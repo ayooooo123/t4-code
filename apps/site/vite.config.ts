@@ -8,6 +8,7 @@ export default defineConfig({
   base: "/",
   plugins: [react()],
   build: {
+    assetsInlineLimit: 0,
     rollupOptions: {
       input: {
         index: page("index.html"),
