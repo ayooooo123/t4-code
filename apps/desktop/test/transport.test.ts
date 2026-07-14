@@ -10,9 +10,10 @@ import { resolveUnixSocketPath, UnixWebSocketTransport } from "../src/transport.
 
 const describeUnix = process.platform === "linux" || process.platform === "darwin" ? describe : (_name: string, _fn: () => void): void => {};
 const UUID = "123e4567-e89b-12d3-a456-426614174000";
+const FIXTURE_TMP_ROOT = process.platform === "darwin" ? "/private/tmp" : tmpdir();
 
 function fixtureDirectory(): string {
-  const directory = mkdtempSync(join(tmpdir(), "t4-transport-"));
+  const directory = mkdtempSync(join(FIXTURE_TMP_ROOT, "t4-transport-"));
   chmodSync(directory, 0o700);
   return directory;
 }

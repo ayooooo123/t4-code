@@ -43,6 +43,16 @@ async function start(): Promise<FixtureWebSocketServer> {
   return server;
 }
 
+async function waitForClientCount(server: FixtureWebSocketServer, expected: number): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (server.clientCount !== expected) {
+    if (Date.now() >= deadline) {
+      throw new Error(`fixture client count did not reach ${expected}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("loopback fixture websocket", () => {
   it("binds loopback, rejects strict paths/hosts, and cleans up", async () => {
     const server = await start();
@@ -77,15 +87,13 @@ describe("loopback fixture websocket", () => {
     const binaryClosed = closed(binary);
     binary.send(Buffer.from(JSON.stringify(hello)));
     expect(await binaryClosed).toBe(1009);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(server.clientCount).toBe(0);
+    await waitForClientCount(server, 0);
     const oversized = new WebSocket(server.address);
     await opened(oversized);
     const oversizedClosed = closed(oversized);
     oversized.send("x".repeat(server.maxPayload + 1));
     expect(await oversizedClosed).toBe(1009);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(server.clientCount).toBe(0);
+    await waitForClientCount(server, 0);
     await server.stop();
   });
   it("passes duplicate-key text through the protocol decoder and cleans disconnected clients", async () => {
@@ -102,7 +110,7 @@ describe("loopback fixture websocket", () => {
     const done = closed(socket);
     socket.close();
     await done;
-    expect(server.clientCount).toBe(0);
+    await waitForClientCount(server, 0);
     expect(server.engine.clientCount).toBe(0);
     await server.stop();
   });

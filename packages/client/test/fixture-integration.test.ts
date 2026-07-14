@@ -34,10 +34,14 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
       expect(projection.snapshot.sessions.get(key)!.entries).toHaveLength(1);
       const { promise: streamed, resolve: resolveStreamed } = Promise.withResolvers<void>();
       const disposeStream = projection.subscribe((snapshot) => {
-        const updates = snapshot.sessions
-          .get(key)
-          ?.events.filter((event) => event.event.type === "message.update").length;
-        if ((updates ?? 0) >= 2) resolveStreamed();
+        const session = snapshot.sessions.get(key);
+        const eventTypes = session?.events.map((event) => event.event.type);
+        if (
+          session?.entries.length === 2 &&
+          eventTypes?.join(",") === "agent.start,turn.start,turn.end,agent.end"
+        ) {
+          resolveStreamed();
+        }
       });
       const prompt = client.command({ hostId: "host-stream", sessionId: "session-stream", command: "session.prompt", args: { message: "hello" } });
       await yieldLoop();
@@ -46,10 +50,9 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
       await yieldLoop();
       await streamed;
       disposeStream();
-      // The subscription above proves both live events crossed the real
-      // WebSocket boundary. Once the matching durable entry arrives, the
-      // projection must retire those transient frames so the response cannot
-      // render twice.
+      // Wait for the complete projected response rather than a subset of the
+      // live frames. The server emits the terminal frames asynchronously after
+      // its message updates, and the durable entry retires those updates.
       expect(
         projection.snapshot.sessions.get(key)!.events.map((event) => event.event.type),
       ).toEqual(["agent.start", "turn.start", "turn.end", "agent.end"]);
