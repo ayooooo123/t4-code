@@ -6,6 +6,7 @@ import type { CursorRecord, CursorStore } from "@t4-code/client";
 import type { CredentialEntry, CredentialVault, PairedHostRecord, TargetRegistry } from "@t4-code/remote";
 import type { CredentialCiphertextStore, RemoteTargetRecord, RemoteTargetStore, SafeStorageAdapter } from "./remote-runtime/index.ts";
 import type { PeerPairingMaterial, PeerPairingStore } from "./peer-share.ts";
+import type { WorkspaceRootsRecord, WorkspaceRootsStore } from "./workspace-roots.ts";
 
 export interface DeviceIdentity {
   readonly deviceId: string;
@@ -17,6 +18,7 @@ interface VaultState { readonly ciphertext: Record<string, string>; }
 interface RemoteRegistryState { readonly version: 1; readonly records: readonly RemoteTargetRecord[]; }
 interface CredentialCiphertextState { readonly version: 1; readonly ciphertexts: Record<string, string>; }
 interface PeerPairingCiphertextState { readonly version: 1; readonly ciphertext?: string; }
+interface WorkspaceRootsState { readonly record?: WorkspaceRootsRecord; }
 
 function recordKey(hostId: string, sessionId: string): string { return `${hostId}\u0000${sessionId}`; }
 function decodeRemoteState(value: unknown): RemoteRegistryState {
@@ -192,6 +194,14 @@ export class ElectronPeerPairingStore implements PeerPairingStore {
     });
     await this.store.write({ version: 1, ciphertext: this.encryption.encryptString(cleartext).toString("base64") });
   }
+}
+
+/** Host-local workspace configuration. Paths never leave the desktop process unvalidated. */
+export class ElectronWorkspaceRootsStore implements WorkspaceRootsStore {
+  private readonly store: ElectronStore<WorkspaceRootsState>;
+  constructor(store = new ElectronStore<WorkspaceRootsState>({ name: "workspace-roots", defaults: {} })) { this.store = store; }
+  async load(): Promise<unknown> { return this.store.get("record") ?? null; }
+  async save(value: WorkspaceRootsRecord): Promise<void> { this.store.set("record", value); }
 }
 
 export const electronSafeStorage: SafeStorageAdapter = {
