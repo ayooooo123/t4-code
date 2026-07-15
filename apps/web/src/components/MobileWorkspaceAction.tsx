@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 
 import { createLiveSession } from "../features/session-runtime/live-create.ts";
 import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
-import { nativeMobilePlatform } from "../platform/native-mobile.ts";
+import { currentNativeMobilePeerInvite, nativeMobilePlatform } from "../platform/native-mobile.ts";
 import { rendererPlatform } from "../state/store-instance.ts";
 
 export function MobileWorkspaceAction() {
@@ -18,7 +18,7 @@ export function MobileWorkspaceAction() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  if (nativeMobilePlatform() === null || shell === null || shell.workspaceRootsList === undefined || shell.workspaceRootSelect === undefined || shell.workspaceProjectCreate === undefined) return null;
+  if (nativeMobilePlatform() === null || currentNativeMobilePeerInvite() === null || shell === null || shell.workspaceRootsList === undefined || shell.workspaceRootSelect === undefined || shell.workspaceProjectCreate === undefined) return null;
 
   const load = async (): Promise<void> => {
     try { setRoots(await shell.workspaceRootsList!()); }
