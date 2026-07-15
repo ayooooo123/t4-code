@@ -107,6 +107,7 @@ export class PeerShareHost {
   private dht: PeerDht | undefined;
   private server: PeerServer | undefined;
   private timer: unknown;
+  private startPromise: Promise<{ readonly invite: string }> | undefined;
   private live: {
     readonly invite: string;
     readonly expiresAt: number;
@@ -127,6 +128,17 @@ export class PeerShareHost {
 
   async start(): Promise<{ readonly invite: string }> {
     if (this.live !== undefined) return { invite: this.live.invite };
+    if (this.startPromise !== undefined) return this.startPromise;
+    const startPromise = this.startInternal();
+    this.startPromise = startPromise;
+    try {
+      return await startPromise;
+    } finally {
+      if (this.startPromise === startPromise) this.startPromise = undefined;
+    }
+  }
+
+  private async startInternal(): Promise<{ readonly invite: string }> {
     await this.stop();
     const saved = await this.pairingStore?.load();
     const keyPair = saved ?? this.createKeyPair();

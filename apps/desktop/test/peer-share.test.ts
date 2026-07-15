@@ -66,6 +66,36 @@ class FakeDht {
 }
 
 describe("PeerShareHost", () => {
+  it("shares one listener while concurrent callers start the host", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<{ readonly invite: string }>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    let resolveListen: (() => void) | undefined;
+    const listening = new Promise<void>((resolve) => { resolveListen = resolve; });
+    dht.server.listen = async () => { dht.server.listens += 1; await listening; };
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: new Uint8Array(32).fill(3), secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(9),
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+
+    const first = host.start();
+    const second = host.start();
+    await waitFor(() => dht.server.listens > 0, "peer listener startup");
+    expect(dht.server.listens).toBe(1);
+    resolveListen?.();
+    const [firstShare, secondShare] = await Promise.all([first, second]);
+    expect(firstShare).toEqual(secondShare);
+    await host.stop();
+  });
+
   it("restores a durable pairing identity after the desktop host restarts", async () => {
     const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
       readonly createDht: () => FakeDht;

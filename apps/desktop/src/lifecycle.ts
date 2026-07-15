@@ -135,15 +135,10 @@ export class DesktopLifecycle {
     });
     await this.electronApp.whenReady();
     if (process.platform === "darwin") this.electronApp.setAsDefaultProtocolClient("t4-code");
-    try {
-      const peerShare = this.peerShareFactory();
-      await peerShare.start();
-      this.peerShare = peerShare;
-    } catch {
-      // Private pairing is unavailable without encrypted local storage or a
-      // usable DHT listener; the rest of desktop startup remains independent.
-      this.peerShare = undefined;
-    }
+    // Pairing uses a network listener and must never prevent the desktop UI
+    // from opening. The IPC bridge can await this same host on demand.
+    const peerShare = this.peerShareFactory();
+    this.peerShare = peerShare;
     const identity = this.identityFactory();
     const remoteRegistry = this.remoteRegistryFactory();
     const credentials = this.credentialsFactory();
@@ -162,6 +157,9 @@ export class DesktopLifecycle {
       },
     });
     this.bindWindow(this.windowFactory());
+    void peerShare.start().catch(() => {
+      // Pairing is optional. A later explicit share request retries startup.
+    });
     this.beforeQuitHandler = () => {
       void this.stop().catch(() => {
         // Electron is already quitting; teardown remains best effort.
