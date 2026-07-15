@@ -9,6 +9,7 @@ import type { OmpTransport, Unsubscribe } from "@t4-code/client";
 import { peerConnection, type T4PeerConnectionPlugin } from "./native-mobile.ts";
 
 const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+const PEER_OPEN_TIMEOUT_MS = 50_000;
 const encoder = new TextEncoder();
 
 function base64Url(bytes: Uint8Array): string {
@@ -110,15 +111,20 @@ export class CapacitorPeerTransport implements OmpTransport {
       this.finishClose();
     });
     this.removers = [dataListener.remove, closeListener.remove];
+    const timeout = setTimeout(() => fail(new Error("private mobile connection timed out")), PEER_OPEN_TIMEOUT_MS);
     try {
-      const session = await plugin.open({ publicKey: base64Url(decoded.desktopPublicKey) });
+      const session = await Promise.race([plugin.open({ publicKey: base64Url(decoded.desktopPublicKey) }), opening]);
+      if (session === undefined) throw new Error("private mobile connection opened without a native session");
       this.sessionId = session.sessionId;
       await this.writeFrame({ type: "hello", version: 1, nonce });
-    } catch {
-      fail(new Error("could not establish the private mobile connection"));
+      await opening;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error("could not establish the private mobile connection");
+      fail(failure);
+      throw failure;
+    } finally {
+      clearTimeout(timeout);
     }
-    const timeout = setTimeout(() => fail(new Error("private mobile connection timed out")), 20_000);
-    try { await opening; } finally { clearTimeout(timeout); }
   }
 
   send(data: string): void {

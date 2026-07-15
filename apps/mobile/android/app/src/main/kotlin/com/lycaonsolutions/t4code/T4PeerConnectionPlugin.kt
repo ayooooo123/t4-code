@@ -13,9 +13,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import java.util.UUID
 
 @CapacitorPlugin(name = "T4PeerConnection")
@@ -47,34 +49,42 @@ class T4PeerConnectionPlugin : Plugin() {
         scope.launch {
             var dht: HyperDHT? = null
             try {
-                dht = HyperDHT(DhtOptions(usePublicBootstrap = true))
-                dht.start()
-                dht.awaitBootstrapped()
-                val stream = dht.connect(key)
-                stream.awaitOpen()
-                val id = UUID.randomUUID().toString()
-                val receiveJob = launch {
-                    try {
-                        stream.data.collect { bytes ->
-                            notifyListeners("peerData", JSObject().apply {
-                                put("sessionId", id)
-                                put("data", Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
-                            })
+                val activeDht = HyperDHT(DhtOptions(usePublicBootstrap = true))
+                dht = activeDht
+                withTimeout(NATIVE_OPEN_TIMEOUT_MS) {
+                    activeDht.start()
+                    activeDht.awaitBootstrapped()
+                    val stream = activeDht.connect(key)
+                    stream.awaitOpen()
+                    val id = UUID.randomUUID().toString()
+                    val receiveJob = scope.launch {
+                        try {
+                            stream.data.collect { bytes ->
+                                notifyListeners("peerData", JSObject().apply {
+                                    put("sessionId", id)
+                                    put("data", Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+                                })
+                            }
+                        } finally {
+                            closeSession(id, false)
+                            notifyListeners("peerClosed", JSObject().apply { put("sessionId", id) })
                         }
-                    } finally {
-                        closeSession(id, false)
-                        notifyListeners("peerClosed", JSObject().apply { put("sessionId", id) })
                     }
+                    synchronized(sessions) {
+                        sessions[id] = Session(activeDht, stream, receiveJob)
+                        opening = false
+                    }
+                    call.resolve(JSObject().apply { put("sessionId", id) })
                 }
-                synchronized(sessions) {
-                    sessions[id] = Session(dht, stream, receiveJob)
-                    opening = false
-                }
-                call.resolve(JSObject().apply { put("sessionId", id) })
-            } catch (_: Exception) {
+            } catch (error: Exception) {
                 synchronized(sessions) { opening = false }
+                val message = if (error is TimeoutCancellationException) {
+                    "Private mobile connection timed out. Generate a fresh key and try again."
+                } else {
+                    "Could not establish the private mobile connection."
+                }
+                call.reject(message)
                 try { dht?.close() } catch (_: Exception) {}
-                call.reject("Could not establish the private mobile connection.")
             }
         }
     }
@@ -135,6 +145,7 @@ class T4PeerConnectionPlugin : Plugin() {
     }
 
     private companion object {
+        const val NATIVE_OPEN_TIMEOUT_MS = 45_000L
         const val MAX_MESSAGE_BYTES = 4 * 1024 * 1024
         const val MAX_ENCODED_BYTES = (MAX_MESSAGE_BYTES * 4 / 3) + 8
     }

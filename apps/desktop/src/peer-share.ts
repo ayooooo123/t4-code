@@ -208,10 +208,11 @@ export class PeerShareHost {
               challenge,
               this.live.desktopPublicKey,
             );
-            if (!sameProof(expected, frame.proof) || (this.activeStream !== undefined && this.activeStream !== stream)) {
+            if (!sameProof(expected, frame.proof)) {
               terminate();
               return;
             }
+            if (this.activeStream !== undefined && this.activeStream !== stream) this.activeStream.destroy?.();
             this.activeStream = stream;
             phase = "opening";
             const transport = await this.createAppserverTransport();

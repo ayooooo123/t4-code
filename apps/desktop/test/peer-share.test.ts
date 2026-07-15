@@ -207,7 +207,7 @@ describe("PeerShareHost", () => {
     await host.stop();
   });
 
-  it("admits only one authorized phone at a time", async () => {
+  it("replaces a stale authorized phone when the same invite reconnects", async () => {
     const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
       readonly createDht: () => FakeDht;
       readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
@@ -254,9 +254,10 @@ describe("PeerShareHost", () => {
     const second = new FakePeerSocket();
     await authorize(second, "second-phone");
 
-    await waitFor(() => second.destroyed, "second phone rejection");
-    expect(opens).toBe(1);
-    expect(first.destroyed).toBe(false);
+    await waitForWrites(second, 2);
+    await waitFor(() => first.destroyed, "stale phone replacement");
+    expect(opens).toBe(2);
+    expect(second.destroyed).toBe(false);
     await host.stop();
   });
 

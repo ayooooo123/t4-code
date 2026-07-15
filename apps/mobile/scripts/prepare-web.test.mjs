@@ -71,3 +71,11 @@ test("the HyperDHT JNI build links a complete static libsodium", async () => {
   assert.doesNotMatch(script, /"--enable-minimal"/);
   assert.doesNotMatch(script, /copyFile\(sodiumLibrary, sodiumOutput\)/);
 });
+
+test("private Android connections have a bounded native open attempt", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  assert.match(plugin, /const val NATIVE_OPEN_TIMEOUT_MS = [\d_]+L/);
+  assert.match(plugin, /withTimeout\(NATIVE_OPEN_TIMEOUT_MS\)/);
+  assert.match(plugin, /call\.reject\(message\)\s+try \{ dht\?\.close\(\) \}/);
+});
