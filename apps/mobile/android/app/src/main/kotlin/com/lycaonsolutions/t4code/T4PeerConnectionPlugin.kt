@@ -1,6 +1,7 @@
 package com.lycaonsolutions.t4code
 
 import android.util.Base64
+import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
@@ -23,17 +24,16 @@ import java.util.UUID
 @CapacitorPlugin(name = "T4PeerConnection")
 class T4PeerConnectionPlugin : Plugin() {
     private data class Session(
-        val dht: HyperDHT,
         val stream: Stream,
         val receiveJob: Job,
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = mutableMapOf<String, Session>()
+    private var activeDht: HyperDHT? = null
     private var opening = false
     private var openingAttemptId: String? = null
     private var openingJob: Job? = null
-    private var openingDht: HyperDHT? = null
 
     @PluginMethod
     fun open(call: PluginCall) {
@@ -57,14 +57,16 @@ class T4PeerConnectionPlugin : Plugin() {
         }
         val job = scope.launch {
             var dht: HyperDHT? = null
+            var phase = "starting DHT"
             try {
-                val activeDht = HyperDHT(DhtOptions(usePublicBootstrap = true))
+                val activeDht = dht()
                 dht = activeDht
-                synchronized(sessions) { if (openingAttemptId == attemptId) openingDht = activeDht }
                 withTimeout(NATIVE_OPEN_TIMEOUT_MS) {
-                    activeDht.start()
+                    phase = "bootstrapping"
                     activeDht.awaitBootstrapped()
+                    phase = "discovering peer"
                     val stream = activeDht.connect(key)
+                    phase = "opening stream"
                     stream.awaitOpen()
                     val id = UUID.randomUUID().toString()
                     val receiveJob = scope.launch {
@@ -81,21 +83,24 @@ class T4PeerConnectionPlugin : Plugin() {
                         }
                     }
                     synchronized(sessions) {
-                        sessions[id] = Session(activeDht, stream, receiveJob)
+                        sessions[id] = Session(stream, receiveJob)
                         opening = false
                         openingAttemptId = null
                         openingJob = null
-                        openingDht = null
                     }
                     call.resolve(JSObject().apply { put("sessionId", id) })
                 }
             } catch (error: Exception) {
+                val network = dht?.let {
+                    "online=${it.isOnline} bootstrapped=${it.isBootstrapped} degraded=${it.isDegraded} " +
+                        "punch=${it.punchStats} relay=${it.relayStats}"
+                } ?: "DHT unavailable"
+                Log.w(TAG, "Private connection failed during $phase: $network", error)
                 synchronized(sessions) {
                     if (openingAttemptId == attemptId) {
                         opening = false
                         openingAttemptId = null
                         openingJob = null
-                        openingDht = null
                     }
                 }
                 val message = if (error is TimeoutCancellationException) {
@@ -104,7 +109,6 @@ class T4PeerConnectionPlugin : Plugin() {
                     "Could not establish the private mobile connection."
                 }
                 call.reject(message)
-                try { dht?.close() } catch (_: Exception) {}
             }
         }
         synchronized(sessions) { if (openingAttemptId == attemptId) openingJob = job }
@@ -119,17 +123,14 @@ class T4PeerConnectionPlugin : Plugin() {
         }
         val pending = synchronized(sessions) {
             if (openingAttemptId != attemptId) null else {
-                val current = Pair(openingJob, openingDht)
+                val current = openingJob
                 opening = false
                 openingAttemptId = null
                 openingJob = null
-                openingDht = null
                 current
             }
         }
-        pending?.first?.cancel()
-        val dht = pending?.second
-        if (dht != null) scope.launch { try { dht.close() } catch (_: Exception) {} }
+        pending?.cancel()
         call.resolve()
     }
 
@@ -172,6 +173,12 @@ class T4PeerConnectionPlugin : Plugin() {
     override fun handleOnDestroy() {
         val ids = synchronized(sessions) { sessions.keys.toList() }
         for (id in ids) closeSession(id, true)
+        val dht = synchronized(sessions) {
+            val current = activeDht
+            activeDht = null
+            current
+        }
+        try { dht?.close() } catch (_: Exception) {}
         scope.cancel()
         super.handleOnDestroy()
     }
@@ -180,7 +187,18 @@ class T4PeerConnectionPlugin : Plugin() {
         val session = synchronized(sessions) { sessions.remove(id) } ?: return
         if (cancelReceiver) session.receiveJob.cancel()
         try { session.stream.close() } catch (_: Exception) {}
-        try { session.dht.close() } catch (_: Exception) {}
+    }
+
+    /**
+     * A DHT node owns the phone's UDP mapping. Reusing it across OMP stream
+     * reconnects avoids turning every transient close into a cold bootstrap
+     * and a brand-new hole-punch attempt.
+     */
+    private fun dht(): HyperDHT = synchronized(sessions) {
+        activeDht ?: HyperDHT(DhtOptions(usePublicBootstrap = true)).also {
+            it.start()
+            activeDht = it
+        }
     }
 
     private fun decode(value: String?): ByteArray? {
@@ -189,6 +207,7 @@ class T4PeerConnectionPlugin : Plugin() {
     }
 
     private companion object {
+        const val TAG = "T4PeerConnection"
         const val NATIVE_OPEN_TIMEOUT_MS = 45_000L
         const val MAX_MESSAGE_BYTES = 4 * 1024 * 1024
         const val MAX_ENCODED_BYTES = (MAX_MESSAGE_BYTES * 4 / 3) + 8

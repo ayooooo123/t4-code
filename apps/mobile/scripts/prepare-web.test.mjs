@@ -77,5 +77,15 @@ test("private Android connections have a bounded native open attempt", async () 
 
   assert.match(plugin, /const val NATIVE_OPEN_TIMEOUT_MS = [\d_]+L/);
   assert.match(plugin, /withTimeout\(NATIVE_OPEN_TIMEOUT_MS\)/);
-  assert.match(plugin, /call\.reject\(message\)\s+try \{ dht\?\.close\(\) \}/);
+  assert.match(plugin, /call\.reject\(message\)/);
+  assert.doesNotMatch(plugin, /call\.reject\(message\)\s+try \{ dht\?\.close\(\) \}/);
+});
+
+test("private Android reconnects retain the app-process DHT node", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  assert.match(plugin, /private var activeDht: HyperDHT\? = null/);
+  assert.match(plugin, /private fun dht\(\): HyperDHT/);
+  assert.doesNotMatch(plugin, /Session\(\s*val dht: HyperDHT/);
+  assert.doesNotMatch(plugin, /session\.dht\.close\(\)/);
 });

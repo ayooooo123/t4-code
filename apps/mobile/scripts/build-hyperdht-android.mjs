@@ -12,7 +12,7 @@ const depsRoot = resolve(cacheRoot, "deps");
 const output = resolve(androidRoot, "app/src/main/jniLibs/arm64-v8a/libhyperdht_jni.so");
 const ABI = "arm64-v8a";
 const API = "26";
-const HYPERDHT_COMMIT = "91ab6a2dcf9394bef8b788f9199422f5f56243cf";
+const HYPERDHT_COMMIT = "17e665ee0871522b748d4148547e6c8747f9dff1";
 const LIBSODIUM_COMMIT = "2ce4d906a68eae82b27b4867f3d4172ec508cb27";
 const LIBUV_COMMIT = "5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b";
 
