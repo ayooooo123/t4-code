@@ -36,27 +36,27 @@
 - Create: `apps/desktop/src/workspace-roots.ts`
 - Create: `apps/desktop/test/workspace-roots.test.ts`
 
-- [ ] **Step 1: Write failing tests for canonical root persistence.**
+- [x] **Step 1: Write failing tests for canonical root persistence.**
 
   Cover: an existing directory is accepted; a file/missing path is rejected; duplicate canonical roots collapse; setting an inactive approved root changes only `activeRootId`; an empty configuration has no active root.
 
-- [ ] **Step 2: Run the focused test and verify it fails.**
+- [x] **Step 2: Run the focused test and verify it fails.**
 
   Run: `pnpm --filter @t4-code/desktop test -- workspace-roots.test.ts`
 
-- [ ] **Step 3: Implement the minimal service.**
+- [x] **Step 3: Implement the minimal service.**
 
   Define `WorkspaceRoot`, `WorkspaceProject`, and `WorkspaceRootsStore`. Use `realpath`, `lstat`, and a stable opaque root/project ID. Return only display-safe labels and IDs; retain canonical absolute paths privately.
 
-- [ ] **Step 4: Add failing path-boundary tests.**
+- [x] **Step 4: Add failing path-boundary tests.**
 
   Assert `createProject("../escape")`, absolute names, separators, empty names, and a symlink escaping the root all fail. Assert a safe single segment creates exactly one directory under the active root.
 
-- [ ] **Step 5: Implement project creation.**
+- [x] **Step 5: Implement project creation.**
 
   Validate a single safe segment, resolve it from the active canonical root, reject existing non-directories, create the directory with mode `0700`, and return an opaque project ID plus relative display name.
 
-- [ ] **Step 6: Re-run focused tests and commit.**
+- [x] **Step 6: Re-run focused tests and commit.**
 
   Run: `pnpm --filter @t4-code/desktop test -- workspace-roots.test.ts`
 
