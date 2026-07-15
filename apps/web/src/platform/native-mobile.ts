@@ -1,4 +1,4 @@
-import { deviceToken as validateDeviceToken } from "@t4-code/protocol";
+import { decodePeerInvite, deviceToken as validateDeviceToken, peerInviteMetadata } from "@t4-code/protocol";
 
 export const MOBILE_BACKEND_STORAGE_KEY = "t4-code:mobile-backend:v1";
 
@@ -13,6 +13,13 @@ export interface StoredMobileBackend {
   readonly wsUrl: string;
   readonly label: string;
 }
+export interface StoredPeerMobileBackend {
+  readonly version: 2;
+  readonly kind: "peer";
+  readonly invite: string;
+  readonly label: string;
+}
+export type StoredMobileConnection = StoredMobileBackend | StoredPeerMobileBackend;
 
 export interface NativeMobileBackendConfig {
   readonly wsUrl: string;
@@ -28,9 +35,21 @@ interface T4SecureStoragePlugin {
   setCredentials(options: { readonly deviceId: string; readonly deviceToken: string }): Promise<void>;
   clearCredentials(): Promise<void>;
 }
+export interface T4PeerConnectionPlugin {
+  open(options: { readonly publicKey: string }): Promise<{ readonly sessionId: string }>;
+  write(options: { readonly sessionId: string; readonly data: string }): Promise<void>;
+  close(options: { readonly sessionId: string }): Promise<void>;
+  addListener(
+    event: "peerData" | "peerClosed",
+    listener: (payload: { readonly sessionId: string; readonly data?: string }) => void,
+  ): Promise<{ readonly remove: () => Promise<void> | void }>;
+}
 
 interface CapacitorBridge {
-  readonly Plugins?: { readonly T4SecureStorage?: T4SecureStoragePlugin };
+  readonly Plugins?: {
+    readonly T4SecureStorage?: T4SecureStoragePlugin;
+    readonly T4PeerConnection?: T4PeerConnectionPlugin;
+  };
   readonly getPlatform?: () => string;
   readonly isNativePlatform?: () => boolean;
 }
@@ -39,16 +58,21 @@ declare global {
   interface Window {
     Capacitor?: CapacitorBridge;
     __t4MobileBackend?: NativeMobileBackendConfig;
+    __t4MobilePeerInvite?: string;
   }
 }
 
 export type MobileBootResult =
   | { readonly kind: "web" }
-  | { readonly kind: "ready"; readonly backend: StoredMobileBackend }
+  | { readonly kind: "ready"; readonly backend: StoredMobileConnection }
   | { readonly kind: "setup"; readonly message?: string };
 
 function secureStorage(): T4SecureStoragePlugin | null {
   return window.Capacitor?.Plugins?.T4SecureStorage ?? null;
+}
+
+export function peerConnection(): T4PeerConnectionPlugin | null {
+  return window.Capacitor?.Plugins?.T4PeerConnection ?? null;
 }
 
 export function nativeMobilePlatform(): NativeMobilePlatform | null {
@@ -101,31 +125,56 @@ export function parseTailnetBackend(value: string): StoredMobileBackend {
   };
 }
 
-export function readStoredMobileBackend(storage: Pick<Storage, "getItem"> = window.localStorage): StoredMobileBackend | null {
+export function parsePeerBackend(value: string): StoredPeerMobileBackend {
+  const invite = value.trim();
+  if (invite.length === 0 || invite.length > MAX_URL_LENGTH) throw new Error("Enter a private connection key.");
+  const metadata = peerInviteMetadata(invite);
+  decodePeerInvite(invite);
+  return {
+    version: 2,
+    kind: "peer",
+    invite,
+    label: requiredLabel(`T4 private host ${metadata.desktopPublicKey.slice(0, 8)}`),
+  };
+}
+
+export function readStoredMobileConnection(storage: Pick<Storage, "getItem"> = window.localStorage): StoredMobileConnection | null {
   const raw = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
   if (raw === null) return null;
   let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("The saved host address is damaged. Enter it again.");
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("The saved host address is damaged. Enter it again.");
-  }
+  try { value = JSON.parse(raw); } catch { throw new Error("The saved mobile connection is damaged. Enter it again."); }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("The saved mobile connection is damaged. Enter it again.");
   const data = value as Record<string, unknown>;
-  if (data.version !== 1 || typeof data.origin !== "string") {
-    throw new Error("The saved host address is from an unsupported app version.");
+  if (data.version === 2 && data.kind === "peer" && typeof data.invite === "string") {
+    const parsed = parsePeerBackend(data.invite);
+    if (data.label !== parsed.label) throw new Error("The saved private connection is inconsistent. Enter it again.");
+    return parsed;
   }
-  const parsed = parseTailnetBackend(data.origin);
-  if (data.wsUrl !== parsed.wsUrl || data.label !== parsed.label) {
+  if (data.version === 1 && typeof data.origin === "string") return parseTailnetBackend(data.origin);
+  throw new Error("The saved mobile connection is from an unsupported app version.");
+}
+
+export function readStoredMobileBackend(storage: Pick<Storage, "getItem"> = window.localStorage): StoredMobileBackend | null {
+  const connection = readStoredMobileConnection(storage);
+  if (connection === null) return null;
+  if (connection.version !== 1) throw new Error("The saved connection is private, not a Tailnet host.");
+  const raw = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
+  const data = raw === null ? undefined : JSON.parse(raw) as Record<string, unknown>;
+  if (data?.wsUrl !== connection.wsUrl || data.label !== connection.label) {
     throw new Error("The saved host address is inconsistent. Enter it again.");
   }
-  return parsed;
+  return connection;
 }
 
 export function writeStoredMobileBackend(
   backend: StoredMobileBackend,
+  storage: Pick<Storage, "setItem"> = window.localStorage,
+): void {
+  storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(backend));
+}
+
+export function writeStoredPeerBackend(
+  backend: StoredPeerMobileBackend,
   storage: Pick<Storage, "setItem"> = window.localStorage,
 ): void {
   storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(backend));
@@ -136,18 +185,29 @@ export function currentNativeMobileBackend(): NativeMobileBackendConfig | null {
   return window.__t4MobileBackend ?? null;
 }
 
+export function currentNativeMobilePeerInvite(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.__t4MobilePeerInvite ?? null;
+}
+
 export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   const platform = nativeMobilePlatform();
   if (platform === null) return { kind: "web" };
   document.documentElement.dataset.platform = platform;
 
-  let backend: StoredMobileBackend | null;
+  let backend: StoredMobileConnection | null;
   try {
-    backend = readStoredMobileBackend();
+    backend = readStoredMobileConnection();
   } catch (error) {
     return { kind: "setup", message: error instanceof Error ? error.message : "Enter the host address again." };
   }
   if (backend === null) return { kind: "setup" };
+
+  if (backend.version === 2) {
+    delete window.__t4MobileBackend;
+    window.__t4MobilePeerInvite = backend.invite;
+    return { kind: "ready", backend };
+  }
 
   const plugin = secureStorage();
   if (plugin === null) {
@@ -171,6 +231,7 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
     label: backend.label,
     ...(credentials === null ? {} : credentials),
   };
+  delete window.__t4MobilePeerInvite;
   return { kind: "ready", backend };
 }
 

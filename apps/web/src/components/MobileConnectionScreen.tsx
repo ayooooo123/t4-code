@@ -4,8 +4,10 @@ import { useState } from "react";
 
 import {
   parseTailnetBackend,
+  parsePeerBackend,
   probeMobileBackend,
   writeStoredMobileBackend,
+  writeStoredPeerBackend,
 } from "../platform/native-mobile.ts";
 
 export function MobileConnectionScreen({ startupMessage }: { readonly startupMessage?: string }) {
@@ -33,27 +35,34 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
             event.preventDefault();
             if (checking) return;
             setMessage(null);
-            let backend;
+            const privateInvite = address.trim().startsWith("t4peer://");
             try {
-              backend = parseTailnetBackend(address);
+              if (privateInvite) {
+                const backend = parsePeerBackend(address);
+                setChecking(true);
+                writeStoredPeerBackend(backend);
+                window.location.reload();
+                return;
+              }
+              const backend = parseTailnetBackend(address);
+              setChecking(true);
+              void probeMobileBackend(backend)
+                .then(() => {
+                  writeStoredMobileBackend(backend);
+                  window.location.reload();
+                })
+                .catch((error: unknown) => {
+                  setMessage(error instanceof Error ? error.message : "T4 Code could not reach that host.");
+                  setChecking(false);
+                });
             } catch (error) {
               setMessage(error instanceof Error ? error.message : "Enter a valid Tailnet address.");
               return;
             }
-            setChecking(true);
-            void probeMobileBackend(backend)
-              .then(() => {
-                writeStoredMobileBackend(backend);
-                window.location.reload();
-              })
-              .catch((error: unknown) => {
-                setMessage(error instanceof Error ? error.message : "T4 Code could not reach that host.");
-                setChecking(false);
-              });
           }}
         >
           <label className="font-medium text-sm" htmlFor="mobile-tailnet-address">
-            Tailnet address
+            Tailnet address or private key
           </label>
           <input
             aria-describedby="mobile-tailnet-help mobile-tailnet-status"
@@ -66,13 +75,13 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
             id="mobile-tailnet-address"
             inputMode="url"
             onChange={(event) => setAddress(event.target.value)}
-            placeholder="https://your-computer.your-tailnet.ts.net:8445"
+            placeholder="t4peer://v1/… or https://your-computer.your-tailnet.ts.net:8445"
             spellCheck={false}
             type="url"
             value={address}
           />
           <p className="text-muted-foreground text-xs leading-relaxed" id="mobile-tailnet-help">
-            Use the full HTTPS address shown by the T4 gateway on your computer.
+            Paste the private key from T4 Code’s QR dialog, or use the full HTTPS Tailnet address shown by the T4 gateway.
           </p>
           <p
             aria-live="polite"

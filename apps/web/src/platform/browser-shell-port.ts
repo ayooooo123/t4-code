@@ -56,8 +56,10 @@ import { commandResultError } from "@t4-code/protocol/desktop-ipc";
 import type { DesktopShellPort } from "@t4-code/client";
 
 import { BrowserWebSocketTransport } from "./browser-transport.ts";
+import { CapacitorPeerTransport } from "./peer-transport.ts";
 import {
   currentNativeMobileBackend,
+  currentNativeMobilePeerInvite,
   nativeMobilePlatform,
   persistNativeMobileCredentials,
 } from "./native-mobile.ts";
@@ -196,7 +198,10 @@ export interface BrowserShellPortOptions {
 export function createBrowserShellPort(
   options: BrowserShellPortOptions = {},
 ): DesktopShellPort | null {
-  const config = detectBackend();
+  const peerInvite = currentNativeMobilePeerInvite();
+  const config = peerInvite === null
+    ? detectBackend()
+    : { wsUrl: "wss://private.invalid", label: "T4 private host" };
   if (config === null) return null;
   const backendConfig = config;
 
@@ -208,7 +213,7 @@ export function createBrowserShellPort(
 
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
-  let transport: BrowserWebSocketTransport | undefined;
+  let transport: BrowserWebSocketTransport | CapacitorPeerTransport | undefined;
   let welcome: WelcomeFrame | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
@@ -257,9 +262,12 @@ export function createBrowserShellPort(
 
   function buildClient(): OmpClient {
     const transportFactory = async (): Promise<OmpTransport> => {
-      transport = new BrowserWebSocketTransport({ url: backendConfig.wsUrl });
-      await transport.open();
-      return transport;
+      const next = peerInvite === null
+        ? new BrowserWebSocketTransport({ url: backendConfig.wsUrl })
+        : new CapacitorPeerTransport(peerInvite);
+      await next.open();
+      transport = next;
+      return next;
     };
 
     const c = (options.clientFactory ?? createOmpClient)({

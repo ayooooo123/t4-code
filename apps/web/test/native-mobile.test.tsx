@@ -5,11 +5,14 @@ import { MobileConnectionScreen } from "../src/components/MobileConnectionScreen
 import {
   clearNativeMobileConnection,
   MOBILE_BACKEND_STORAGE_KEY,
+  parsePeerBackend,
   parseTailnetBackend,
   prepareNativeMobileBackend,
   probeMobileBackend,
   readStoredMobileBackend,
+  readStoredMobileConnection,
   writeStoredMobileBackend,
+  writeStoredPeerBackend,
 } from "../src/platform/native-mobile.ts";
 
 const originalDocument = globalThis.document;
@@ -49,6 +52,16 @@ describe("native mobile connection", () => {
 
     storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify({ ...backend, wsUrl: "wss://evil.example/v1/ws" }));
     expect(() => readStoredMobileBackend(storage)).toThrow(/inconsistent/u);
+  });
+
+  it("stores a validated private peer invite without treating it as a Tailnet address", () => {
+    const storage = new MemoryStorage();
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const backend = parsePeerBackend(`t4peer://v1/${key}/${key}`);
+    writeStoredPeerBackend(backend, storage);
+
+    expect(readStoredMobileConnection(storage)).toEqual(backend);
+    expect(() => readStoredMobileBackend(storage)).toThrow(/private/u);
   });
 
   it("loads paired credentials from the native security bridge before app boot", async () => {
