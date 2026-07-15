@@ -66,6 +66,45 @@ class FakeDht {
 }
 
 describe("PeerShareHost", () => {
+  it("restores a durable pairing identity after the desktop host restarts", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly pairingStore: {
+        load(): Promise<{ readonly publicKey: Uint8Array; readonly secretKey: Uint8Array; readonly capability: Uint8Array } | null>;
+        save(value: { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array; readonly capability: Uint8Array }): Promise<void>;
+      };
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+    }) => { start(): Promise<{ readonly invite: string }>; stop(): Promise<void> };
+    let saved: { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array; readonly capability: Uint8Array } | null = null;
+    const pairingStore = {
+      load: async () => saved,
+      save: async (value: { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array; readonly capability: Uint8Array }) => { saved = value; },
+    };
+    const first = new PeerShareHost({
+      createDht: () => new FakeDht(),
+      createKeyPair: () => ({ publicKey: new Uint8Array(32).fill(3), secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(9),
+      pairingStore,
+      setTimer: () => { throw new Error("durable pairing must not expire"); },
+    });
+    const firstShare = await first.start();
+    await first.stop();
+
+    const second = new PeerShareHost({
+      createDht: () => new FakeDht(),
+      createKeyPair: () => ({ publicKey: new Uint8Array(32).fill(7), secretKey: new Uint8Array(64).fill(8) }),
+      randomBytes: (length) => new Uint8Array(length).fill(6),
+      pairingStore,
+      setTimer: () => { throw new Error("durable pairing must not expire"); },
+    });
+    const secondShare = await second.start();
+
+    expect(secondShare.invite).toBe(firstShare.invite);
+    await second.stop();
+  });
+
   it("creates an ephemeral invite while keeping its capability out of status", async () => {
     const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
       readonly createDht: () => FakeDht;
@@ -75,7 +114,7 @@ describe("PeerShareHost", () => {
       readonly setTimer: (callback: () => void, delay: number) => unknown;
       readonly clearTimer: (timer: unknown) => void;
     }) => {
-      start(): Promise<{ readonly invite: string; readonly expiresAt: number }>;
+      start(): Promise<{ readonly invite: string }>;
       status(): unknown;
       stop(): Promise<void>;
     };
@@ -92,7 +131,6 @@ describe("PeerShareHost", () => {
     const share = await host.start();
 
     expect(share.invite).toMatch(/^t4peer:\/\/v1\//u);
-    expect(share.expiresAt).toBe(900_100);
     expect(JSON.stringify(host.status())).not.toContain(share.invite.split("/").at(-1)!);
     await host.stop();
     expect(dht.server.closes).toBe(1);
@@ -207,7 +245,7 @@ describe("PeerShareHost", () => {
     await host.stop();
   });
 
-  it("replaces a stale authorized phone when the same invite reconnects", async () => {
+  it("keeps multiple authorized phones connected through the same pairing", async () => {
     const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
       readonly createDht: () => FakeDht;
       readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
@@ -255,9 +293,60 @@ describe("PeerShareHost", () => {
     await authorize(second, "second-phone");
 
     await waitForWrites(second, 2);
-    await waitFor(() => first.destroyed, "stale phone replacement");
     expect(opens).toBe(2);
+    expect(first.destroyed).toBe(false);
     expect(second.destroyed).toBe(false);
+    await host.stop();
+  });
+
+  it("rejects a fifth authorized phone without opening another OMP transport", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly createAppserverTransport: () => Promise<FakeOmpTransport>;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<unknown>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    let randomCall = 0;
+    let opens = 0;
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(++randomCall),
+      createAppserverTransport: async () => {
+        opens += 1;
+        return new FakeOmpTransport();
+      },
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+
+    const authorize = async (socket: FakePeerSocket, nonce: string): Promise<void> => {
+      dht.server.connection?.(socket);
+      socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce }));
+      await waitForWrites(socket, 1);
+      const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+      if (challenge?.type !== "challenge") throw new Error("missing challenge");
+      const proof = createHmac("sha256", Buffer.alloc(32, 1))
+        .update("t4peer/v1\0")
+        .update(nonce)
+        .update(challenge.nonce)
+        .update(desktopPublicKey)
+        .digest("base64url");
+      socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    };
+
+    const phones = Array.from({ length: 5 }, () => new FakePeerSocket());
+    for (const [index, phone] of phones.entries()) await authorize(phone, `phone-${index}`);
+    await waitFor(() => phones.slice(0, 4).every((phone) => phone.writes.length >= 2), "four authorized phones");
+    await waitFor(() => phones[4]!.destroyed, "fifth phone rejection");
+
+    expect(opens).toBe(4);
+    expect(phones.slice(0, 4).every((phone) => !phone.destroyed)).toBe(true);
     await host.stop();
   });
 

@@ -74,11 +74,13 @@ export class CapacitorPeerTransport implements OmpTransport {
     const decoded = decodePeerInvite(this.invite);
     this.plugin = plugin;
     const nonce = randomNonce();
+    const attemptId = randomNonce();
     let resolveOpen: (() => void) | undefined;
     let rejectOpen: ((error: Error) => void) | undefined;
     const opening = new Promise<void>((resolve, reject) => { resolveOpen = resolve; rejectOpen = reject; });
     const fail = (error: Error): void => {
       if (this.closed) return;
+      void plugin.cancelOpen({ attemptId }).catch(() => undefined);
       rejectOpen?.(error);
       for (const listener of this.errors) listener(error);
       this.close();
@@ -113,7 +115,7 @@ export class CapacitorPeerTransport implements OmpTransport {
     this.removers = [dataListener.remove, closeListener.remove];
     const timeout = setTimeout(() => fail(new Error("private mobile connection timed out")), PEER_OPEN_TIMEOUT_MS);
     try {
-      const session = await Promise.race([plugin.open({ publicKey: base64Url(decoded.desktopPublicKey) }), opening]);
+      const session = await Promise.race([plugin.open({ publicKey: base64Url(decoded.desktopPublicKey), attemptId }), opening]);
       if (session === undefined) throw new Error("private mobile connection opened without a native session");
       this.sessionId = session.sessionId;
       await this.writeFrame({ type: "hello", version: 1, nonce });

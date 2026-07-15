@@ -49,7 +49,7 @@ export interface IpcRuntime {
   readonly acquireServiceManager?: () => Promise<ServiceManager | undefined>;
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly drainPairLinks?: () => readonly PairLinkEvent[];
-  readonly peerShare?: Pick<PeerShareHost, "start" | "status" | "stop">;
+  readonly peerShare?: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
 }
 export class RemotePairingUnavailableError extends Error {
   readonly code = "remote_pairing_unavailable" as const;
@@ -198,7 +198,7 @@ export class DesktopIpcRegistry {
     this.ipc.handle("omp:peer-share:regenerate", async (event, payload: unknown): Promise<PeerShareStartResult> => {
       this.assertSender(event);
       decodeRequest("omp:peer-share:regenerate", payload);
-      return this.enqueuePeerShare(() => this.peerShare().start());
+      return this.enqueuePeerShare(() => this.peerShare().regenerate());
     });
   }
   uninstall(): void {
@@ -284,7 +284,7 @@ export class DesktopIpcRegistry {
     this.serviceQueue.tail = result.then(() => undefined, () => undefined);
     return result;
   }
-  private peerShare(): Pick<PeerShareHost, "start" | "status" | "stop"> {
+  private peerShare(): Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> {
     if (this.runtime.peerShare === undefined) throw new Error("peer sharing is unavailable");
     return this.runtime.peerShare;
   }

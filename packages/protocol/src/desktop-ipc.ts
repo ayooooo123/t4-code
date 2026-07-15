@@ -82,11 +82,10 @@ export interface ServiceActionResult {
 export interface PeerShareRequest {}
 export interface PeerShareStartResult {
   readonly invite: string;
-  readonly expiresAt: number;
 }
 export type PeerShareStatusResult =
   | { readonly state: "stopped" }
-  | { readonly state: "sharing"; readonly expiresAt: number; readonly desktopPublicKey: string };
+  | { readonly state: "sharing"; readonly desktopPublicKey: string };
 export interface BootstrapResult {
   platform: DesktopPlatform;
   version: typeof PROTOCOL_VERSION;

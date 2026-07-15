@@ -92,6 +92,12 @@ function setup(
     loadIdentity: () => ({ deviceId: "device-test", deviceName: "Desktop Test" }),
     createCursorStore: () => ({ load: () => [], save: () => {} }),
     createCredentials: () => undefined,
+    createPeerShare: () => ({
+      start: async () => ({ invite: "t4peer://v1/test/capability" }),
+      regenerate: async () => ({ invite: "t4peer://v1/test/capability" }),
+      status: () => ({ state: "sharing" as const, desktopPublicKey: "test" }),
+      stop: async () => {},
+    }),
     discoverExecutable: overrides.discoverExecutable ?? (serviceManager === undefined ? async () => undefined : async () => "/opt/omp/bin/omp"),
     ...(
       overrides.createServiceManager === undefined && serviceManager === undefined

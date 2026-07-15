@@ -43,10 +43,14 @@ describe("desktop IPC lifecycle proof", () => {
         start: async () => {
           calls.push("start");
           sharing = true;
-          return { invite: "t4peer://v1/desktop/capability", expiresAt: 1_000 };
+          return { invite: "t4peer://v1/desktop/capability" };
+        },
+        regenerate: async () => {
+          calls.push("regenerate");
+          return { invite: "t4peer://v1/desktop/replacement" };
         },
         status: () => sharing
-          ? { state: "sharing" as const, expiresAt: 1_000, desktopPublicKey: "desktop" }
+          ? { state: "sharing" as const, desktopPublicKey: "desktop" }
           : { state: "stopped" as const },
         stop: async () => { calls.push("stop"); sharing = false; },
       },
@@ -56,15 +60,14 @@ describe("desktop IPC lifecycle proof", () => {
 
     expect(await ipc.handlers.get("omp:peer-share:start")!(event, request("omp:peer-share:start"))).toEqual({
       invite: "t4peer://v1/desktop/capability",
-      expiresAt: 1_000,
     });
     expect(await ipc.handlers.get("omp:peer-share:status")!(event, request("omp:peer-share:status"))).toEqual({
       state: "sharing",
-      expiresAt: 1_000,
       desktopPublicKey: "desktop",
     });
     expect(await ipc.handlers.get("omp:peer-share:stop")!(event, request("omp:peer-share:stop"))).toEqual({ state: "stopped" });
-    expect(calls).toEqual(["start", "stop"]);
+    expect(await ipc.handlers.get("omp:peer-share:regenerate")!(event, request("omp:peer-share:regenerate"))).toEqual({ invite: "t4peer://v1/desktop/replacement" });
+    expect(calls).toEqual(["start", "stop", "regenerate"]);
     await expect(ipc.handlers.get("omp:peer-share:start")!(event, request("omp:peer-share:start", { invite: "forbidden" }))).rejects.toThrow();
   });
   it("serializes concurrent service actions", async () => {

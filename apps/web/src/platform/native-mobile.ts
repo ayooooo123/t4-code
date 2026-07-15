@@ -36,7 +36,8 @@ interface T4SecureStoragePlugin {
   clearCredentials(): Promise<void>;
 }
 export interface T4PeerConnectionPlugin {
-  open(options: { readonly publicKey: string }): Promise<{ readonly sessionId: string }>;
+  open(options: { readonly publicKey: string; readonly attemptId: string }): Promise<{ readonly sessionId: string }>;
+  cancelOpen(options: { readonly attemptId: string }): Promise<void>;
   write(options: { readonly sessionId: string; readonly data: string }): Promise<void>;
   close(options: { readonly sessionId: string }): Promise<void>;
   addListener(

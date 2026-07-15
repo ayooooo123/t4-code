@@ -5,6 +5,7 @@ import { safeStorage } from "electron";
 import type { CursorRecord, CursorStore } from "@t4-code/client";
 import type { CredentialEntry, CredentialVault, PairedHostRecord, TargetRegistry } from "@t4-code/remote";
 import type { CredentialCiphertextStore, RemoteTargetRecord, RemoteTargetStore, SafeStorageAdapter } from "./remote-runtime/index.ts";
+import type { PeerPairingMaterial, PeerPairingStore } from "./peer-share.ts";
 
 export interface DeviceIdentity {
   readonly deviceId: string;
@@ -15,6 +16,7 @@ interface RegistryState { readonly targets: Record<string, PairedHostRecord>; }
 interface VaultState { readonly ciphertext: Record<string, string>; }
 interface RemoteRegistryState { readonly version: 1; readonly records: readonly RemoteTargetRecord[]; }
 interface CredentialCiphertextState { readonly version: 1; readonly ciphertexts: Record<string, string>; }
+interface PeerPairingCiphertextState { readonly version: 1; readonly ciphertext?: string; }
 
 function recordKey(hostId: string, sessionId: string): string { return `${hostId}\u0000${sessionId}`; }
 function decodeRemoteState(value: unknown): RemoteRegistryState {
@@ -33,6 +35,18 @@ function decodeCredentialState(value: unknown): CredentialCiphertextState {
     ciphertexts[key] = encoded;
   }
   return { version: 1, ciphertexts };
+}
+function decodePeerPairingCiphertextState(value: unknown): PeerPairingCiphertextState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid peer pairing store");
+  const root = value as { version?: unknown; ciphertext?: unknown };
+  if (root.version !== 1 || root.ciphertext !== undefined && (typeof root.ciphertext !== "string" || root.ciphertext.length > 16_384 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(root.ciphertext) || Buffer.from(root.ciphertext, "base64").toString("base64") !== root.ciphertext)) throw new Error("invalid peer pairing store");
+  return root.ciphertext === undefined ? { version: 1 } : { version: 1, ciphertext: root.ciphertext };
+}
+function pairingBytes(value: unknown, expected: number): Uint8Array {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error("invalid peer pairing");
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.byteLength !== expected || decoded.toString("base64url") !== value) throw new Error("invalid peer pairing");
+  return new Uint8Array(decoded);
 }
 function enqueueWrite(queue: { tail: Promise<void> }, operation: () => void): Promise<void> {
   const result = queue.tail.then(operation, operation);
@@ -121,6 +135,62 @@ export class ElectronCredentialCiphertextStore implements CredentialCiphertextSt
       this.store.set("version", state.version);
       this.store.set("ciphertexts", state.ciphertexts);
     });
+  }
+}
+
+export interface PeerPairingCiphertextStore {
+  read(): unknown;
+  write(value: unknown): Promise<void>;
+}
+
+export class ElectronPeerPairingCiphertextStore implements PeerPairingCiphertextStore {
+  private readonly store: ElectronStore<PeerPairingCiphertextState>;
+  private readonly writeQueue = { tail: Promise.resolve() };
+  constructor(store = new ElectronStore<PeerPairingCiphertextState>({ name: "peer-pairing", defaults: { version: 1 } })) { this.store = store; }
+  read(): PeerPairingCiphertextState { return decodePeerPairingCiphertextState(this.store.store); }
+  write(value: unknown): Promise<void> {
+    return enqueueWrite(this.writeQueue, () => {
+      const state = decodePeerPairingCiphertextState(value);
+      this.store.set("version", state.version);
+      if (state.ciphertext === undefined) this.store.delete("ciphertext");
+      else this.store.set("ciphertext", state.ciphertext);
+    });
+  }
+}
+
+export class ElectronPeerPairingStore implements PeerPairingStore {
+  private readonly store: PeerPairingCiphertextStore;
+  private readonly encryption: SafeStorageAdapter;
+  constructor(store: PeerPairingCiphertextStore = new ElectronPeerPairingCiphertextStore(), encryption: SafeStorageAdapter = electronSafeStorage) {
+    if (!encryption.isEncryptionAvailable() || encryption.selectedStorageBackend?.() === "basic_text") throw new Error("encrypted peer pairing storage unavailable");
+    this.store = store;
+    this.encryption = encryption;
+  }
+  async load(): Promise<PeerPairingMaterial | null> {
+    const state = decodePeerPairingCiphertextState(this.store.read());
+    if (state.ciphertext === undefined) return null;
+    let value: unknown;
+    try { value = JSON.parse(this.encryption.decryptString(Buffer.from(state.ciphertext, "base64"))) as unknown; } catch { throw new Error("invalid peer pairing"); }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid peer pairing");
+    const pairing = value as { version?: unknown; publicKey?: unknown; secretKey?: unknown; capability?: unknown };
+    if (pairing.version !== 1) throw new Error("invalid peer pairing");
+    return {
+      publicKey: pairingBytes(pairing.publicKey, 32),
+      secretKey: pairingBytes(pairing.secretKey, 64),
+      capability: pairingBytes(pairing.capability, 32),
+    };
+  }
+  async save(value: PeerPairingMaterial): Promise<void> {
+    const publicKey = pairingBytes(Buffer.from(value.publicKey).toString("base64url"), 32);
+    const secretKey = pairingBytes(Buffer.from(value.secretKey).toString("base64url"), 64);
+    const capability = pairingBytes(Buffer.from(value.capability).toString("base64url"), 32);
+    const cleartext = JSON.stringify({
+      version: 1,
+      publicKey: Buffer.from(publicKey).toString("base64url"),
+      secretKey: Buffer.from(secretKey).toString("base64url"),
+      capability: Buffer.from(capability).toString("base64url"),
+    });
+    await this.store.write({ version: 1, ciphertext: this.encryption.encryptString(cleartext).toString("base64") });
   }
 }
 

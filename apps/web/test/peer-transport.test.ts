@@ -17,6 +17,7 @@ afterEach(() => {
 describe("CapacitorPeerTransport", () => {
   it("bounds a native connection attempt that never resolves", async () => {
     vi.useFakeTimers();
+    const cancelOpen = vi.fn(() => Promise.resolve());
     Object.assign(globalThis, { window: globalThis });
     Object.defineProperty(globalThis, "Capacitor", {
       configurable: true,
@@ -24,6 +25,7 @@ describe("CapacitorPeerTransport", () => {
         Plugins: {
           T4PeerConnection: {
             addListener: () => Promise.resolve({ remove: () => undefined }),
+            cancelOpen,
             close: () => Promise.resolve(),
             open: () => new Promise(() => undefined),
             write: () => Promise.resolve(),
@@ -38,5 +40,7 @@ describe("CapacitorPeerTransport", () => {
     await vi.advanceTimersByTimeAsync(50_000);
 
     expect(settled).toBe(true);
+    expect(cancelOpen).toHaveBeenCalledTimes(1);
+    expect(cancelOpen.mock.calls[0]?.[0]).toMatchObject({ attemptId: expect.any(String) });
   });
 });

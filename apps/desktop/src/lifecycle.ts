@@ -7,7 +7,7 @@ import type { ServiceManager } from "@t4-code/service-manager";
 import type { RemoteTargetRegistry } from "./remote-runtime/registry.ts";
 import { createDesktopWindow, type DesktopWindowHandle } from "./window.ts";
 import { DesktopIpcRegistry, runtimeError, type IpcRuntime } from "./ipc.ts";
-import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
+import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, ElectronPeerPairingStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
 import { VersionedRemoteTargetRegistry, DeviceCredentialStore } from "./remote-runtime/index.ts";
 import { LocalTargetManager, type TargetManagerOptions } from "./target-manager.ts";
 import { parsePairDeepLink, PendingPairQueue, type PendingPair } from "./deep-link.ts";
@@ -40,6 +40,7 @@ export interface DesktopLifecycleOptions {
   readonly probeAppserver?: (executable: string) => Promise<boolean>;
   readonly createServiceManager?: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   readonly createTargetManager?: (options: TargetManagerOptions) => LocalTargetManager;
+  readonly createPeerShare?: () => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
 }
 
 class ServiceRecoveryCancelledError extends Error {
@@ -63,7 +64,8 @@ export class DesktopLifecycle {
   private readonly serviceFactory: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
   private readonly targetManagerFactory: (options: TargetManagerOptions) => LocalTargetManager;
-  private readonly peerShare = new PeerShareHost();
+  private readonly peerShareFactory: () => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  private peerShare: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> | undefined;
   private mainWindow: BrowserWindow | undefined;
   private ipc: DesktopIpcRegistry | undefined;
   private manager: LocalTargetManager | undefined;
@@ -94,6 +96,7 @@ export class DesktopLifecycle {
     this.appserverProbe = options.probeAppserver ?? ((executable) => probeOmpAppserver(executable));
     this.serviceFactory = options.createServiceManager ?? createAppserverServiceManager;
     this.targetManagerFactory = options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
+    this.peerShareFactory = options.createPeerShare ?? (() => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore() }));
   }
   async start(): Promise<void> {
     if (this.startupPromise !== undefined) return this.startupPromise;
@@ -132,6 +135,15 @@ export class DesktopLifecycle {
     });
     await this.electronApp.whenReady();
     if (process.platform === "darwin") this.electronApp.setAsDefaultProtocolClient("t4-code");
+    try {
+      const peerShare = this.peerShareFactory();
+      await peerShare.start();
+      this.peerShare = peerShare;
+    } catch {
+      // Private pairing is unavailable without encrypted local storage or a
+      // usable DHT listener; the rest of desktop startup remains independent.
+      this.peerShare = undefined;
+    }
     const identity = this.identityFactory();
     const remoteRegistry = this.remoteRegistryFactory();
     const credentials = this.credentialsFactory();
@@ -177,7 +189,7 @@ export class DesktopLifecycle {
     const recovery = this.serviceRecoveryPromise;
     await Promise.all([
       manager?.close() ?? Promise.resolve(),
-      this.peerShare.stop(),
+      this.peerShare?.stop() ?? Promise.resolve(),
       recovery?.then(() => undefined, () => undefined) ?? Promise.resolve(),
     ]);
     if (this.beforeQuitHandler !== undefined) this.electronApp.removeListener("before-quit", this.beforeQuitHandler);
@@ -313,7 +325,7 @@ export class DesktopLifecycle {
       acquireServiceManager: () => this.acquireServiceManager(),
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
       drainPairLinks: () => this.pendingPairs.drain(),
-      peerShare: this.peerShare,
+      ...(this.peerShare === undefined ? {} : { peerShare: this.peerShare }),
     });
     this.ipc.install();
     handle.window.webContents.once("did-finish-load", () => {

@@ -6,10 +6,20 @@ import { createLocalTransport } from "./transport.ts";
 
 const SHARE_DURATION_MS = 15 * 60 * 1_000;
 const KEY_BYTES = 32;
+const MAX_ACTIVE_STREAMS = 4;
 
 export interface PeerKeyPair {
   readonly publicKey: Uint8Array;
   readonly secretKey: Uint8Array;
+}
+
+export interface PeerPairingMaterial extends PeerKeyPair {
+  readonly capability: Uint8Array;
+}
+
+export interface PeerPairingStore {
+  load(): Promise<PeerPairingMaterial | null>;
+  save(value: PeerPairingMaterial): Promise<void>;
 }
 
 export interface PeerServer {
@@ -32,7 +42,7 @@ export interface PeerDht {
 
 export type PeerShareStatus =
   | { readonly state: "stopped" }
-  | { readonly state: "sharing"; readonly expiresAt: number; readonly desktopPublicKey: string };
+  | { readonly state: "sharing"; readonly desktopPublicKey: string };
 
 export interface PeerShareHostOptions {
   readonly createDht?: () => PeerDht;
@@ -42,6 +52,7 @@ export interface PeerShareHostOptions {
   readonly setTimer?: (callback: () => void, delay: number) => unknown;
   readonly clearTimer?: (timer: unknown) => void;
   readonly createAppserverTransport?: () => Promise<OmpTransport>;
+  readonly pairingStore?: PeerPairingStore;
 }
 
 function defaultDht(): PeerDht {
@@ -90,8 +101,9 @@ export class PeerShareHost {
   private readonly setTimer: (callback: () => void, delay: number) => unknown;
   private readonly clearTimer: (timer: unknown) => void;
   private readonly createAppserverTransport: () => Promise<OmpTransport>;
+  private readonly pairingStore: PeerPairingStore | undefined;
   private readonly activeTransports = new Set<OmpTransport>();
-  private activeStream: PeerStream | undefined;
+  private readonly activeStreams = new Set<PeerStream>();
   private dht: PeerDht | undefined;
   private server: PeerServer | undefined;
   private timer: unknown;
@@ -110,14 +122,18 @@ export class PeerShareHost {
     this.setTimer = options.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
     this.createAppserverTransport = options.createAppserverTransport ?? defaultAppserverTransport;
+    this.pairingStore = options.pairingStore;
   }
 
-  async start(): Promise<{ readonly invite: string; readonly expiresAt: number }> {
+  async start(): Promise<{ readonly invite: string }> {
+    if (this.live !== undefined) return { invite: this.live.invite };
     await this.stop();
-    const keyPair = this.createKeyPair();
+    const saved = await this.pairingStore?.load();
+    const keyPair = saved ?? this.createKeyPair();
     const desktopPublicKey = requireLength(keyPair.publicKey, "desktop peer key", KEY_BYTES);
     requireLength(keyPair.secretKey, "desktop peer secret", 64);
-    const capability = requireLength(this.randomBytes(KEY_BYTES), "peer capability", KEY_BYTES);
+    const capability = requireLength(saved?.capability ?? this.randomBytes(KEY_BYTES), "peer capability", KEY_BYTES);
+    if (saved === null) await this.pairingStore?.save({ publicKey: desktopPublicKey, secretKey: keyPair.secretKey, capability });
     const dht = this.createDht();
     const server = dht.createServer();
     server.on("connection", (stream) => this.onConnection(stream));
@@ -132,14 +148,29 @@ export class PeerShareHost {
     this.dht = dht;
     this.server = server;
     this.live = { invite, expiresAt, desktopPublicKey, capability };
-    this.timer = this.setTimer(() => { void this.stop(); }, SHARE_DURATION_MS);
-    return this.live;
+    if (this.pairingStore === undefined) this.timer = this.setTimer(() => { void this.stop(); }, SHARE_DURATION_MS);
+    return { invite: this.live.invite };
+  }
+
+  async regenerate(): Promise<{ readonly invite: string }> {
+    const saved = await this.pairingStore?.load();
+    if (saved === undefined) {
+      await this.stop();
+      return this.start();
+    }
+    const capability = requireLength(this.randomBytes(KEY_BYTES), "peer capability", KEY_BYTES);
+    const keyPair = saved ?? this.createKeyPair();
+    const publicKey = requireLength(keyPair.publicKey, "desktop peer key", KEY_BYTES);
+    const secretKey = requireLength(keyPair.secretKey, "desktop peer secret", 64);
+    await this.pairingStore?.save({ publicKey, secretKey, capability });
+    await this.stop();
+    return this.start();
   }
 
   status(): PeerShareStatus {
     if (this.live === undefined) return { state: "stopped" };
     const metadata = peerInviteMetadata(this.live.invite);
-    return { state: "sharing", expiresAt: this.live.expiresAt, desktopPublicKey: metadata.desktopPublicKey };
+    return { state: "sharing", desktopPublicKey: metadata.desktopPublicKey };
   }
 
   async stop(): Promise<void> {
@@ -150,12 +181,12 @@ export class PeerShareHost {
     this.server = undefined;
     this.timer = undefined;
     this.live = undefined;
-    const activeStream = this.activeStream;
-    this.activeStream = undefined;
+    const activeStreams = [...this.activeStreams];
+    this.activeStreams.clear();
     if (timer !== undefined) this.clearTimer(timer);
     for (const transport of this.activeTransports) transport.close();
     this.activeTransports.clear();
-    activeStream?.destroy?.();
+    for (const stream of activeStreams) stream.destroy?.();
     if (server !== undefined) await server.close().catch(() => undefined);
     if (dht !== undefined) await dht.destroy().catch(() => undefined);
   }
@@ -167,9 +198,7 @@ export class PeerShareHost {
     let challenge: string | undefined;
     let upstream: OmpTransport | undefined;
     let queue = Promise.resolve();
-    const release = () => {
-      if (this.activeStream === stream) this.activeStream = undefined;
-    };
+    const release = () => { this.activeStreams.delete(stream); };
     const closeUpstream = () => {
       if (upstream === undefined) return;
       const transport = upstream;
@@ -212,11 +241,14 @@ export class PeerShareHost {
               terminate();
               return;
             }
-            if (this.activeStream !== undefined && this.activeStream !== stream) this.activeStream.destroy?.();
-            this.activeStream = stream;
+            if (this.activeStreams.size >= MAX_ACTIVE_STREAMS) {
+              terminate();
+              return;
+            }
+            this.activeStreams.add(stream);
             phase = "opening";
             const transport = await this.createAppserverTransport();
-            if (this.live === undefined || phase !== "opening" || this.activeStream !== stream) {
+            if (this.live === undefined || phase !== "opening" || !this.activeStreams.has(stream)) {
               transport.close();
               release();
               return;

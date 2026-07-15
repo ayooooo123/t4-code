@@ -31,12 +31,20 @@ class T4PeerConnectionPlugin : Plugin() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = mutableMapOf<String, Session>()
     private var opening = false
+    private var openingAttemptId: String? = null
+    private var openingJob: Job? = null
+    private var openingDht: HyperDHT? = null
 
     @PluginMethod
     fun open(call: PluginCall) {
         val key = decode(call.getString("publicKey"))
+        val attemptId = call.getString("attemptId")
         if (key == null || key.size != 32) {
             call.reject("Invalid desktop peer key.")
+            return
+        }
+        if (attemptId == null || attemptId.isEmpty() || attemptId.length > 128) {
+            call.reject("Invalid private connection attempt.")
             return
         }
         synchronized(sessions) {
@@ -45,12 +53,14 @@ class T4PeerConnectionPlugin : Plugin() {
                 return
             }
             opening = true
+            openingAttemptId = attemptId
         }
-        scope.launch {
+        val job = scope.launch {
             var dht: HyperDHT? = null
             try {
                 val activeDht = HyperDHT(DhtOptions(usePublicBootstrap = true))
                 dht = activeDht
+                synchronized(sessions) { if (openingAttemptId == attemptId) openingDht = activeDht }
                 withTimeout(NATIVE_OPEN_TIMEOUT_MS) {
                     activeDht.start()
                     activeDht.awaitBootstrapped()
@@ -73,11 +83,21 @@ class T4PeerConnectionPlugin : Plugin() {
                     synchronized(sessions) {
                         sessions[id] = Session(activeDht, stream, receiveJob)
                         opening = false
+                        openingAttemptId = null
+                        openingJob = null
+                        openingDht = null
                     }
                     call.resolve(JSObject().apply { put("sessionId", id) })
                 }
             } catch (error: Exception) {
-                synchronized(sessions) { opening = false }
+                synchronized(sessions) {
+                    if (openingAttemptId == attemptId) {
+                        opening = false
+                        openingAttemptId = null
+                        openingJob = null
+                        openingDht = null
+                    }
+                }
                 val message = if (error is TimeoutCancellationException) {
                     "Private mobile connection timed out. Generate a fresh key and try again."
                 } else {
@@ -87,6 +107,30 @@ class T4PeerConnectionPlugin : Plugin() {
                 try { dht?.close() } catch (_: Exception) {}
             }
         }
+        synchronized(sessions) { if (openingAttemptId == attemptId) openingJob = job }
+    }
+
+    @PluginMethod
+    fun cancelOpen(call: PluginCall) {
+        val attemptId = call.getString("attemptId")
+        if (attemptId == null) {
+            call.reject("Missing private connection attempt.")
+            return
+        }
+        val pending = synchronized(sessions) {
+            if (openingAttemptId != attemptId) null else {
+                val current = Pair(openingJob, openingDht)
+                opening = false
+                openingAttemptId = null
+                openingJob = null
+                openingDht = null
+                current
+            }
+        }
+        pending?.first?.cancel()
+        val dht = pending?.second
+        if (dht != null) scope.launch { try { dht.close() } catch (_: Exception) {} }
+        call.resolve()
     }
 
     @PluginMethod

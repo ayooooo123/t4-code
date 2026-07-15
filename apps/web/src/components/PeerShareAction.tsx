@@ -18,11 +18,7 @@ import { useState } from "react";
 
 import { rendererPlatform } from "../state/store-instance.ts";
 
-type PeerShare = { readonly invite: string; readonly expiresAt: number };
-
-function expiryLabel(expiresAt: number): string {
-  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(expiresAt);
-}
+type PeerShare = { readonly invite: string };
 
 export function PeerShareAction() {
   const shell = rendererPlatform.shell;
@@ -101,7 +97,7 @@ export function PeerShareAction() {
         <DialogHeader>
           <DialogTitle>Private mobile connection</DialogTitle>
           <DialogDescription>
-            Scan this code from T4 Code on Android, or paste the key. It expires at {share === undefined ? "—" : expiryLabel(share.expiresAt)} and allows one phone at a time.
+            Scan this code from T4 Code on Android, or paste the key. It stays paired until you reset it and supports up to four phones at once.
           </DialogDescription>
         </DialogHeader>
         {share !== undefined ? (
@@ -123,7 +119,7 @@ export function PeerShareAction() {
             <Copy /> {copied ? "Copied" : "Copy key"}
           </Button>
           <Button disabled={busy || share === undefined} onClick={() => void begin(true)} size="sm" variant="outline">
-            <RefreshCw /> Regenerate
+            <RefreshCw /> Reset pairing
           </Button>
           <Button disabled={busy || share === undefined} onClick={() => void stop()} size="sm" variant="destructive">
             <Square /> Stop
