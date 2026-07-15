@@ -87,7 +87,9 @@ export class WorkspaceRootsService {
     if (!within(canonicalRoot, canonicalTarget)) throw new Error("project must stay inside the active root");
     const stat = await lstat(canonicalTarget);
     if (!stat.isDirectory()) throw new Error("project is not a directory");
-    return { id: this.ids(), name };
+    // OMP uses its project id as the working directory. The host validates and
+    // creates this path before it is ever passed to an appserver command.
+    return { id: canonicalTarget, name };
   }
 
   private async directory(input: string): Promise<string> {

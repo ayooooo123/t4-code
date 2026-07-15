@@ -21,6 +21,11 @@ export interface PeerPairingStore {
   load(): Promise<PeerPairingMaterial | null>;
   save(value: PeerPairingMaterial): Promise<void>;
 }
+export interface PeerWorkspaceRoots {
+  list(): Promise<{ readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null }>;
+  selectRoot(id: string): Promise<void>;
+  createProject(name: string): Promise<{ readonly id: string; readonly name: string }>;
+}
 
 export interface PeerServer {
   listen(keyPair: PeerKeyPair): Promise<void>;
@@ -53,6 +58,7 @@ export interface PeerShareHostOptions {
   readonly clearTimer?: (timer: unknown) => void;
   readonly createAppserverTransport?: () => Promise<OmpTransport>;
   readonly pairingStore?: PeerPairingStore;
+  readonly workspaceRoots?: PeerWorkspaceRoots;
 }
 
 function defaultDht(): PeerDht {
@@ -102,6 +108,7 @@ export class PeerShareHost {
   private readonly clearTimer: (timer: unknown) => void;
   private readonly createAppserverTransport: () => Promise<OmpTransport>;
   private readonly pairingStore: PeerPairingStore | undefined;
+  private readonly workspaceRoots: PeerWorkspaceRoots | undefined;
   private readonly activeTransports = new Set<OmpTransport>();
   private readonly activeStreams = new Set<PeerStream>();
   private dht: PeerDht | undefined;
@@ -124,6 +131,7 @@ export class PeerShareHost {
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
     this.createAppserverTransport = options.createAppserverTransport ?? defaultAppserverTransport;
     this.pairingStore = options.pairingStore;
+    this.workspaceRoots = options.workspaceRoots;
   }
 
   async start(): Promise<{ readonly invite: string }> {
@@ -284,10 +292,40 @@ export class PeerShareHost {
             upstream.send(frame.data);
             continue;
           }
+          if (phase === "authorized" && frame.type === "workspace") {
+            await this.handleWorkspace(stream, frame);
+            continue;
+          }
           terminate();
           return;
         }
       }).catch(() => terminate());
     });
+  }
+
+  private async handleWorkspace(
+    stream: PeerStream,
+    frame: Extract<import("@t4-code/protocol").PeerWireFrame, { readonly type: "workspace" }>,
+  ): Promise<void> {
+    const roots = this.workspaceRoots;
+    try {
+      if (roots === undefined) throw new Error("workspace folders are unavailable");
+      if (frame.operation === "roots.list") {
+        const result = await roots.list();
+        stream.write(encodePeerWireFrame({ type: "workspace-result", requestId: frame.requestId, ok: true, roots: result.roots, activeRootId: result.activeRootId }));
+        return;
+      }
+      if (frame.operation === "root.select") {
+        await roots.selectRoot(frame.rootId!);
+        const result = await roots.list();
+        stream.write(encodePeerWireFrame({ type: "workspace-result", requestId: frame.requestId, ok: true, roots: result.roots, activeRootId: result.activeRootId }));
+        return;
+      }
+      const project = await roots.createProject(frame.name!);
+      stream.write(encodePeerWireFrame({ type: "workspace-result", requestId: frame.requestId, ok: true, project }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 512) : "workspace operation failed";
+      stream.write(encodePeerWireFrame({ type: "workspace-result", requestId: frame.requestId, ok: false, error: message }));
+    }
   }
 }

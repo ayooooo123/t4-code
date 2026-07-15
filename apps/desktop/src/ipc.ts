@@ -31,6 +31,11 @@ import {
   type TerminalInputRequest,
   type TerminalResizeRequest,
   type TerminalResult,
+  type WorkspaceProjectCreateRequest,
+  type WorkspaceProjectCreateResult,
+  type WorkspaceRootChooseResult,
+  type WorkspaceRootSelectRequest,
+  type WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
 import type { RendererServerFrame } from "@t4-code/protocol/desktop-ipc";
 import type { ServiceManager } from "@t4-code/service-manager";
@@ -38,6 +43,7 @@ import { redactedMessage } from "@t4-code/client";
 import { trustedSender, type TrustedRenderer } from "./security.ts";
 import type { PeerShareHost } from "./peer-share.ts";
 import type { LocalTargetManager } from "./target-manager.ts";
+import type { WorkspaceRootsService } from "./workspace-roots.ts";
 export interface IpcRuntime {
   readonly manager: LocalTargetManager;
   readonly window: BrowserWindow;
@@ -50,6 +56,8 @@ export interface IpcRuntime {
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly drainPairLinks?: () => readonly PairLinkEvent[];
   readonly peerShare?: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  readonly workspaceRoots?: Pick<WorkspaceRootsService, "list" | "addRoot" | "selectRoot" | "createProject">;
+  readonly chooseWorkspaceRoot?: () => Promise<string | null>;
 }
 export class RemotePairingUnavailableError extends Error {
   readonly code = "remote_pairing_unavailable" as const;
@@ -81,6 +89,7 @@ export class DesktopIpcRegistry {
   private readonly runtime: IpcRuntime;
   private readonly serviceQueue = { tail: Promise.resolve() };
   private readonly peerShareQueue = { tail: Promise.resolve() };
+  private readonly workspaceQueue = { tail: Promise.resolve() };
   private serviceInspectionPromise: Promise<ServiceInspection> | undefined;
   private readonly ipc: IpcMainLike;
   constructor(runtime: IpcRuntime, ipc: IpcMainLike = ipcMain) {
@@ -200,6 +209,29 @@ export class DesktopIpcRegistry {
       decodeRequest("omp:peer-share:regenerate", payload);
       return this.enqueuePeerShare(() => this.peerShare().regenerate());
     });
+    this.ipc.handle("omp:workspace:roots:list", async (event, payload: unknown): Promise<WorkspaceRootsResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:workspace:roots:list", payload);
+      return this.enqueueWorkspace(() => this.workspaceRoots().list());
+    });
+    this.ipc.handle("omp:workspace:root:select", async (event, payload: unknown): Promise<void> => {
+      this.assertSender(event);
+      const input = decodeRequest("omp:workspace:root:select", payload).payload as WorkspaceRootSelectRequest;
+      await this.enqueueWorkspace(() => this.workspaceRoots().selectRoot(input.rootId));
+    });
+    this.ipc.handle("omp:workspace:root:choose", async (event, payload: unknown): Promise<WorkspaceRootChooseResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:workspace:root:choose", payload);
+      return this.enqueueWorkspace(async () => {
+        const path = await this.runtime.chooseWorkspaceRoot?.();
+        return { root: path === null || path === undefined ? null : await this.workspaceRoots().addRoot(path) };
+      });
+    });
+    this.ipc.handle("omp:workspace:project:create", async (event, payload: unknown): Promise<WorkspaceProjectCreateResult> => {
+      this.assertSender(event);
+      const input = decodeRequest("omp:workspace:project:create", payload).payload as WorkspaceProjectCreateRequest;
+      return this.enqueueWorkspace(async () => ({ project: await this.workspaceRoots().createProject(input.name) }));
+    });
   }
   uninstall(): void {
     for (const channel of [
@@ -291,6 +323,15 @@ export class DesktopIpcRegistry {
   private enqueuePeerShare<T>(operation: () => Promise<T> | T): Promise<T> {
     const result = this.peerShareQueue.tail.then(operation, operation);
     this.peerShareQueue.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+  private workspaceRoots(): Pick<WorkspaceRootsService, "list" | "addRoot" | "selectRoot" | "createProject"> {
+    if (this.runtime.workspaceRoots === undefined) throw new Error("workspace folders are unavailable");
+    return this.runtime.workspaceRoots;
+  }
+  private enqueueWorkspace<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.workspaceQueue.tail.then(operation, operation);
+    this.workspaceQueue.tail = result.then(() => undefined, () => undefined);
     return result;
   }
   private emit(channel: DesktopEventChannel, payload: unknown): void {

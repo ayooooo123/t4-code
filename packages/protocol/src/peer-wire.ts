@@ -9,6 +9,9 @@ export type PeerWireFrame =
   | { readonly type: "authorize"; readonly proof: string }
   | { readonly type: "authorized" }
   | { readonly type: "message"; readonly data: string }
+  | { readonly type: "workspace"; readonly requestId: string; readonly operation: "roots.list" | "root.select" | "project.create"; readonly rootId?: string; readonly name?: string }
+  | { readonly type: "workspace-result"; readonly requestId: string; readonly ok: true; readonly roots?: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId?: string | null; readonly project?: { readonly id: string; readonly name: string } }
+  | { readonly type: "workspace-result"; readonly requestId: string; readonly ok: false; readonly error: string }
   | { readonly type: "close"; readonly code: number; readonly reason: string }
   | { readonly type: "error"; readonly code: string };
 
@@ -26,6 +29,17 @@ function text(value: unknown, maxBytes: number): string {
 
 function fields(value: Record<string, unknown>, allowed: readonly string[]): void {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error("invalid peer frame");
+}
+
+function workspaceRoot(value: unknown): { readonly id: string; readonly label: string } {
+  const item = record(value);
+  fields(item, ["id", "label"]);
+  return { id: text(item.id, 256), label: text(item.label, 256) };
+}
+function workspaceProject(value: unknown): { readonly id: string; readonly name: string } {
+  const item = record(value);
+  fields(item, ["id", "name"]);
+  return { id: text(item.id, 4 * 1024), name: text(item.name, 256) };
 }
 
 export function decodePeerWireFrame(value: unknown): PeerWireFrame {
@@ -51,6 +65,39 @@ export function decodePeerWireFrame(value: unknown): PeerWireFrame {
   if (type === "message") {
     fields(frame, ["type", "data"]);
     return { type, data: text(frame.data, MAX_TEXT_BYTES) };
+  }
+  if (type === "workspace") {
+    fields(frame, ["type", "requestId", "operation", "rootId", "name"]);
+    const requestId = text(frame.requestId, 256);
+    if (frame.operation === "roots.list") {
+      if (frame.rootId !== undefined || frame.name !== undefined) throw new Error("invalid peer frame");
+      return { type, requestId, operation: frame.operation };
+    }
+    if (frame.operation === "root.select") {
+      if (frame.name !== undefined) throw new Error("invalid peer frame");
+      return { type, requestId, operation: frame.operation, rootId: text(frame.rootId, 256) };
+    }
+    if (frame.operation === "project.create") {
+      if (frame.rootId !== undefined) throw new Error("invalid peer frame");
+      return { type, requestId, operation: frame.operation, name: text(frame.name, 256) };
+    }
+    throw new Error("invalid peer frame");
+  }
+  if (type === "workspace-result") {
+    const requestId = text(frame.requestId, 256);
+    if (frame.ok === false) {
+      fields(frame, ["type", "requestId", "ok", "error"]);
+      return { type, requestId, ok: false, error: text(frame.error, 512) };
+    }
+    fields(frame, ["type", "requestId", "ok", "roots", "activeRootId", "project"]);
+    if (frame.ok !== true) throw new Error("invalid peer frame");
+    if (frame.roots !== undefined) {
+      if (!Array.isArray(frame.roots) || frame.roots.length > 64 || frame.project !== undefined) throw new Error("invalid peer frame");
+      if (frame.activeRootId !== null && frame.activeRootId !== undefined && typeof frame.activeRootId !== "string") throw new Error("invalid peer frame");
+      return { type, requestId, ok: true, roots: frame.roots.map(workspaceRoot), ...(frame.activeRootId === undefined ? {} : { activeRootId: frame.activeRootId === null ? null : text(frame.activeRootId, 256) }) };
+    }
+    if (frame.project !== undefined && frame.activeRootId === undefined) return { type, requestId, ok: true, project: workspaceProject(frame.project) };
+    throw new Error("invalid peer frame");
   }
   if (type === "close") {
     fields(frame, ["type", "code", "reason"]);

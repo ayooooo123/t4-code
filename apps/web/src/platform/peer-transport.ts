@@ -12,6 +12,11 @@ const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 const PEER_OPEN_TIMEOUT_MS = 50_000;
 const encoder = new TextEncoder();
 
+export type PeerWorkspaceRoots = { readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null };
+export type PeerWorkspaceProject = { readonly id: string; readonly name: string };
+type WorkspaceRequest = Omit<Extract<PeerWireFrame, { readonly type: "workspace" }>, "type" | "requestId">;
+type WorkspaceResult = Extract<PeerWireFrame, { readonly type: "workspace-result"; readonly ok: true }>;
+
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
@@ -60,6 +65,7 @@ export class CapacitorPeerTransport implements OmpTransport {
   private removers: (() => Promise<void> | void)[] = [];
   private opened = false;
   private closed = false;
+  private readonly workspaceRequests = new Map<string, { resolve: (value: WorkspaceResult) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 
   constructor(invite: string) {
     decodePeerInvite(invite);
@@ -98,6 +104,15 @@ export class CapacitorPeerTransport implements OmpTransport {
       }
       if (frame.type === "message" && this.opened) {
         for (const listener of this.messages) listener(frame.data);
+        return;
+      }
+      if (frame.type === "workspace-result" && this.opened) {
+        const pending = this.workspaceRequests.get(frame.requestId);
+        if (pending === undefined) return;
+        this.workspaceRequests.delete(frame.requestId);
+        clearTimeout(pending.timer);
+        if (!frame.ok) pending.reject(new Error(frame.error));
+        else pending.resolve(frame);
         return;
       }
       fail(new Error("private mobile connection rejected the protocol"));
@@ -151,6 +166,41 @@ export class CapacitorPeerTransport implements OmpTransport {
   onClose(listener: (code?: number, reason?: string) => void): Unsubscribe { this.closes.add(listener); return () => this.closes.delete(listener); }
   onError(listener: (error: unknown) => void): Unsubscribe { this.errors.add(listener); return () => this.errors.delete(listener); }
 
+  async workspaceRoots(): Promise<PeerWorkspaceRoots> {
+    const result = await this.workspace({ operation: "roots.list" });
+    if (result.roots === undefined || result.activeRootId === undefined) throw new Error("private host returned invalid workspace roots");
+    return { roots: result.roots, activeRootId: result.activeRootId };
+  }
+  async selectWorkspaceRoot(rootId: string): Promise<PeerWorkspaceRoots> {
+    const result = await this.workspace({ operation: "root.select", rootId });
+    if (result.roots === undefined || result.activeRootId === undefined) throw new Error("private host returned invalid workspace roots");
+    return { roots: result.roots, activeRootId: result.activeRootId };
+  }
+  async createWorkspaceProject(name: string): Promise<PeerWorkspaceProject> {
+    const result = await this.workspace({ operation: "project.create", name });
+    if (result.project === undefined) throw new Error("private host returned invalid project");
+    return result.project;
+  }
+
+  private workspace(frame: WorkspaceRequest): Promise<WorkspaceResult> {
+    if (!this.opened || this.closed) return Promise.reject(new Error("private mobile connection is not connected"));
+    const requestId = randomNonce();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.workspaceRequests.delete(requestId);
+        reject(new Error("workspace request timed out"));
+      }, 15_000);
+      this.workspaceRequests.set(requestId, { resolve, reject, timer });
+      void this.writeFrame({ type: "workspace", ...frame, requestId }).catch((error: unknown) => {
+        const pending = this.workspaceRequests.get(requestId);
+        if (pending === undefined) return;
+        this.workspaceRequests.delete(requestId);
+        clearTimeout(pending.timer);
+        pending.reject(error instanceof Error ? error : new Error("workspace request failed"));
+      });
+    });
+  }
+
   private async writeFrame(frame: PeerWireFrame): Promise<void> {
     const plugin = this.plugin;
     const sessionId = this.sessionId;
@@ -162,6 +212,11 @@ export class CapacitorPeerTransport implements OmpTransport {
     for (const remove of this.removers.splice(0)) void remove();
     if (!this.opened && !this.closed) return;
     this.opened = false;
+    for (const [requestId, pending] of this.workspaceRequests) {
+      this.workspaceRequests.delete(requestId);
+      clearTimeout(pending.timer);
+      pending.reject(new Error("private mobile connection closed"));
+    }
     for (const listener of this.closes) listener(1000, "private connection closed");
     this.messages.clear();
     this.closes.clear();

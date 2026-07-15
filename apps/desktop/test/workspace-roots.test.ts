@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
@@ -55,7 +55,7 @@ describe("WorkspaceRootsService", () => {
     const project = await service.createProject("mobile-app");
 
     expect(project.name).toBe("mobile-app");
-    expect(project.id).toBe("id-2");
+    expect(project.id).toBe(await realpath(join(root, "mobile-app")));
     await expect(service.createProject("../escape")).rejects.toThrow("folder name");
     await expect(service.createProject("nested/project")).rejects.toThrow("folder name");
   });

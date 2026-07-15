@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, dialog } from "electron";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { CursorStore } from "@t4-code/client";
@@ -7,12 +7,13 @@ import type { ServiceManager } from "@t4-code/service-manager";
 import type { RemoteTargetRegistry } from "./remote-runtime/registry.ts";
 import { createDesktopWindow, type DesktopWindowHandle } from "./window.ts";
 import { DesktopIpcRegistry, runtimeError, type IpcRuntime } from "./ipc.ts";
-import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, ElectronPeerPairingStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
+import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, ElectronPeerPairingStore, ElectronWorkspaceRootsStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
 import { VersionedRemoteTargetRegistry, DeviceCredentialStore } from "./remote-runtime/index.ts";
 import { LocalTargetManager, type TargetManagerOptions } from "./target-manager.ts";
 import { parsePairDeepLink, PendingPairQueue, type PendingPair } from "./deep-link.ts";
 import { PeerShareHost } from "./peer-share.ts";
 import { createAppserverServiceManager, discoverOmpExecutable, OmpAppserverCompatibilityError, probeOmpAppserver, NodeServiceFileSystem } from "./service.ts";
+import { WorkspaceRootsService } from "./workspace-roots.ts";
 
 export function appserverLogsDirectory(
   homeDirectory: string,
@@ -40,7 +41,8 @@ export interface DesktopLifecycleOptions {
   readonly probeAppserver?: (executable: string) => Promise<boolean>;
   readonly createServiceManager?: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   readonly createTargetManager?: (options: TargetManagerOptions) => LocalTargetManager;
-  readonly createPeerShare?: () => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  readonly createPeerShare?: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  readonly createWorkspaceRoots?: () => WorkspaceRootsService;
 }
 
 class ServiceRecoveryCancelledError extends Error {
@@ -64,8 +66,10 @@ export class DesktopLifecycle {
   private readonly serviceFactory: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
   private readonly targetManagerFactory: (options: TargetManagerOptions) => LocalTargetManager;
-  private readonly peerShareFactory: () => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  private readonly peerShareFactory: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  private readonly workspaceRootsFactory: () => WorkspaceRootsService;
   private peerShare: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> | undefined;
+  private workspaceRoots: WorkspaceRootsService | undefined;
   private mainWindow: BrowserWindow | undefined;
   private ipc: DesktopIpcRegistry | undefined;
   private manager: LocalTargetManager | undefined;
@@ -96,7 +100,8 @@ export class DesktopLifecycle {
     this.appserverProbe = options.probeAppserver ?? ((executable) => probeOmpAppserver(executable));
     this.serviceFactory = options.createServiceManager ?? createAppserverServiceManager;
     this.targetManagerFactory = options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
-    this.peerShareFactory = options.createPeerShare ?? (() => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore() }));
+    this.peerShareFactory = options.createPeerShare ?? ((workspaceRoots) => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore(), workspaceRoots }));
+    this.workspaceRootsFactory = options.createWorkspaceRoots ?? (() => new WorkspaceRootsService({ store: new ElectronWorkspaceRootsStore() }));
   }
   async start(): Promise<void> {
     if (this.startupPromise !== undefined) return this.startupPromise;
@@ -137,7 +142,8 @@ export class DesktopLifecycle {
     if (process.platform === "darwin") this.electronApp.setAsDefaultProtocolClient("t4-code");
     // Pairing uses a network listener and must never prevent the desktop UI
     // from opening. The IPC bridge can await this same host on demand.
-    const peerShare = this.peerShareFactory();
+    this.workspaceRoots = this.workspaceRootsFactory();
+    const peerShare = this.peerShareFactory(this.workspaceRoots);
     this.peerShare = peerShare;
     const identity = this.identityFactory();
     const remoteRegistry = this.remoteRegistryFactory();
@@ -324,6 +330,14 @@ export class DesktopLifecycle {
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
       drainPairLinks: () => this.pendingPairs.drain(),
       ...(this.peerShare === undefined ? {} : { peerShare: this.peerShare }),
+      ...(this.workspaceRoots === undefined ? {} : { workspaceRoots: this.workspaceRoots }),
+      chooseWorkspaceRoot: async () => {
+        const choice = await dialog.showOpenDialog(handle.window, {
+          title: "Choose workspace folder",
+          properties: ["openDirectory", "createDirectory"],
+        });
+        return choice.canceled ? null : (choice.filePaths[0] ?? null);
+      },
     });
     this.ipc.install();
     handle.window.webContents.once("did-finish-load", () => {

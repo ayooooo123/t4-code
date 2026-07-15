@@ -70,6 +70,30 @@ describe("desktop IPC lifecycle proof", () => {
     expect(calls).toEqual(["start", "stop", "regenerate"]);
     await expect(ipc.handlers.get("omp:peer-share:start")!(event, request("omp:peer-share:start", { invite: "forbidden" }))).rejects.toThrow();
   });
+  it("serves only approved workspace roots and serializes project creation", async () => {
+    const ipc = new FakeIpc();
+    const { runtime: baseRuntime } = makeRuntime();
+    const calls: string[] = [];
+    const runtime: IpcRuntime = {
+      ...baseRuntime,
+      workspaceRoots: {
+        list: async () => ({ roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1" }),
+        addRoot: async () => ({ id: "root-1", label: "Projects" }),
+        selectRoot: async (id: string) => { calls.push(`select:${id}`); },
+        createProject: async (name: string) => { calls.push(`create:${name}`); return { id: "project-1", name }; },
+      },
+    } as IpcRuntime;
+    new DesktopIpcRegistry(runtime, ipc).install();
+    const event = { sender: runtime.window.webContents, senderFrame: runtime.window.webContents.mainFrame };
+    expect(await ipc.handlers.get("omp:workspace:roots:list")!(event, request("omp:workspace:roots:list"))).toEqual({
+      roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1",
+    });
+    await ipc.handlers.get("omp:workspace:root:select")!(event, request("omp:workspace:root:select", { rootId: "root-1" }));
+    expect(await ipc.handlers.get("omp:workspace:project:create")!(event, request("omp:workspace:project:create", { name: "Mobile app" }))).toEqual({
+      project: { id: "project-1", name: "Mobile app" },
+    });
+    expect(calls).toEqual(["select:root-1", "create:Mobile app"]);
+  });
   it("serializes concurrent service actions", async () => {
     const ipc = new FakeIpc();
     const order: string[] = [];

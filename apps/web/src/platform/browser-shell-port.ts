@@ -51,6 +51,9 @@ import type {
   TerminalInputRequest,
   TerminalResizeRequest,
   TerminalResult,
+  WorkspaceProjectCreateResult,
+  WorkspaceRootSelectRequest,
+  WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
 import { commandResultError } from "@t4-code/protocol/desktop-ipc";
 import type { DesktopShellPort } from "@t4-code/client";
@@ -213,6 +216,7 @@ export function createBrowserShellPort(
 
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
+  let activePeerTransport: CapacitorPeerTransport | undefined;
   let welcome: WelcomeFrame | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
@@ -265,6 +269,10 @@ export function createBrowserShellPort(
         ? new BrowserWebSocketTransport({ url: backendConfig.wsUrl })
         : new CapacitorPeerTransport(peerInvite);
       await next.open();
+      if (next instanceof CapacitorPeerTransport) {
+        activePeerTransport = next;
+        next.onClose(() => { if (activePeerTransport === next) activePeerTransport = undefined; });
+      }
       return next;
     };
 
@@ -355,6 +363,19 @@ export function createBrowserShellPort(
       }
       emitState(TARGET_ID, "disconnected");
       return { targetId: TARGET_ID, state: "disconnected" };
+    },
+
+    async workspaceRootsList(): Promise<WorkspaceRootsResult> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      return activePeerTransport.workspaceRoots();
+    },
+    async workspaceRootSelect(request: WorkspaceRootSelectRequest): Promise<void> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      await activePeerTransport.selectWorkspaceRoot(request.rootId);
+    },
+    async workspaceProjectCreate(request: { readonly name: string }): Promise<WorkspaceProjectCreateResult> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      return { project: await activePeerTransport.createWorkspaceProject(request.name) };
     },
 
     async command(request: CommandRequest): Promise<CommandResult> {

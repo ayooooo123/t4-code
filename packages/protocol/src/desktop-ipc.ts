@@ -45,6 +45,10 @@ export const DESKTOP_IPC_CHANNELS = [
   "omp:peer-share:status",
   "omp:peer-share:stop",
   "omp:peer-share:regenerate",
+  "omp:workspace:roots:list",
+  "omp:workspace:root:select",
+  "omp:workspace:root:choose",
+  "omp:workspace:project:create",
 ] as const;
 export type DesktopInvokeChannel = (typeof DESKTOP_IPC_CHANNELS)[number];
 export const DESKTOP_IPC_EVENTS = [
@@ -86,6 +90,16 @@ export interface PeerShareStartResult {
 export type PeerShareStatusResult =
   | { readonly state: "stopped" }
   | { readonly state: "sharing"; readonly desktopPublicKey: string };
+/** Approved host directories. Their paths never cross the renderer IPC boundary. */
+export interface WorkspaceRoot { readonly id: string; readonly label: string; }
+export interface WorkspaceProject { readonly id: string; readonly name: string; }
+export interface WorkspaceRootsListRequest {}
+export interface WorkspaceRootsResult { readonly roots: readonly WorkspaceRoot[]; readonly activeRootId: string | null; }
+export interface WorkspaceRootSelectRequest { readonly rootId: string; }
+export interface WorkspaceRootChooseRequest {}
+export interface WorkspaceRootChooseResult { readonly root: WorkspaceRoot | null; }
+export interface WorkspaceProjectCreateRequest { readonly name: string; }
+export interface WorkspaceProjectCreateResult { readonly project: WorkspaceProject; }
 export interface BootstrapResult {
   platform: DesktopPlatform;
   version: typeof PROTOCOL_VERSION;
@@ -380,6 +394,10 @@ export interface DesktopInvokeRequestMap {
   "omp:peer-share:status": PeerShareRequest;
   "omp:peer-share:stop": PeerShareRequest;
   "omp:peer-share:regenerate": PeerShareRequest;
+  "omp:workspace:roots:list": WorkspaceRootsListRequest;
+  "omp:workspace:root:select": WorkspaceRootSelectRequest;
+  "omp:workspace:root:choose": WorkspaceRootChooseRequest;
+  "omp:workspace:project:create": WorkspaceProjectCreateRequest;
 }
 export interface DesktopInvokeResponseMap {
   "omp:targets:list": TargetListResult;
@@ -405,6 +423,10 @@ export interface DesktopInvokeResponseMap {
   "omp:peer-share:status": PeerShareStatusResult;
   "omp:peer-share:stop": PeerShareStatusResult;
   "omp:peer-share:regenerate": PeerShareStartResult;
+  "omp:workspace:roots:list": WorkspaceRootsResult;
+  "omp:workspace:root:select": void;
+  "omp:workspace:root:choose": WorkspaceRootChooseResult;
+  "omp:workspace:project:create": WorkspaceProjectCreateResult;
 }
 export interface RendererServerFrameEvent {
   targetId: string;
@@ -618,8 +640,16 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:peer-share:status":
     case "omp:peer-share:stop":
     case "omp:peer-share:regenerate":
+    case "omp:workspace:roots:list":
+    case "omp:workspace:root:choose":
       exact(payload, []);
       return { channel, payload: {} };
+    case "omp:workspace:root:select":
+      exact(payload, ["rootId"]);
+      return { channel, payload: { rootId: controlFree(payload.rootId, "rootId", 128) } };
+    case "omp:workspace:project:create":
+      exact(payload, ["name"]);
+      return { channel, payload: { name: controlFree(payload.name, "name", 81) } };
     case "omp:command":
       exact(payload, ["targetId", "intent"]);
       {

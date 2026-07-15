@@ -28,6 +28,10 @@ import {
   type TerminalInputRequest,
   type TerminalResizeRequest,
   type TerminalResult,
+  type WorkspaceProjectCreateResult,
+  type WorkspaceRootChooseResult,
+  type WorkspaceRootSelectRequest,
+  type WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
  
 export interface OmpShellBridge {
@@ -53,6 +57,10 @@ export interface OmpShellBridge {
   readonly peerShareStatus: () => Promise<PeerShareStatusResult>;
   readonly peerShareStop: () => Promise<PeerShareStatusResult>;
   readonly peerShareRegenerate: () => Promise<PeerShareStartResult>;
+  readonly workspaceRootsList: () => Promise<WorkspaceRootsResult>;
+  readonly workspaceRootSelect: (request: WorkspaceRootSelectRequest) => Promise<void>;
+  readonly workspaceRootChoose: () => Promise<WorkspaceRootChooseResult>;
+  readonly workspaceProjectCreate: (request: { readonly name: string }) => Promise<WorkspaceProjectCreateResult>;
   readonly listTargets: () => Promise<TargetListResult>;
   readonly addTarget: (request: TargetAddRequest) => Promise<TargetAddResult>;
   readonly removeTarget: (request: TargetRequest) => Promise<TargetRemoveResult>;
@@ -64,7 +72,7 @@ export interface OmpShellBridge {
   readonly onPairLink: (listener: (event: PairLinkEvent) => void) => () => void;
 }
 
-function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:peer-share:start" | "omp:peer-share:status" | "omp:peer-share:stop" | "omp:peer-share:regenerate" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove", R>(channel: C, payload: unknown): Promise<R> {
+function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:peer-share:start" | "omp:peer-share:status" | "omp:peer-share:stop" | "omp:peer-share:regenerate" | "omp:workspace:roots:list" | "omp:workspace:root:select" | "omp:workspace:root:choose" | "omp:workspace:project:create" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove", R>(channel: C, payload: unknown): Promise<R> {
   return ipcRenderer.invoke(channel, { channel, payload }) as Promise<R>;
 }
 
@@ -107,6 +115,10 @@ const bridge: OmpShellBridge = {
   peerShareStatus: () => invoke("omp:peer-share:status", {}),
   peerShareStop: () => invoke("omp:peer-share:stop", {}),
   peerShareRegenerate: () => invoke("omp:peer-share:regenerate", {}),
+  workspaceRootsList: () => invoke("omp:workspace:roots:list", {}),
+  workspaceRootSelect: (request) => invoke("omp:workspace:root:select", request),
+  workspaceRootChoose: () => invoke("omp:workspace:root:choose", {}),
+  workspaceProjectCreate: (request) => invoke("omp:workspace:project:create", request),
   listTargets: () => invoke("omp:targets:list", {}),
   addTarget: (request) => invoke("omp:targets:add", request),
   removeTarget: (request) => invoke("omp:targets:remove", request),

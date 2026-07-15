@@ -78,7 +78,7 @@ describe("PeerShareHost", () => {
     let resolveListen: (() => void) | undefined;
     const listening = new Promise<void>((resolve) => { resolveListen = resolve; });
     dht.server.listen = async () => { dht.server.listens += 1; await listening; };
-    const host = new PeerShareHost({
+    const host = new peer.PeerShareHost({
       createDht: () => dht,
       createKeyPair: () => ({ publicKey: new Uint8Array(32).fill(3), secretKey: new Uint8Array(64).fill(4) }),
       randomBytes: (length) => new Uint8Array(length).fill(9),
@@ -238,6 +238,43 @@ describe("PeerShareHost", () => {
 
     expect(new PeerWireDecoder().push(socket.writes[1]!)).toEqual([{ type: "authorized" }]);
     expect(socket.destroyed).toBe(false);
+    await host.stop();
+  });
+
+  it("handles approved workspace controls only after peer authorization", async () => {
+    const dht = new FakeDht();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    const calls: string[] = [];
+    const host = new peer.PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(1),
+      createAppserverTransport: async () => new FakeOmpTransport(),
+      workspaceRoots: {
+        list: async () => ({ roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1" }),
+        selectRoot: async (id) => { calls.push(`select:${id}`); },
+        createProject: async (name) => { calls.push(`create:${name}`); return { id: "/approved/mobile-app", name }; },
+      },
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+    const socket = new FakePeerSocket();
+    dht.server.connection?.(socket);
+    socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce: "mobile" }));
+    await waitForWrites(socket, 1);
+    const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+    if (challenge?.type !== "challenge") throw new Error("missing challenge");
+    const proof = createHmac("sha256", Buffer.alloc(32, 1)).update("t4peer/v1\0").update("mobile").update(challenge.nonce).update(desktopPublicKey).digest("base64url");
+    socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    await waitForWrites(socket, 2);
+    socket.send(encodePeerWireFrame({ type: "workspace", requestId: "folders", operation: "roots.list" }));
+    await waitForWrites(socket, 3);
+    expect(new PeerWireDecoder().push(socket.writes[2]!)).toEqual([{ type: "workspace-result", requestId: "folders", ok: true, roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1" }]);
+    socket.send(encodePeerWireFrame({ type: "workspace", requestId: "project", operation: "project.create", name: "mobile-app" }));
+    await waitForWrites(socket, 4);
+    expect(new PeerWireDecoder().push(socket.writes[3]!)).toEqual([{ type: "workspace-result", requestId: "project", ok: true, project: { id: "/approved/mobile-app", name: "mobile-app" } }]);
+    expect(calls).toEqual(["create:mobile-app"]);
     await host.stop();
   });
 

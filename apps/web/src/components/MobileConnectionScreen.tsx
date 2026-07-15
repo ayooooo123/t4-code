@@ -1,9 +1,8 @@
 import { BrandLockup, Button, Spinner } from "@t4-code/ui";
-import { Cable, LockKeyhole, Network, ScanLine } from "lucide-react";
+import { Cable, LockKeyhole, ScanLine } from "lucide-react";
 import { useState } from "react";
 
 import {
-  barcodeScanner,
   nativeMobilePlatform,
   parseTailnetBackend,
   parsePeerBackend,
@@ -18,7 +17,10 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
   const [message, setMessage] = useState<string | null>(startupMessage ?? null);
   const [checking, setChecking] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const canScan = nativeMobilePlatform() !== null && barcodeScanner() !== null;
+  // Keep the primary action visible on every native build. A missing bridge or
+  // unavailable camera is reported by the scan flow instead of silently
+  // hiding QR setup (notably on hardened Android distributions).
+  const canScan = nativeMobilePlatform() !== null;
 
   const savePrivateInvite = (backend: ReturnType<typeof parsePeerBackend>): void => {
     writeStoredPeerBackend(backend);
@@ -51,7 +53,7 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
         </div>
         <h1 className="text-balance font-heading font-semibold text-2xl">Connect to your T4 host</h1>
         <p className="mt-2 max-w-[62ch] text-pretty text-muted-foreground text-sm leading-relaxed">
-          T4 Code runs the interface on this phone. OMP and your projects stay on your computer.
+          Scan the key from your desktop to connect directly. OMP and your projects stay on your computer.
         </p>
 
         <form
@@ -86,7 +88,7 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
           }}
         >
           <label className="font-medium text-sm" htmlFor="mobile-tailnet-address">
-            Tailnet address or private key
+            Private connection key
           </label>
           <input
             aria-describedby="mobile-tailnet-help mobile-tailnet-status"
@@ -99,13 +101,13 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
             id="mobile-tailnet-address"
             inputMode="url"
             onChange={(event) => setAddress(event.target.value)}
-            placeholder="t4peer://v1/… or https://your-computer.your-tailnet.ts.net:8445"
+            placeholder="t4peer://v1/…"
             spellCheck={false}
             type="url"
             value={address}
           />
           <p className="text-muted-foreground text-xs leading-relaxed" id="mobile-tailnet-help">
-            Paste the private key from T4 Code’s QR dialog, or use the full HTTPS Tailnet address shown by the T4 gateway.
+            Scan the QR code first, or paste the private key shown by T4 Code on your desktop.
           </p>
           <p
             aria-live="polite"
@@ -123,21 +125,15 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
           )}
           <Button className="mt-1 h-12 w-full text-base" disabled={checking || scanning} size="lg" type="submit">
             {checking && <Spinner />}
-            {checking ? "Checking host…" : "Connect"}
+            {checking ? "Connecting…" : "Connect"}
           </Button>
         </form>
 
         <div className="mt-9 divide-y divide-border border-border border-y">
           <div className="flex gap-3 py-3.5">
-            <Network aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-            <p className="text-sm leading-relaxed">
-              Open Tailscale on this phone and connect to the same tailnet as your computer.
-            </p>
-          </div>
-          <div className="flex gap-3 py-3.5">
             <LockKeyhole aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
             <p className="text-sm leading-relaxed">
-              If the host asks to pair, T4 Code will show the exact command and six-digit code flow.
+              The key authorizes only this direct desktop connection. Reset it from the desktop if you want to revoke access.
             </p>
           </div>
         </div>

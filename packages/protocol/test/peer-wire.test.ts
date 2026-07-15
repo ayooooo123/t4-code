@@ -34,4 +34,13 @@ describe("peer wire framing", () => {
       { type: "message", data: "{\"type\":\"hello\"}" },
     ]);
   });
+
+  it("carries bounded workspace controls separately from OMP messages", () => {
+    const encodePeerWireFrame = (protocol as Record<string, unknown>).encodePeerWireFrame as (frame: unknown) => Uint8Array;
+    const PeerWireDecoder = (protocol as Record<string, unknown>).PeerWireDecoder as new () => { push(value: Uint8Array): unknown[]; };
+    const encoded = encodePeerWireFrame({ type: "workspace", requestId: "request-1", operation: "project.create", name: "Mobile app" });
+    expect(new PeerWireDecoder().push(encoded)).toEqual([
+      { type: "workspace", requestId: "request-1", operation: "project.create", name: "Mobile app" },
+    ]);
+  });
 });

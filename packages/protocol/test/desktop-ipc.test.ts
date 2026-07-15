@@ -86,6 +86,21 @@ describe("desktop IPC boundary", () => {
       payload: { invite: "must-not-cross-ipc" },
     })).toThrow();
   });
+  it("strictly decodes desktop workspace controls", () => {
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:roots:list", payload: {} })).toEqual({
+      channel: "omp:workspace:roots:list",
+      payload: {},
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:root:select", payload: { rootId: "root-1" } })).toEqual({
+      channel: "omp:workspace:root:select",
+      payload: { rootId: "root-1" },
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:project:create", payload: { name: "My project" } })).toEqual({
+      channel: "omp:workspace:project:create",
+      payload: { name: "My project" },
+    });
+    expect(() => decodeDesktopInvokeRequest({ channel: "omp:workspace:project:create", payload: { name: "My project", path: "/tmp" } })).toThrow();
+  });
   it("decodes confirmations and target-scoped terminal requests with app-wire bounds", () => {
     expect(
       decodeDesktopInvokeRequest({
