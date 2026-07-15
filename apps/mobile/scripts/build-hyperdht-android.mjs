@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,10 @@ function run(command, args, options = {}) {
 
 async function exists(path) {
   try { await access(path); return true; } catch { return false; }
+}
+
+async function usableStaticArchive(path) {
+  try { return (await stat(path)).size > 64 * 1024; } catch { return false; }
 }
 
 function gitHead(path) {
@@ -80,15 +84,34 @@ async function main() {
   await ensureCheckout(uvRoot, "https://github.com/libuv/libuv.git", "v1.51.0", LIBUV_COMMIT);
 
   const sodiumPrefix = resolve(sodiumRoot, "libsodium-android-armv8-a+crypto");
-  if (!(await exists(resolve(sodiumPrefix, "lib/libsodium.a")))) {
+  const sodiumLibrary = resolve(sodiumPrefix, "lib/libsodium.a");
+  const sodiumMarker = resolve(sodiumPrefix, ".t4-full-static-build");
+  if (!(await usableStaticArchive(sodiumLibrary)) || !(await exists(sodiumMarker))) {
+    // libsodium's Android helper produces an empty static archive and a shared
+    // library with unresolved ARM-crypto symbols on this pinned release.
+    // Build the complete static library ourselves so every symbol is bundled
+    // into the JNI library and Android has no secondary native dependency.
+    await rm(sodiumPrefix, { force: true, recursive: true });
+    run("make", ["distclean"], { cwd: sodiumRoot });
     run("./autogen.sh", [], {
       cwd: sodiumRoot,
       env: { ...process.env, LIBTOOLIZE: process.platform === "darwin" ? "glibtoolize" : "libtoolize" },
     });
-    run("./dist-build/android-armv8-a.sh", [], {
+    run("./configure", ["--host=aarch64-linux-android", `--prefix=${sodiumPrefix}`, `--with-sysroot=${resolve(toolchain, "sysroot")}`, "--disable-shared", "--enable-static", "--disable-pie"], {
       cwd: sodiumRoot,
-      env: { ...process.env, ANDROID_NDK_HOME: ndk, NDK_PLATFORM: `android-${API}`, LIBSODIUM_FULL_BUILD: "1" },
+      env: {
+        ...process.env,
+        PATH: `${resolve(toolchain, "bin")}:${process.env.PATH ?? ""}`,
+        CC: resolve(toolchain, "bin/aarch64-linux-android26-clang"),
+        AR: resolve(toolchain, "bin/llvm-ar"),
+        RANLIB: resolve(toolchain, "bin/llvm-ranlib"),
+        STRIP: resolve(toolchain, "bin/llvm-strip"),
+        CFLAGS: "-Os -march=armv8-a+crypto",
+        LDFLAGS: "-Wl,-z,max-page-size=16384",
+      },
     });
+    run("make", ["-j4", "install"], { cwd: sodiumRoot });
+    await writeFile(sodiumMarker, `${LIBSODIUM_COMMIT}\n`, "utf8");
   }
 
   const uvBuild = resolve(cacheRoot, "libuv-build");
@@ -104,13 +127,13 @@ async function main() {
   const builtLibrary = resolve(hyperdhtBuild, "libhyperdht.a");
   if (!(await exists(builtLibrary))) {
     await rm(hyperdhtBuild, { force: true, recursive: true });
-    run("cmake", ["-B", hyperdhtBuild, "-S", hyperdhtRoot, "-G", "Ninja", `-DCMAKE_TOOLCHAIN_FILE=${resolve(ndk, "build/cmake/android.toolchain.cmake")}`, `-DANDROID_ABI=${ABI}`, `-DANDROID_PLATFORM=android-${API}`, "-DCMAKE_BUILD_TYPE=Release", "-DHYPERDHT_BUILD_TESTS=OFF", "-DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON", `-DSODIUM_INCLUDE_DIR=${resolve(sodiumPrefix, "include")}`, `-DSODIUM_LIBRARY=${resolve(sodiumPrefix, "lib/libsodium.a")}`, `-DUV_INCLUDE_DIR=${resolve(uvInstall, "include")}`, `-DUV_LIBRARY=${uvLibrary}`]);
+    run("cmake", ["-B", hyperdhtBuild, "-S", hyperdhtRoot, "-G", "Ninja", `-DCMAKE_TOOLCHAIN_FILE=${resolve(ndk, "build/cmake/android.toolchain.cmake")}`, `-DANDROID_ABI=${ABI}`, `-DANDROID_PLATFORM=android-${API}`, "-DCMAKE_BUILD_TYPE=Release", "-DHYPERDHT_BUILD_TESTS=OFF", "-DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON", `-DSODIUM_INCLUDE_DIR=${resolve(sodiumPrefix, "include")}`, `-DSODIUM_LIBRARY=${sodiumLibrary}`, `-DUV_INCLUDE_DIR=${resolve(uvInstall, "include")}`, `-DUV_LIBRARY=${uvLibrary}`]);
     run("ninja", ["-C", hyperdhtBuild]);
   }
 
   const shared = resolve(cacheRoot, "libhyperdht_jni.so");
   const jniSource = await patchedJniSource();
-  run(resolve(toolchain, "bin/aarch64-linux-android26-clang++"), ["-std=c++20", "-O2", "-shared", "-fPIC", "-static-libstdc++", `-I${resolve(hyperdhtRoot, "include")}`, `-I${resolve(hyperdhtRoot, "deps/libudx/include")}`, `-I${resolve(uvInstall, "include")}`, `-I${resolve(toolchain, "sysroot/usr/include")}`, jniSource, builtLibrary, resolve(hyperdhtBuild, "libudx.a"), resolve(sodiumPrefix, "lib/libsodium.a"), uvLibrary, "-llog", "-Wl,-z,max-page-size=16384", "-o", shared]);
+  run(resolve(toolchain, "bin/aarch64-linux-android26-clang++"), ["-std=c++20", "-O2", "-shared", "-fPIC", "-static-libstdc++", `-I${resolve(hyperdhtRoot, "include")}`, `-I${resolve(hyperdhtRoot, "deps/libudx/include")}`, `-I${resolve(uvInstall, "include")}`, `-I${resolve(toolchain, "sysroot/usr/include")}`, jniSource, builtLibrary, resolve(hyperdhtBuild, "libudx.a"), sodiumLibrary, uvLibrary, "-llog", "-Wl,-z,max-page-size=16384", "-o", shared]);
   await mkdir(dirname(output), { recursive: true });
   await copyFile(shared, output);
   console.log(`Built ${output}`);

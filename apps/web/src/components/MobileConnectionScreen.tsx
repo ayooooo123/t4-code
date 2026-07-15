@@ -1,11 +1,14 @@
 import { BrandLockup, Button, Spinner } from "@t4-code/ui";
-import { Cable, LockKeyhole, Network } from "lucide-react";
+import { Cable, LockKeyhole, Network, ScanLine } from "lucide-react";
 import { useState } from "react";
 
 import {
+  barcodeScanner,
+  nativeMobilePlatform,
   parseTailnetBackend,
   parsePeerBackend,
   probeMobileBackend,
+  scanPrivatePeerInvite,
   writeStoredMobileBackend,
   writeStoredPeerBackend,
 } from "../platform/native-mobile.ts";
@@ -14,6 +17,28 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
   const [address, setAddress] = useState("");
   const [message, setMessage] = useState<string | null>(startupMessage ?? null);
   const [checking, setChecking] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const canScan = nativeMobilePlatform() !== null && barcodeScanner() !== null;
+
+  const savePrivateInvite = (backend: ReturnType<typeof parsePeerBackend>): void => {
+    writeStoredPeerBackend(backend);
+    window.location.reload();
+  };
+
+  const scanCode = async (): Promise<void> => {
+    if (checking || scanning) return;
+    setScanning(true);
+    setMessage(null);
+    try {
+      const backend = await scanPrivatePeerInvite();
+      setAddress(backend.invite);
+      savePrivateInvite(backend);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Couldn’t open the QR scanner.");
+    } finally {
+      setScanning(false);
+    }
+  };
 
   return (
     <div className="flex min-h-full flex-col bg-background text-foreground">
@@ -33,15 +58,14 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
           className="mt-8 flex flex-col gap-3"
           onSubmit={(event) => {
             event.preventDefault();
-            if (checking) return;
+            if (checking || scanning) return;
             setMessage(null);
             const privateInvite = address.trim().startsWith("t4peer://");
             try {
               if (privateInvite) {
                 const backend = parsePeerBackend(address);
                 setChecking(true);
-                writeStoredPeerBackend(backend);
-                window.location.reload();
+                savePrivateInvite(backend);
                 return;
               }
               const backend = parseTailnetBackend(address);
@@ -71,7 +95,7 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
             autoComplete="url"
             autoCorrect="off"
             className="h-12 w-full rounded-lg border border-input bg-background px-3 font-mono text-base outline-none transition-shadow duration-(--motion-duration-fast) placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            disabled={checking}
+            disabled={checking || scanning}
             id="mobile-tailnet-address"
             inputMode="url"
             onChange={(event) => setAddress(event.target.value)}
@@ -91,7 +115,13 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
           >
             {message}
           </p>
-          <Button className="mt-1 h-12 w-full text-base" disabled={checking} size="lg" type="submit">
+          {canScan && (
+            <Button className="h-12 w-full text-base" disabled={checking || scanning} onClick={() => void scanCode()} size="lg" type="button" variant="outline">
+              {scanning && <Spinner />}
+              <ScanLine /> {scanning ? "Opening scanner…" : "Scan QR code"}
+            </Button>
+          )}
+          <Button className="mt-1 h-12 w-full text-base" disabled={checking || scanning} size="lg" type="submit">
             {checking && <Spinner />}
             {checking ? "Checking host…" : "Connect"}
           </Button>

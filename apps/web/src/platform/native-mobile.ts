@@ -45,10 +45,19 @@ export interface T4PeerConnectionPlugin {
   ): Promise<{ readonly remove: () => Promise<void> | void }>;
 }
 
+export interface BarcodeScannerPlugin {
+  isSupported(): Promise<{ readonly supported: boolean }>;
+  scan(options: {
+    readonly formats: readonly ["QR_CODE"];
+    readonly autoZoom: boolean;
+  }): Promise<{ readonly barcodes: readonly { readonly rawValue?: string }[] }>;
+}
+
 interface CapacitorBridge {
   readonly Plugins?: {
     readonly T4SecureStorage?: T4SecureStoragePlugin;
     readonly T4PeerConnection?: T4PeerConnectionPlugin;
+    readonly BarcodeScanner?: BarcodeScannerPlugin;
   };
   readonly getPlatform?: () => string;
   readonly isNativePlatform?: () => boolean;
@@ -73,6 +82,11 @@ function secureStorage(): T4SecureStoragePlugin | null {
 
 export function peerConnection(): T4PeerConnectionPlugin | null {
   return window.Capacitor?.Plugins?.T4PeerConnection ?? null;
+}
+
+export function barcodeScanner(): BarcodeScannerPlugin | null {
+  if (typeof window === "undefined") return null;
+  return window.Capacitor?.Plugins?.BarcodeScanner ?? null;
 }
 
 export function nativeMobilePlatform(): NativeMobilePlatform | null {
@@ -136,6 +150,22 @@ export function parsePeerBackend(value: string): StoredPeerMobileBackend {
     invite,
     label: requiredLabel(`T4 private host ${metadata.desktopPublicKey.slice(0, 8)}`),
   };
+}
+
+/** Reads one QR code through Android's native scanner and validates it before it can be persisted. */
+export async function scanPrivatePeerInvite(scanner: BarcodeScannerPlugin | null = barcodeScanner()): Promise<StoredPeerMobileBackend> {
+  if (scanner === null) throw new Error("QR scanning is unavailable. Update T4 Code and try again.");
+  const supported = await scanner.isSupported();
+  if (!supported.supported) throw new Error("This device does not have a camera available for QR scanning.");
+
+  const result = await scanner.scan({ formats: ["QR_CODE"], autoZoom: true });
+  const value = result.barcodes.find((barcode) => typeof barcode.rawValue === "string")?.rawValue;
+  if (value === undefined) throw new Error("No QR code was scanned. Try again.");
+  try {
+    return parsePeerBackend(value);
+  } catch {
+    throw new Error("That QR code is not a T4 private connection key.");
+  }
 }
 
 export function readStoredMobileConnection(storage: Pick<Storage, "getItem"> = window.localStorage): StoredMobileConnection | null {

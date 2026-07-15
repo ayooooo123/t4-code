@@ -5,9 +5,11 @@ import { join } from "node:path";
 const require = createRequire(import.meta.url);
 const electron = process.env.ELECTRON_BIN ?? require("electron");
 const cwd = join(import.meta.dirname, "..");
+const env = { ...process.env };
+delete env.ELECTRON_RUN_AS_NODE;
 const child = spawn(electron, [join(cwd, "dist-electron", "main.cjs")], {
   cwd,
-  env: { ...process.env, ELECTRON_RUN_AS_NODE: "0" },
+  env,
   stdio: "inherit",
   shell: false,
 });

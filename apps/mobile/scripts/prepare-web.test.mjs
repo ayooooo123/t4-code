@@ -62,3 +62,12 @@ test("the Android build verifies its Gradle distribution", async () => {
   assert.match(wrapper, /^distributionSha256Sum=[a-f0-9]{64}$/mu);
   assert.match(wrapper, /^validateDistributionUrl=true$/mu);
 });
+
+test("the HyperDHT JNI build links a complete static libsodium", async () => {
+  const script = await readFile(resolve(mobileRoot, "scripts/build-hyperdht-android.mjs"), "utf8");
+
+  assert.match(script, /const sodiumLibrary = resolve\(sodiumPrefix, "lib\/libsodium\.a"\)/);
+  assert.match(script, /"--disable-shared", "--enable-static"/);
+  assert.doesNotMatch(script, /"--enable-minimal"/);
+  assert.doesNotMatch(script, /copyFile\(sodiumLibrary, sodiumOutput\)/);
+});

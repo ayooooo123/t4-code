@@ -11,6 +11,7 @@ import {
   probeMobileBackend,
   readStoredMobileBackend,
   readStoredMobileConnection,
+  scanPrivatePeerInvite,
   writeStoredMobileBackend,
   writeStoredPeerBackend,
 } from "../src/platform/native-mobile.ts";
@@ -62,6 +63,17 @@ describe("native mobile connection", () => {
 
     expect(readStoredMobileConnection(storage)).toEqual(backend);
     expect(() => readStoredMobileBackend(storage)).toThrow(/private/u);
+  });
+
+  it("accepts only a private T4 key from the native QR scanner", async () => {
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const scan = () => Promise.resolve({ barcodes: [{ rawValue: `t4peer://v1/${key}/${key}` }] });
+    await expect(scanPrivatePeerInvite({ isSupported: () => Promise.resolve({ supported: true }), scan })).resolves.toEqual(
+      parsePeerBackend(`t4peer://v1/${key}/${key}`),
+    );
+    await expect(
+      scanPrivatePeerInvite({ isSupported: () => Promise.resolve({ supported: true }), scan: () => Promise.resolve({ barcodes: [{ rawValue: "https://example.com" }] }) }),
+    ).rejects.toThrow(/not a T4 private connection key/u);
   });
 
   it("loads paired credentials from the native security bridge before app boot", async () => {
