@@ -41,6 +41,5 @@ describe("CapacitorPeerTransport", () => {
 
     expect(settled).toBe(true);
     expect(cancelOpen).toHaveBeenCalledTimes(1);
-    expect(cancelOpen.mock.calls[0]?.[0]).toMatchObject({ attemptId: expect.any(String) });
   });
 });

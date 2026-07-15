@@ -48,10 +48,14 @@ export interface T4PeerConnectionPlugin {
 
 export interface BarcodeScannerPlugin {
   isSupported(): Promise<{ readonly supported: boolean }>;
-  scan(options: {
+  startScan(options: {
     readonly formats: readonly ["QR_CODE"];
-    readonly autoZoom: boolean;
-  }): Promise<{ readonly barcodes: readonly { readonly rawValue?: string }[] }>;
+  }): Promise<void>;
+  stopScan(): Promise<void>;
+  addListener(
+    event: "barcodesScanned",
+    listener: (payload: { readonly barcodes: readonly { readonly rawValue?: string }[] }) => void,
+  ): Promise<{ readonly remove: () => Promise<void> | void }>;
 }
 
 interface CapacitorBridge {
@@ -159,7 +163,20 @@ export async function scanPrivatePeerInvite(scanner: BarcodeScannerPlugin | null
   const supported = await scanner.isSupported();
   if (!supported.supported) throw new Error("This device does not have a camera available for QR scanning.");
 
-  const result = await scanner.scan({ formats: ["QR_CODE"], autoZoom: true });
+  let listener: { readonly remove: () => Promise<void> | void } | undefined;
+  const result = await new Promise<{ readonly barcodes: readonly { readonly rawValue?: string }[] }>((resolve, reject) => {
+    void (async () => {
+      try {
+        listener = await scanner.addListener("barcodesScanned", resolve);
+        await scanner.startScan({ formats: ["QR_CODE"] });
+      } catch (error) {
+        reject(error);
+      }
+    })();
+  }).finally(async () => {
+    await scanner.stopScan().catch(() => undefined);
+    await listener?.remove();
+  });
   const value = result.barcodes.find((barcode) => typeof barcode.rawValue === "string")?.rawValue;
   if (value === undefined) throw new Error("No QR code was scanned. Try again.");
   try {

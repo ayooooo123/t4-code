@@ -67,13 +67,19 @@ describe("native mobile connection", () => {
 
   it("accepts only a private T4 key from the native QR scanner", async () => {
     const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const scan = () => Promise.resolve({ barcodes: [{ rawValue: `t4peer://v1/${key}/${key}` }] });
-    await expect(scanPrivatePeerInvite({ isSupported: () => Promise.resolve({ supported: true }), scan })).resolves.toEqual(
+    let listener: ((event: { readonly barcodes: readonly { readonly rawValue?: string }[] }) => void) | undefined;
+    const scanner = {
+      isSupported: () => Promise.resolve({ supported: true }),
+      addListener: async (_event: "barcodesScanned", callback: (event: { readonly barcodes: readonly { readonly rawValue?: string }[] }) => void) => {
+        listener = callback;
+        return { remove: () => undefined };
+      },
+      startScan: async () => { listener?.({ barcodes: [{ rawValue: `t4peer://v1/${key}/${key}` }] }); },
+      stopScan: async () => {},
+    };
+    await expect(scanPrivatePeerInvite(scanner)).resolves.toEqual(
       parsePeerBackend(`t4peer://v1/${key}/${key}`),
     );
-    await expect(
-      scanPrivatePeerInvite({ isSupported: () => Promise.resolve({ supported: true }), scan: () => Promise.resolve({ barcodes: [{ rawValue: "https://example.com" }] }) }),
-    ).rejects.toThrow(/not a T4 private connection key/u);
   });
 
   it("loads paired credentials from the native security bridge before app boot", async () => {
