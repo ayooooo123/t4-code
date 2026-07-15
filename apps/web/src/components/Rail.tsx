@@ -62,6 +62,7 @@ import {
 } from "../platform/live-workspace.ts";
 import { useWorkspace, workspaceStore } from "../state/store-instance.ts";
 import { SessionListTabs } from "./SessionListTabs.tsx";
+import { WorkspaceRootsAction } from "./WorkspaceRootsAction.tsx";
 
 function describeSessionState(session: WorkspaceSession): string {
   if (session.freshness === "offline") return "Offline";
@@ -677,6 +678,7 @@ export function Rail({
         <p className="mt-0.5 text-muted-foreground text-xs leading-snug">
           OMP groups sessions by the folder they were started in.
         </p>
+        <WorkspaceRootsAction placement="rail" />
         <SessionListTabs archivedCount={archivedCount} currentCount={currentCount} view={view} />
       </div>
       <p aria-live="polite" className="sr-only">

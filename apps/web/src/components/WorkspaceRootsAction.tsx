@@ -22,7 +22,7 @@ import { rendererPlatform, workspaceStore } from "../state/store-instance.ts";
 type Roots = { readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null };
 
 /** Desktop-only chooser for the directories T4 is allowed to create projects in. */
-export function WorkspaceRootsAction() {
+export function WorkspaceRootsAction({ placement = "toolbar" }: { readonly placement?: "toolbar" | "rail" }) {
   const shell = rendererPlatform.shell;
   const [open, setOpen] = useState(false);
   const [roots, setRoots] = useState<Roots>({ roots: [], activeRootId: null });
@@ -68,10 +68,14 @@ export function WorkspaceRootsAction() {
 
   return (
     <Dialog onOpenChange={setOpen} open={open}>
-      <Tooltip>
-        <TooltipTrigger render={<IconButton aria-label="Manage workspace folders" className="size-11 sm:size-7" onClick={() => setOpen(true)} size="icon-sm"><FolderCog /></IconButton>} />
-        <TooltipPopup side="bottom">Workspace folders</TooltipPopup>
-      </Tooltip>
+      {placement === "rail" ? (
+        <Button className="mt-2 w-full justify-start" onClick={() => setOpen(true)} size="sm" variant="outline"><FolderPlus /> New folder</Button>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger render={<IconButton aria-label="Manage workspace folders" className="size-11 sm:size-7" onClick={() => setOpen(true)} size="icon-sm"><FolderCog /></IconButton>} />
+          <TooltipPopup side="bottom">Workspace folders</TooltipPopup>
+        </Tooltip>
+      )}
       <DialogPopup aria-label="Workspace folders" className="max-w-md">
         <DialogHeader>
           <DialogTitle>Workspace folders</DialogTitle>

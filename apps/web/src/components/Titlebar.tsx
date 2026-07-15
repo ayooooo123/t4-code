@@ -10,7 +10,6 @@ import { resolveTheme } from "../theme/theme.ts";
 import { HostedAppAction } from "./HostedAppAction.tsx";
 import { MobileConnectionAction } from "./MobileConnectionAction.tsx";
 import { PeerShareAction } from "./PeerShareAction.tsx";
-import { WorkspaceRootsAction } from "./WorkspaceRootsAction.tsx";
 import { MobileWorkspaceAction } from "./MobileWorkspaceAction.tsx";
 import type { RailTogglePresentation } from "./rail-toggle.ts";
 
@@ -106,7 +105,6 @@ export function Titlebar({
       <HostedAppAction />
       <MobileConnectionAction />
       <PeerShareAction />
-      <WorkspaceRootsAction />
       <MobileWorkspaceAction />
       <Tooltip>
         <TooltipTrigger
