@@ -34,6 +34,11 @@ export interface SessionViewState {
   readonly paneWidth: number;
   readonly terminalDrawerOpen: boolean;
 }
+export interface WorkspaceRailProject {
+  readonly hostId: string;
+  readonly projectId: string;
+  readonly name: string;
+}
 
 export const DEFAULT_SESSION_VIEW: SessionViewState = {
   scrollTop: null,
@@ -54,6 +59,7 @@ interface PersistedWorkspaceState {
   readonly projectExpandedById: Record<string, boolean>;
   readonly lastVisitedAtBySessionId: Record<string, string>;
   readonly sessionViewById: Record<string, SessionViewState>;
+  readonly workspaceProjects?: readonly WorkspaceRailProject[];
 }
 
 export interface WorkspaceState {
@@ -69,6 +75,7 @@ export interface WorkspaceState {
   readonly projectExpandedById: Record<string, boolean>;
   readonly lastVisitedAtBySessionId: Record<string, string>;
   readonly sessionViewById: Record<string, SessionViewState>;
+  readonly workspaceProjects: readonly WorkspaceRailProject[];
 }
 
 export interface WorkspaceActions {
@@ -83,6 +90,7 @@ export interface WorkspaceActions {
   /** Stamp a visit; timestamps only move forward. */
   markSessionVisited(sessionId: string, visitedAt: string): void;
   setProjectExpanded(projectId: string, expanded: boolean): void;
+  addWorkspaceProject(project: WorkspaceRailProject): void;
   setSessionDraft(sessionId: string, draft: string): void;
   setSessionScrollTop(sessionId: string, scrollTop: number | null): void;
   /** Select a family; selecting the active family again closes the pane. */
@@ -106,7 +114,20 @@ const INITIAL_STATE: WorkspaceState = {
   projectExpandedById: {},
   lastVisitedAtBySessionId: {},
   sessionViewById: {},
+  workspaceProjects: [],
 };
+
+function readWorkspaceProjects(value: unknown): readonly WorkspaceRailProject[] {
+  if (!Array.isArray(value)) return [];
+  const result = new Map<string, WorkspaceRailProject>();
+  for (const item of value) {
+    if (item === null || typeof item !== "object") continue;
+    const project = item as Partial<WorkspaceRailProject>;
+    if (typeof project.hostId !== "string" || typeof project.projectId !== "string" || typeof project.name !== "string" || project.hostId === "" || project.projectId === "" || project.name === "") continue;
+    result.set(`${project.hostId}\u0000${project.projectId}`, { hostId: project.hostId, projectId: project.projectId, name: project.name });
+  }
+  return [...result.values()];
+}
 
 function sanitizeBooleanRecord(value: unknown): Record<string, boolean> {
   if (typeof value !== "object" || value === null) return {};
@@ -176,6 +197,7 @@ export function parsePersistedWorkspace(raw: unknown): WorkspaceState | null {
     projectExpandedById: sanitizeBooleanRecord(parsed.projectExpandedById),
     lastVisitedAtBySessionId: sanitizeTimestampRecord(parsed.lastVisitedAtBySessionId),
     sessionViewById,
+    workspaceProjects: readWorkspaceProjects(parsed.workspaceProjects),
   };
 }
 
@@ -190,6 +212,7 @@ export function toPersistedWorkspace(state: WorkspaceState): PersistedWorkspaceS
     projectExpandedById: state.projectExpandedById,
     lastVisitedAtBySessionId: state.lastVisitedAtBySessionId,
     sessionViewById: state.sessionViewById,
+    workspaceProjects: state.workspaceProjects,
   };
 }
 
@@ -276,6 +299,9 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions): Work
       set((state) => ({
         projectExpandedById: { ...state.projectExpandedById, [projectId]: expanded },
       })),
+    addWorkspaceProject: (project) => set((state) => ({
+      workspaceProjects: readWorkspaceProjects([...state.workspaceProjects, project]),
+    })),
     setSessionDraft: (sessionId, draft) =>
       set((state) => updateSessionView(state, sessionId, { draft })),
     setSessionScrollTop: (sessionId, scrollTop) =>

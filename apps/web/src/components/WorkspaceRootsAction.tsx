@@ -16,7 +16,8 @@ import {
 import { FolderCog, FolderPlus } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { rendererPlatform } from "../state/store-instance.ts";
+import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
+import { rendererPlatform, workspaceStore } from "../state/store-instance.ts";
 
 type Roots = { readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null };
 
@@ -28,6 +29,7 @@ export function WorkspaceRootsAction() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const snapshot = useDesktopRuntimeSnapshot();
   if (shell === null || shell.workspaceRootsList === undefined || shell.workspaceRootChoose === undefined || shell.workspaceRootSelect === undefined || shell.workspaceProjectCreate === undefined) return null;
 
   const refresh = async (): Promise<void> => {
@@ -56,8 +58,10 @@ export function WorkspaceRootsAction() {
     setBusy(true); setMessage(null);
     try {
       const project = await shell.workspaceProjectCreate!({ name: trimmed });
+      const binding = snapshot?.targetHosts.entries().next().value as readonly [string, string] | undefined;
+      if (binding !== undefined) workspaceStore.getState().addWorkspaceProject({ hostId: binding[1], projectId: project.project.id, name: project.project.name });
       setName("");
-      setMessage(`Created ${project.project.name}. It is ready for a new OMP session.`);
+      setMessage(binding === undefined ? `Created ${project.project.name}. Connect to OMP to show it in the left rail.` : `Created ${project.project.name}. It is now in the left rail.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Couldn’t create the project folder."); }
     finally { setBusy(false); }
   };

@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { createLiveSession } from "../features/session-runtime/live-create.ts";
 import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
 import { currentNativeMobilePeerInvite, nativeMobilePlatform } from "../platform/native-mobile.ts";
-import { rendererPlatform } from "../state/store-instance.ts";
+import { rendererPlatform, workspaceStore } from "../state/store-instance.ts";
 
 export function MobileWorkspaceAction() {
   const shell = rendererPlatform.shell;
@@ -38,6 +38,7 @@ export function MobileWorkspaceAction() {
     setBusy(true); setMessage(null);
     try {
       const project = await shell.workspaceProjectCreate!({ name: name.trim() });
+      workspaceStore.getState().addWorkspaceProject({ hostId: binding[1], projectId: project.project.id, name: project.project.name });
       const created = await createLiveSession(controller, { targetId: binding[0], hostId: binding[1], projectId: project.project.id });
       setOpen(false);
       void navigate({ params: { sessionId: created.viewId }, to: "/sessions/$sessionId" });
