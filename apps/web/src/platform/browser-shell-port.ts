@@ -213,7 +213,6 @@ export function createBrowserShellPort(
 
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
-  let transport: BrowserWebSocketTransport | CapacitorPeerTransport | undefined;
   let welcome: WelcomeFrame | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
@@ -266,7 +265,6 @@ export function createBrowserShellPort(
         ? new BrowserWebSocketTransport({ url: backendConfig.wsUrl })
         : new CapacitorPeerTransport(peerInvite);
       await next.open();
-      transport = next;
       return next;
     };
 
@@ -353,7 +351,6 @@ export function createBrowserShellPort(
       if (client !== undefined) {
         await client.close();
         client = undefined;
-        transport = undefined;
         welcome = undefined;
       }
       emitState(TARGET_ID, "disconnected");

@@ -1,6 +1,6 @@
 import { createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from "node:crypto";
 import DHT from "hyperdht";
-import { encodePeerInvite, encodePeerWireFrame, PeerWireDecoder, peerInviteMetadata, type PeerWireFrame } from "@t4-code/protocol";
+import { encodePeerInvite, encodePeerWireFrame, PeerWireDecoder, peerInviteMetadata } from "@t4-code/protocol";
 import type { OmpTransport } from "@t4-code/client";
 import { createLocalTransport } from "./transport.ts";
 
