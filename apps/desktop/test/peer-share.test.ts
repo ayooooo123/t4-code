@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
+import { createHmac } from "node:crypto";
 import { encodePeerWireFrame, PeerWireDecoder } from "@t4-code/protocol";
+import type { OmpTransport, Unsubscribe } from "@t4-code/client";
 import * as peer from "../src/peer-share.ts";
 
 class FakeServer {
@@ -15,12 +17,45 @@ class FakeServer {
 
 class FakePeerSocket {
   readonly writes: Uint8Array[] = [];
+  destroyed = false;
   private dataListener: ((value: Uint8Array) => void) | undefined;
-  on(event: "data", listener: (value: Uint8Array) => void): void {
+  private closeListener: (() => void) | undefined;
+  on(event: "data" | "close", listener: ((value: Uint8Array) => void) | (() => void)): void {
     if (event === "data") this.dataListener = listener;
+    if (event === "close") this.closeListener = listener as () => void;
   }
   write(value: Uint8Array): void { this.writes.push(value); }
   send(value: Uint8Array): void { this.dataListener?.(value); }
+  destroy(): void {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.closeListener?.();
+  }
+}
+
+class FakeOmpTransport implements OmpTransport {
+  readonly sent: string[] = [];
+  private readonly messages = new Set<(data: string | Uint8Array) => void>();
+  private readonly closes = new Set<(code?: number, reason?: string) => void>();
+  private readonly errors = new Set<(error: unknown) => void>();
+  send(data: string): void { this.sent.push(data); }
+  close(): void { for (const listener of this.closes) listener(1000, "closed"); }
+  onMessage(listener: (data: string | Uint8Array) => void): Unsubscribe { this.messages.add(listener); return () => this.messages.delete(listener); }
+  onClose(listener: (code?: number, reason?: string) => void): Unsubscribe { this.closes.add(listener); return () => this.closes.delete(listener); }
+  onError(listener: (error: unknown) => void): Unsubscribe { this.errors.add(listener); return () => this.errors.delete(listener); }
+  emitMessage(data: string): void { for (const listener of this.messages) listener(data); }
+}
+
+async function waitFor(condition: () => boolean, description: string): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForWrites(socket: FakePeerSocket, count: number): Promise<void> {
+  await waitFor(() => socket.writes.length >= count, `${count} peer writes`);
 }
 
 class FakeDht {
@@ -87,11 +122,188 @@ describe("PeerShareHost", () => {
     dht.server.connection?.(socket);
     expect(socket.writes).toEqual([]);
     socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce: "client-nonce" }));
+    await waitForWrites(socket, 1);
 
     const frames = new PeerWireDecoder().push(socket.writes[0]!);
     expect(frames).toHaveLength(1);
     expect(frames[0]).toMatchObject({ type: "challenge" });
     expect(frames[0]?.type === "challenge" && frames[0].nonce.length > 0).toBe(true);
+    await host.stop();
+  });
+
+  it("authorizes only the holder of the invite capability", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly createAppserverTransport: () => Promise<FakeOmpTransport>;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<unknown>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    let randomCall = 0;
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(++randomCall),
+      createAppserverTransport: async () => new FakeOmpTransport(),
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+    const socket = new FakePeerSocket();
+    dht.server.connection?.(socket);
+    socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce: "client-nonce" }));
+    await waitForWrites(socket, 1);
+    const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+    if (challenge?.type !== "challenge") throw new Error("missing challenge");
+    const proof = createHmac("sha256", Buffer.alloc(32, 1))
+      .update("t4peer/v1\0")
+      .update("client-nonce")
+      .update(challenge.nonce)
+      .update(desktopPublicKey)
+      .digest("base64url");
+
+    socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    await waitForWrites(socket, 2);
+
+    expect(new PeerWireDecoder().push(socket.writes[1]!)).toEqual([{ type: "authorized" }]);
+    expect(socket.destroyed).toBe(false);
+    await host.stop();
+  });
+
+  it("rejects an invalid capability proof before opening an OMP connection", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly createAppserverTransport: () => Promise<FakeOmpTransport>;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<unknown>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    let opens = 0;
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: new Uint8Array(32).fill(3), secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(1),
+      createAppserverTransport: async () => {
+        opens += 1;
+        return new FakeOmpTransport();
+      },
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+    const socket = new FakePeerSocket();
+    dht.server.connection?.(socket);
+    socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce: "client-nonce" }));
+    await waitForWrites(socket, 1);
+    socket.send(encodePeerWireFrame({ type: "authorize", proof: "not-the-capability-proof" }));
+
+    await waitFor(() => socket.destroyed, "invalid proof rejection");
+    expect(opens).toBe(0);
+    await host.stop();
+  });
+
+  it("admits only one authorized phone at a time", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly createAppserverTransport: () => Promise<FakeOmpTransport>;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<unknown>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    let randomCall = 0;
+    let opens = 0;
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(++randomCall),
+      createAppserverTransport: async () => {
+        opens += 1;
+        return new FakeOmpTransport();
+      },
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+
+    const authorize = async (socket: FakePeerSocket, nonce: string): Promise<void> => {
+      dht.server.connection?.(socket);
+      socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce }));
+      await waitForWrites(socket, 1);
+      const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+      if (challenge?.type !== "challenge") throw new Error("missing challenge");
+      const proof = createHmac("sha256", Buffer.alloc(32, 1))
+        .update("t4peer/v1\0")
+        .update(nonce)
+        .update(challenge.nonce)
+        .update(desktopPublicKey)
+        .digest("base64url");
+      socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    };
+
+    const first = new FakePeerSocket();
+    await authorize(first, "first-phone");
+    await waitForWrites(first, 2);
+    const second = new FakePeerSocket();
+    await authorize(second, "second-phone");
+
+    await waitFor(() => second.destroyed, "second phone rejection");
+    expect(opens).toBe(1);
+    expect(first.destroyed).toBe(false);
+    await host.stop();
+  });
+
+  it("relays OMP messages only after authorization", async () => {
+    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
+      readonly createDht: () => FakeDht;
+      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
+      readonly randomBytes: (length: number) => Uint8Array;
+      readonly createAppserverTransport: () => Promise<FakeOmpTransport>;
+      readonly setTimer: (callback: () => void, delay: number) => unknown;
+      readonly clearTimer: (timer: unknown) => void;
+    }) => { start(): Promise<unknown>; stop(): Promise<void> };
+    const dht = new FakeDht();
+    const upstream = new FakeOmpTransport();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    let randomCall = 0;
+    const host = new PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(++randomCall),
+      createAppserverTransport: async () => upstream,
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+    const socket = new FakePeerSocket();
+    dht.server.connection?.(socket);
+    socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce: "client-nonce" }));
+    await waitForWrites(socket, 1);
+    const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+    if (challenge?.type !== "challenge") throw new Error("missing challenge");
+    const proof = createHmac("sha256", Buffer.alloc(32, 1))
+      .update("t4peer/v1\0")
+      .update("client-nonce")
+      .update(challenge.nonce)
+      .update(desktopPublicKey)
+      .digest("base64url");
+    socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    await waitForWrites(socket, 2);
+    socket.send(encodePeerWireFrame({ type: "message", data: "{\"type\":\"ping\"}" }));
+    await waitFor(() => upstream.sent.length === 1, "forwarded OMP message");
+
+    expect(upstream.sent).toEqual(["{\"type\":\"ping\"}"]);
+    upstream.emitMessage("{\"type\":\"pong\"}");
+    expect(new PeerWireDecoder().push(socket.writes.at(-1)!)).toEqual([
+      { type: "message", data: "{\"type\":\"pong\"}" },
+    ]);
     await host.stop();
   });
 });

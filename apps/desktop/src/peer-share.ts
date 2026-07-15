@@ -1,6 +1,8 @@
-import { randomBytes as nodeRandomBytes } from "node:crypto";
+import { createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from "node:crypto";
 import DHT from "hyperdht";
 import { encodePeerInvite, encodePeerWireFrame, PeerWireDecoder, peerInviteMetadata, type PeerWireFrame } from "@t4-code/protocol";
+import type { OmpTransport } from "@t4-code/client";
+import { createLocalTransport } from "./transport.ts";
 
 const SHARE_DURATION_MS = 15 * 60 * 1_000;
 const KEY_BYTES = 32;
@@ -18,6 +20,7 @@ export interface PeerServer {
 
 export interface PeerStream {
   on(event: "data", listener: (value: Uint8Array) => void): void;
+  on(event: "close", listener: () => void): void;
   write(value: Uint8Array): void;
   destroy?(): void;
 }
@@ -38,6 +41,7 @@ export interface PeerShareHostOptions {
   readonly now?: () => number;
   readonly setTimer?: (callback: () => void, delay: number) => unknown;
   readonly clearTimer?: (timer: unknown) => void;
+  readonly createAppserverTransport?: () => Promise<OmpTransport>;
 }
 
 function defaultDht(): PeerDht {
@@ -52,9 +56,30 @@ function random(length: number): Uint8Array {
   return new Uint8Array(nodeRandomBytes(length));
 }
 
+async function defaultAppserverTransport(): Promise<OmpTransport> {
+  const transport = createLocalTransport();
+  await transport.open();
+  return transport;
+}
+
 function requireLength(value: Uint8Array, name: string, expected: number): Uint8Array {
   if (!(value instanceof Uint8Array) || value.byteLength !== expected) throw new Error(`invalid ${name}`);
   return value;
+}
+
+function authorizationProof(capability: Uint8Array, clientNonce: string, challenge: string, desktopPublicKey: Uint8Array): string {
+  return createHmac("sha256", capability)
+    .update("t4peer/v1\0")
+    .update(clientNonce)
+    .update(challenge)
+    .update(desktopPublicKey)
+    .digest("base64url");
+}
+
+function sameProof(expected: string, provided: string): boolean {
+  const expectedBytes = Buffer.from(expected, "utf8");
+  const providedBytes = Buffer.from(provided, "utf8");
+  return expectedBytes.byteLength === providedBytes.byteLength && timingSafeEqual(expectedBytes, providedBytes);
 }
 
 export class PeerShareHost {
@@ -64,6 +89,9 @@ export class PeerShareHost {
   private readonly now: () => number;
   private readonly setTimer: (callback: () => void, delay: number) => unknown;
   private readonly clearTimer: (timer: unknown) => void;
+  private readonly createAppserverTransport: () => Promise<OmpTransport>;
+  private readonly activeTransports = new Set<OmpTransport>();
+  private activeStream: PeerStream | undefined;
   private dht: PeerDht | undefined;
   private server: PeerServer | undefined;
   private timer: unknown;
@@ -81,6 +109,7 @@ export class PeerShareHost {
     this.now = options.now ?? Date.now;
     this.setTimer = options.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
+    this.createAppserverTransport = options.createAppserverTransport ?? defaultAppserverTransport;
   }
 
   async start(): Promise<{ readonly invite: string; readonly expiresAt: number }> {
@@ -121,31 +150,99 @@ export class PeerShareHost {
     this.server = undefined;
     this.timer = undefined;
     this.live = undefined;
+    const activeStream = this.activeStream;
+    this.activeStream = undefined;
     if (timer !== undefined) this.clearTimer(timer);
+    for (const transport of this.activeTransports) transport.close();
+    this.activeTransports.clear();
+    activeStream?.destroy?.();
     if (server !== undefined) await server.close().catch(() => undefined);
     if (dht !== undefined) await dht.destroy().catch(() => undefined);
   }
 
   private onConnection(stream: PeerStream): void {
     const decoder = new PeerWireDecoder();
-    let phase: "hello" | "challenge" = "hello";
+    let phase: "hello" | "challenge" | "opening" | "authorized" = "hello";
+    let clientNonce: string | undefined;
+    let challenge: string | undefined;
+    let upstream: OmpTransport | undefined;
+    let queue = Promise.resolve();
+    const release = () => {
+      if (this.activeStream === stream) this.activeStream = undefined;
+    };
+    const closeUpstream = () => {
+      if (upstream === undefined) return;
+      const transport = upstream;
+      upstream = undefined;
+      this.activeTransports.delete(transport);
+      transport.close();
+    };
+    const terminate = () => {
+      release();
+      closeUpstream();
+      stream.destroy?.();
+    };
+    stream.on("close", () => {
+      release();
+      closeUpstream();
+    });
     stream.on("data", (chunk) => {
-      let frames: PeerWireFrame[];
-      try {
-        frames = decoder.push(chunk);
-      } catch {
-        stream.destroy?.();
-        return;
-      }
-      for (const frame of frames) {
-        if (phase !== "hello" || frame.type !== "hello" || this.live === undefined) {
-          stream.destroy?.();
+      queue = queue.then(async () => {
+        const frames = decoder.push(chunk);
+        for (const frame of frames) {
+          if (this.live === undefined) {
+            terminate();
+            return;
+          }
+          if (phase === "hello" && frame.type === "hello") {
+            clientNonce = frame.nonce;
+            challenge = Buffer.from(requireLength(this.randomBytes(KEY_BYTES), "peer challenge", KEY_BYTES)).toString("base64url");
+            stream.write(encodePeerWireFrame({ type: "challenge", nonce: challenge }));
+            phase = "challenge";
+            continue;
+          }
+          if (phase === "challenge" && frame.type === "authorize" && clientNonce !== undefined && challenge !== undefined) {
+            const expected = authorizationProof(
+              this.live.capability,
+              clientNonce,
+              challenge,
+              this.live.desktopPublicKey,
+            );
+            if (!sameProof(expected, frame.proof) || (this.activeStream !== undefined && this.activeStream !== stream)) {
+              terminate();
+              return;
+            }
+            this.activeStream = stream;
+            phase = "opening";
+            const transport = await this.createAppserverTransport();
+            if (this.live === undefined || phase !== "opening" || this.activeStream !== stream) {
+              transport.close();
+              release();
+              return;
+            }
+            upstream = transport;
+            this.activeTransports.add(transport);
+            transport.onMessage((data) => {
+              if (phase !== "authorized" || typeof data !== "string") {
+                terminate();
+                return;
+              }
+              stream.write(encodePeerWireFrame({ type: "message", data }));
+            });
+            transport.onClose(() => terminate());
+            transport.onError(() => terminate());
+            stream.write(encodePeerWireFrame({ type: "authorized" }));
+            phase = "authorized";
+            continue;
+          }
+          if (phase === "authorized" && frame.type === "message" && upstream !== undefined) {
+            upstream.send(frame.data);
+            continue;
+          }
+          terminate();
           return;
         }
-        const challenge = Buffer.from(this.randomBytes(KEY_BYTES)).toString("base64url");
-        stream.write(encodePeerWireFrame({ type: "challenge", nonce: challenge }));
-        phase = "challenge";
-      }
+      }).catch(() => terminate());
     });
   }
 }
