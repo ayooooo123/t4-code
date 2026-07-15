@@ -11,6 +11,8 @@ import {
   type DisconnectResult,
   type PairLinkEvent,
   type PairLinksDrainResult,
+  type PeerShareStartResult,
+  type PeerShareStatusResult,
   type PairRequest,
   type PairResult,
   type RendererServerFrameEvent,
@@ -47,6 +49,10 @@ export interface OmpShellBridge {
   readonly serviceStop: () => Promise<ServiceActionResult>;
   readonly serviceRestart: () => Promise<ServiceActionResult>;
   readonly serviceUninstall: () => Promise<ServiceActionResult>;
+  readonly peerShareStart: () => Promise<PeerShareStartResult>;
+  readonly peerShareStatus: () => Promise<PeerShareStatusResult>;
+  readonly peerShareStop: () => Promise<PeerShareStatusResult>;
+  readonly peerShareRegenerate: () => Promise<PeerShareStartResult>;
   readonly listTargets: () => Promise<TargetListResult>;
   readonly addTarget: (request: TargetAddRequest) => Promise<TargetAddResult>;
   readonly removeTarget: (request: TargetRequest) => Promise<TargetRemoveResult>;
@@ -58,7 +64,7 @@ export interface OmpShellBridge {
   readonly onPairLink: (listener: (event: PairLinkEvent) => void) => () => void;
 }
 
-function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove", R>(channel: C, payload: unknown): Promise<R> {
+function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:peer-share:start" | "omp:peer-share:status" | "omp:peer-share:stop" | "omp:peer-share:regenerate" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove", R>(channel: C, payload: unknown): Promise<R> {
   return ipcRenderer.invoke(channel, { channel, payload }) as Promise<R>;
 }
 
@@ -97,6 +103,10 @@ const bridge: OmpShellBridge = {
   serviceStop: () => invoke("omp:service:stop", {}),
   serviceRestart: () => invoke("omp:service:restart", {}),
   serviceUninstall: () => invoke("omp:service:uninstall", {}),
+  peerShareStart: () => invoke("omp:peer-share:start", {}),
+  peerShareStatus: () => invoke("omp:peer-share:status", {}),
+  peerShareStop: () => invoke("omp:peer-share:stop", {}),
+  peerShareRegenerate: () => invoke("omp:peer-share:regenerate", {}),
   listTargets: () => invoke("omp:targets:list", {}),
   addTarget: (request) => invoke("omp:targets:add", request),
   removeTarget: (request) => invoke("omp:targets:remove", request),

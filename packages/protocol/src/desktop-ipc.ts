@@ -41,6 +41,10 @@ export const DESKTOP_IPC_CHANNELS = [
   "omp:service:stop",
   "omp:service:restart",
   "omp:service:uninstall",
+  "omp:peer-share:start",
+  "omp:peer-share:status",
+  "omp:peer-share:stop",
+  "omp:peer-share:regenerate",
 ] as const;
 export type DesktopInvokeChannel = (typeof DESKTOP_IPC_CHANNELS)[number];
 export const DESKTOP_IPC_EVENTS = [
@@ -75,6 +79,14 @@ export interface ServiceActionRequest {}
 export interface ServiceActionResult {
   completed: true;
 }
+export interface PeerShareRequest {}
+export interface PeerShareStartResult {
+  readonly invite: string;
+  readonly expiresAt: number;
+}
+export type PeerShareStatusResult =
+  | { readonly state: "stopped" }
+  | { readonly state: "sharing"; readonly expiresAt: number; readonly desktopPublicKey: string };
 export interface BootstrapResult {
   platform: DesktopPlatform;
   version: typeof PROTOCOL_VERSION;
@@ -365,6 +377,10 @@ export interface DesktopInvokeRequestMap {
   "omp:service:stop": ServiceActionRequest;
   "omp:service:restart": ServiceActionRequest;
   "omp:service:uninstall": ServiceActionRequest;
+  "omp:peer-share:start": PeerShareRequest;
+  "omp:peer-share:status": PeerShareRequest;
+  "omp:peer-share:stop": PeerShareRequest;
+  "omp:peer-share:regenerate": PeerShareRequest;
 }
 export interface DesktopInvokeResponseMap {
   "omp:targets:list": TargetListResult;
@@ -386,6 +402,10 @@ export interface DesktopInvokeResponseMap {
   "omp:service:stop": ServiceActionResult;
   "omp:service:restart": ServiceActionResult;
   "omp:service:uninstall": ServiceActionResult;
+  "omp:peer-share:start": PeerShareStartResult;
+  "omp:peer-share:status": PeerShareStatusResult;
+  "omp:peer-share:stop": PeerShareStatusResult;
+  "omp:peer-share:regenerate": PeerShareStartResult;
 }
 export interface RendererServerFrameEvent {
   targetId: string;
@@ -595,6 +615,10 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:service:stop":
     case "omp:service:restart":
     case "omp:service:uninstall":
+    case "omp:peer-share:start":
+    case "omp:peer-share:status":
+    case "omp:peer-share:stop":
+    case "omp:peer-share:regenerate":
       exact(payload, []);
       return { channel, payload: {} };
     case "omp:command":

@@ -11,6 +11,7 @@ import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphe
 import { VersionedRemoteTargetRegistry, DeviceCredentialStore } from "./remote-runtime/index.ts";
 import { LocalTargetManager, type TargetManagerOptions } from "./target-manager.ts";
 import { parsePairDeepLink, PendingPairQueue, type PendingPair } from "./deep-link.ts";
+import { PeerShareHost } from "./peer-share.ts";
 import { createAppserverServiceManager, discoverOmpExecutable, OmpAppserverCompatibilityError, probeOmpAppserver, NodeServiceFileSystem } from "./service.ts";
 
 export function appserverLogsDirectory(
@@ -62,6 +63,7 @@ export class DesktopLifecycle {
   private readonly serviceFactory: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
   private readonly targetManagerFactory: (options: TargetManagerOptions) => LocalTargetManager;
+  private readonly peerShare = new PeerShareHost();
   private mainWindow: BrowserWindow | undefined;
   private ipc: DesktopIpcRegistry | undefined;
   private manager: LocalTargetManager | undefined;
@@ -175,6 +177,7 @@ export class DesktopLifecycle {
     const recovery = this.serviceRecoveryPromise;
     await Promise.all([
       manager?.close() ?? Promise.resolve(),
+      this.peerShare.stop(),
       recovery?.then(() => undefined, () => undefined) ?? Promise.resolve(),
     ]);
     if (this.beforeQuitHandler !== undefined) this.electronApp.removeListener("before-quit", this.beforeQuitHandler);
@@ -310,6 +313,7 @@ export class DesktopLifecycle {
       acquireServiceManager: () => this.acquireServiceManager(),
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
       drainPairLinks: () => this.pendingPairs.drain(),
+      peerShare: this.peerShare,
     });
     this.ipc.install();
     handle.window.webContents.once("did-finish-load", () => {

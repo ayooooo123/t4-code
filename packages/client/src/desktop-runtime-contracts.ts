@@ -12,6 +12,8 @@ import type {
   PairRequest,
   PairResult,
   PairLinksDrainResult,
+  PeerShareStartResult,
+  PeerShareStatusResult,
   RendererServerFrame,
   RendererServerFrameEvent,
   RuntimeErrorEvent,
@@ -50,6 +52,10 @@ export interface DesktopShellPort {
   readonly serviceStop?: () => Promise<ServiceActionResult>;
   readonly serviceRestart?: () => Promise<ServiceActionResult>;
   readonly serviceUninstall?: () => Promise<ServiceActionResult>;
+  readonly peerShareStart?: () => Promise<PeerShareStartResult>;
+  readonly peerShareStatus?: () => Promise<PeerShareStatusResult>;
+  readonly peerShareStop?: () => Promise<PeerShareStatusResult>;
+  readonly peerShareRegenerate?: () => Promise<PeerShareStartResult>;
   readonly listTargets: () => Promise<TargetListResult>;
   readonly addTarget: (request: TargetAddRequest) => Promise<TargetAddResult>;
   readonly removeTarget: (request: TargetRequest) => Promise<TargetRemoveResult>;

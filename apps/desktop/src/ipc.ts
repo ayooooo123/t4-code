@@ -17,6 +17,8 @@ import {
   type PairRequest,
   type PairResult,
   type PairLinksDrainResult,
+  type PeerShareStartResult,
+  type PeerShareStatusResult,
   type RuntimeErrorEvent,
   type ServiceActionResult,
   type ServiceAvailabilityIssue,
@@ -34,6 +36,7 @@ import type { RendererServerFrame } from "@t4-code/protocol/desktop-ipc";
 import type { ServiceManager } from "@t4-code/service-manager";
 import { redactedMessage } from "@t4-code/client";
 import { trustedSender, type TrustedRenderer } from "./security.ts";
+import type { PeerShareHost } from "./peer-share.ts";
 import type { LocalTargetManager } from "./target-manager.ts";
 export interface IpcRuntime {
   readonly manager: LocalTargetManager;
@@ -46,6 +49,7 @@ export interface IpcRuntime {
   readonly acquireServiceManager?: () => Promise<ServiceManager | undefined>;
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly drainPairLinks?: () => readonly PairLinkEvent[];
+  readonly peerShare?: Pick<PeerShareHost, "start" | "status" | "stop">;
 }
 export class RemotePairingUnavailableError extends Error {
   readonly code = "remote_pairing_unavailable" as const;
@@ -76,6 +80,7 @@ export class DesktopIpcRegistry {
   private installed = false;
   private readonly runtime: IpcRuntime;
   private readonly serviceQueue = { tail: Promise.resolve() };
+  private readonly peerShareQueue = { tail: Promise.resolve() };
   private serviceInspectionPromise: Promise<ServiceInspection> | undefined;
   private readonly ipc: IpcMainLike;
   constructor(runtime: IpcRuntime, ipc: IpcMainLike = ipcMain) {
@@ -171,6 +176,30 @@ export class DesktopIpcRegistry {
         return { completed: true };
       });
     }
+    this.ipc.handle("omp:peer-share:start", async (event, payload: unknown): Promise<PeerShareStartResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:start", payload);
+      return this.enqueuePeerShare(() => this.peerShare().start());
+    });
+    this.ipc.handle("omp:peer-share:status", async (event, payload: unknown): Promise<PeerShareStatusResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:status", payload);
+      return this.enqueuePeerShare(async () => this.peerShare().status());
+    });
+    this.ipc.handle("omp:peer-share:stop", async (event, payload: unknown): Promise<PeerShareStatusResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:stop", payload);
+      return this.enqueuePeerShare(async () => {
+        const peerShare = this.peerShare();
+        await peerShare.stop();
+        return peerShare.status();
+      });
+    });
+    this.ipc.handle("omp:peer-share:regenerate", async (event, payload: unknown): Promise<PeerShareStartResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:regenerate", payload);
+      return this.enqueuePeerShare(() => this.peerShare().start());
+    });
   }
   uninstall(): void {
     for (const channel of [
@@ -179,6 +208,7 @@ export class DesktopIpcRegistry {
       "omp:pair-links:drain", "omp:targets:list", "omp:targets:add", "omp:targets:remove",
       "omp:service:inspect", "omp:service:install", "omp:service:start", "omp:service:stop",
       "omp:service:restart", "omp:service:uninstall",
+      "omp:peer-share:start", "omp:peer-share:status", "omp:peer-share:stop", "omp:peer-share:regenerate",
     ] as const) this.ipc.removeHandler(channel);
     this.installed = false;
   }
@@ -252,6 +282,15 @@ export class DesktopIpcRegistry {
   private enqueueService<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.serviceQueue.tail.then(operation, operation);
     this.serviceQueue.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+  private peerShare(): Pick<PeerShareHost, "start" | "status" | "stop"> {
+    if (this.runtime.peerShare === undefined) throw new Error("peer sharing is unavailable");
+    return this.runtime.peerShare;
+  }
+  private enqueuePeerShare<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.peerShareQueue.tail.then(operation, operation);
+    this.peerShareQueue.tail = result.then(() => undefined, () => undefined);
     return result;
   }
   private emit(channel: DesktopEventChannel, payload: unknown): void {

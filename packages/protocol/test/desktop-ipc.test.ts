@@ -72,6 +72,20 @@ describe("desktop IPC boundary", () => {
       payload: { intent: { hostId: "h", command: "host.list", args: {} } },
     });
   });
+  it("accepts only empty payloads for desktop peer-share controls", () => {
+    expect(decodeDesktopInvokeRequest({ channel: "omp:peer-share:start", payload: {} })).toEqual({
+      channel: "omp:peer-share:start",
+      payload: {},
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:peer-share:status", payload: {} })).toEqual({
+      channel: "omp:peer-share:status",
+      payload: {},
+    });
+    expect(() => decodeDesktopInvokeRequest({
+      channel: "omp:peer-share:regenerate",
+      payload: { invite: "must-not-cross-ipc" },
+    })).toThrow();
+  });
   it("decodes confirmations and target-scoped terminal requests with app-wire bounds", () => {
     expect(
       decodeDesktopInvokeRequest({
