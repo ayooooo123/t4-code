@@ -62,6 +62,7 @@ describe("deterministic fixture engine", () => {
       .sort();
     expect(names).toEqual([...DESKTOP_CATALOG_COMMANDS].sort());
     expect(names).toEqual([
+      "broker.status",
       "session.archive",
       "session.cancel",
       "session.close",
@@ -72,6 +73,7 @@ describe("deterministic fixture engine", () => {
       "session.rename",
       "session.restore",
       "session.thinking.set",
+      "usage.read",
     ]);
   });
 

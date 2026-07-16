@@ -2,30 +2,41 @@ import { app, BrowserWindow, dialog } from "electron";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { CursorStore } from "@t4-code/client";
-import type { ServiceAvailabilityIssue } from "@t4-code/protocol/desktop-ipc";
+import { decodeLocalProfileId, type ServiceAvailabilityIssue } from "@t4-code/protocol/desktop-ipc";
 import type { ServiceManager } from "@t4-code/service-manager";
 import type { RemoteTargetRegistry } from "./remote-runtime/registry.ts";
 import { createDesktopWindow, type DesktopWindowHandle } from "./window.ts";
 import { DesktopIpcRegistry, runtimeError, type IpcRuntime } from "./ipc.ts";
-import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, ElectronPeerPairingStore, ElectronWorkspaceRootsStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
+import { ElectronCursorStore, ElectronRemoteTargetStore, ElectronCredentialCiphertextStore, ElectronLocalProfileStore, ElectronPeerPairingStore, ElectronWorkspaceRootsStore, electronSafeStorage, loadDeviceIdentity, type DeviceIdentity } from "./stores.ts";
 import { VersionedRemoteTargetRegistry, DeviceCredentialStore } from "./remote-runtime/index.ts";
 import { LocalTargetManager, type TargetManagerOptions } from "./target-manager.ts";
 import { parsePairDeepLink, PendingPairQueue, type PendingPair } from "./deep-link.ts";
 import { PeerShareHost } from "./peer-share.ts";
 import { createAppserverServiceManager, discoverOmpExecutable, OmpAppserverCompatibilityError, probeOmpAppserver, NodeServiceFileSystem } from "./service.ts";
 import { WorkspaceRootsService } from "./workspace-roots.ts";
+import { createElectronUpdateController } from "./electron-update-controller.ts";
+import { installApplicationMenu, type ApplicationMenuOptions } from "./menu.ts";
+import { DesktopUpdateController } from "./update-controller.ts";
+import { LocalProfileRegistry } from "./local-profiles.ts";
+import { LocalProfileRuntime } from "./profile-runtime.ts";
 
 export function appserverLogsDirectory(
   homeDirectory: string,
   platform: NodeJS.Platform = process.platform,
   environment: NodeJS.ProcessEnv = process.env,
+  profileId = "default",
 ): string {
-  if (platform === "darwin") return join(homeDirectory, "Library", "Logs", "T4 Code", "appserver");
-  const configuredStateRoot = environment.XDG_STATE_HOME;
-  const stateRoot = configuredStateRoot?.startsWith("/") === true
-    ? configuredStateRoot
-    : join(homeDirectory, ".local", "state");
-  return join(stateRoot, "t4-code", "appserver");
+  const profile = decodeLocalProfileId(profileId);
+  const base = platform === "darwin"
+    ? join(homeDirectory, "Library", "Logs", "T4 Code", "appserver")
+    : (() => {
+        const configuredStateRoot = environment.XDG_STATE_HOME;
+        const stateRoot = configuredStateRoot?.startsWith("/") === true
+          ? configuredStateRoot
+          : join(homeDirectory, ".local", "state");
+        return join(stateRoot, "t4-code", "appserver");
+      })();
+  return profile === "default" ? base : join(base, "profiles", profile);
 }
 
 export interface DesktopLifecycleOptions {
@@ -37,12 +48,15 @@ export interface DesktopLifecycleOptions {
   readonly createCursorStore?: () => CursorStore;
   readonly createRemoteRegistry?: () => RemoteTargetRegistry;
   readonly createCredentials?: () => DeviceCredentialStore | undefined;
+  readonly createLocalProfileRegistry?: () => LocalProfileRegistry;
   readonly discoverExecutable?: () => Promise<string | undefined>;
   readonly probeAppserver?: (executable: string) => Promise<boolean>;
   readonly createServiceManager?: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   readonly createTargetManager?: (options: TargetManagerOptions) => LocalTargetManager;
   readonly createPeerShare?: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
   readonly createWorkspaceRoots?: () => WorkspaceRootsService;
+  readonly createUpdateController?: () => DesktopUpdateController;
+  readonly installMenu?: (options: ApplicationMenuOptions) => void;
 }
 
 class ServiceRecoveryCancelledError extends Error {
@@ -62,6 +76,7 @@ export class DesktopLifecycle {
   private readonly cursorStoreFactory: () => CursorStore;
   private readonly remoteRegistryFactory: () => RemoteTargetRegistry;
   private readonly credentialsFactory: () => DeviceCredentialStore | undefined;
+  private readonly localProfileRegistryFactory: () => LocalProfileRegistry;
   private readonly executableFactory: () => Promise<string | undefined>;
   private readonly serviceFactory: (options: Parameters<typeof createAppserverServiceManager>[0]) => ServiceManager;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
@@ -70,13 +85,24 @@ export class DesktopLifecycle {
   private readonly workspaceRootsFactory: () => WorkspaceRootsService;
   private peerShare: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> | undefined;
   private workspaceRoots: WorkspaceRootsService | undefined;
+  private readonly updateControllerFactory: () => DesktopUpdateController;
+  private readonly menuInstaller: (options: ApplicationMenuOptions) => void;
   private mainWindow: BrowserWindow | undefined;
   private ipc: DesktopIpcRegistry | undefined;
   private manager: LocalTargetManager | undefined;
+  private localProfileRegistry: LocalProfileRegistry | undefined;
+  private profileRuntime: LocalProfileRuntime | undefined;
   private serviceManager: ServiceManager | undefined;
+  private readonly serviceManagers = new Map<string, ServiceManager>();
   private serviceAvailabilityIssue: ServiceAvailabilityIssue | undefined;
+  private serviceExecutablePromise: Promise<string | undefined> | undefined;
   private serviceRecoveryPromise: Promise<ServiceManager | undefined> | undefined;
+  private readonly serviceRecoveryPromises = new Map<string, Promise<ServiceManager | undefined>>();
+  private readonly serviceAvailabilityIssues = new Map<string, ServiceAvailabilityIssue>();
+  private updateController: DesktopUpdateController | undefined;
+  private pendingUpdateOpen = false;
   private rendererLoaded = false;
+  private updateRendererReady = false;
   private startupPromise: Promise<void> | undefined;
   private stopPromise: Promise<void> | undefined;
   private startupServiceError: unknown;
@@ -96,12 +122,17 @@ export class DesktopLifecycle {
       if (!electronSafeStorage.isEncryptionAvailable()) return undefined;
       try { return new DeviceCredentialStore(new ElectronCredentialCiphertextStore(), electronSafeStorage); } catch { return undefined; }
     });
+    this.localProfileRegistryFactory = options.createLocalProfileRegistry ?? (
+      () => new LocalProfileRegistry(new ElectronLocalProfileStore())
+    );
     this.executableFactory = options.discoverExecutable ?? (() => discoverOmpExecutable());
     this.appserverProbe = options.probeAppserver ?? ((executable) => probeOmpAppserver(executable));
     this.serviceFactory = options.createServiceManager ?? createAppserverServiceManager;
     this.targetManagerFactory = options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
     this.peerShareFactory = options.createPeerShare ?? ((workspaceRoots) => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore(), workspaceRoots }));
     this.workspaceRootsFactory = options.createWorkspaceRoots ?? (() => new WorkspaceRootsService({ store: new ElectronWorkspaceRootsStore() }));
+    this.updateControllerFactory = options.createUpdateController ?? createElectronUpdateController;
+    this.menuInstaller = options.installMenu ?? installApplicationMenu;
   }
   async start(): Promise<void> {
     if (this.startupPromise !== undefined) return this.startupPromise;
@@ -145,14 +176,18 @@ export class DesktopLifecycle {
     this.workspaceRoots = this.workspaceRootsFactory();
     const peerShare = this.peerShareFactory(this.workspaceRoots);
     this.peerShare = peerShare;
+    this.updateController = this.updateControllerFactory();
+    this.menuInstaller({ onOpenUpdates: () => this.openUpdatesFromMenu() });
     const identity = this.identityFactory();
     const remoteRegistry = this.remoteRegistryFactory();
     const credentials = this.credentialsFactory();
+    this.localProfileRegistry = this.localProfileRegistryFactory();
     await this.acquireServiceManager();
     if (this.stopping) return;
     this.manager = this.targetManagerFactory({
       cursorStore: this.cursorStoreFactory(),
       registry: remoteRegistry,
+      localProfiles: () => this.localProfileRegistry?.list() ?? Promise.resolve([]),
       ...(credentials === undefined ? {} : { credentials }),
       deviceId: identity.deviceId,
       deviceName: identity.deviceName,
@@ -162,9 +197,19 @@ export class DesktopLifecycle {
         onError: (error) => this.ipc?.emitRuntimeError(error),
       },
     });
+    this.profileRuntime = new LocalProfileRuntime({
+      registry: this.localProfileRegistry,
+      targets: this.manager,
+      acquireServiceManager: (profileId) => this.acquireServiceManager(profileId),
+      releaseServiceManager: (profileId) => this.releaseServiceManager(profileId),
+      getServiceAvailabilityIssue: (profileId) => this.getServiceAvailabilityIssue(profileId),
+    });
     this.bindWindow(this.windowFactory());
     void peerShare.start().catch(() => {
       // Pairing is optional. A later explicit share request retries startup.
+    });
+    await this.profileRuntime.startAutomaticProfiles((profileId, error) => {
+      this.ipc?.emitRuntimeError(runtimeError(error, `local:${profileId}`));
     });
     this.beforeQuitHandler = () => {
       void this.stop().catch(() => {
@@ -188,13 +233,17 @@ export class DesktopLifecycle {
     this.ipc?.uninstall();
     this.ipc = undefined;
     this.mainWindow = undefined;
+    this.updateController?.dispose();
+    this.updateController = undefined;
     const manager = this.manager;
     this.manager = undefined;
     const recovery = this.serviceRecoveryPromise;
+    const recoveries = [...this.serviceRecoveryPromises.values()];
     await Promise.all([
       manager?.close() ?? Promise.resolve(),
       this.peerShare?.stop() ?? Promise.resolve(),
       recovery?.then(() => undefined, () => undefined) ?? Promise.resolve(),
+      ...recoveries.map((value) => value.then(() => undefined, () => undefined)),
     ]);
     if (this.beforeQuitHandler !== undefined) this.electronApp.removeListener("before-quit", this.beforeQuitHandler);
     this.beforeQuitHandler = undefined;
@@ -233,46 +282,66 @@ export class DesktopLifecycle {
    * A constructed manager is retained for explicit inspection/repair even
    * when automatic startup fails, and all windows/retries share one attempt.
    */
-  private acquireServiceManager(): Promise<ServiceManager | undefined> {
+  private acquireServiceManager(profileId = "default"): Promise<ServiceManager | undefined> {
+    const profile = decodeLocalProfileId(profileId);
     if (this.stopping) return Promise.resolve(undefined);
-    if (this.serviceManager !== undefined) return Promise.resolve(this.serviceManager);
-    if (this.serviceRecoveryPromise !== undefined) return this.serviceRecoveryPromise;
-    const recovery = this.recoverServiceManager();
-    this.serviceRecoveryPromise = recovery;
+    const current = profile === "default"
+      ? this.serviceManager
+      : this.serviceManagers.get(profile);
+    if (current !== undefined) return Promise.resolve(current);
+    const activeRecovery = profile === "default"
+      ? this.serviceRecoveryPromise
+      : this.serviceRecoveryPromises.get(profile);
+    if (activeRecovery !== undefined) return activeRecovery;
+    const recovery = this.recoverServiceManager(profile);
+    if (profile === "default") this.serviceRecoveryPromise = recovery;
+    else this.serviceRecoveryPromises.set(profile, recovery);
     const clearRecovery = (): void => {
-      if (this.serviceRecoveryPromise === recovery) this.serviceRecoveryPromise = undefined;
+      if (profile === "default") {
+        if (this.serviceRecoveryPromise === recovery) this.serviceRecoveryPromise = undefined;
+      } else if (this.serviceRecoveryPromises.get(profile) === recovery) {
+        this.serviceRecoveryPromises.delete(profile);
+      }
     };
     void recovery.then(clearRecovery, clearRecovery);
     return recovery;
   }
 
-  private async recoverServiceManager(): Promise<ServiceManager | undefined> {
+  private async recoverServiceManager(profileId = "default"): Promise<ServiceManager | undefined> {
     if (this.stopping) return undefined;
     let executable: string | undefined;
     try {
-      executable = await this.executableFactory();
+      executable = await this.discoverServiceExecutable();
       this.assertServiceRecoveryActive();
     } catch (error) {
       if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
-      this.recordServiceFailure(error);
+      this.recordServiceFailure(error, profileId);
       return undefined;
     }
     if (executable === undefined) {
-      this.serviceAvailabilityIssue = {
+      const issue: ServiceAvailabilityIssue = {
         code: "omp_not_found",
         message: "OMP was not found. Install or update OMP, then choose Check again.",
       };
+      if (profileId === "default") this.serviceAvailabilityIssue = issue;
+      else this.serviceAvailabilityIssues.set(profileId, issue);
       return undefined;
     }
     try {
       const candidate = this.serviceFactory({
+        profileId,
         homeDirectory: homedir(),
-        logsDirectory: appserverLogsDirectory(homedir()),
+        logsDirectory: appserverLogsDirectory(homedir(), process.platform, process.env, profileId),
         executable,
         argv: executable.endsWith("/ompd") ? [] : ["appserver", "serve"],
         fs: new NodeServiceFileSystem(),
       });
       this.assertServiceRecoveryActive();
+      if (profileId !== "default") {
+        this.serviceManagers.set(profileId, candidate);
+        this.serviceAvailabilityIssues.delete(profileId);
+        return candidate;
+      }
       // A healthy appserver may have been launched outside T4 Code. Use it
       // as-is; service installation/startup is only a cold-start fallback.
       try {
@@ -296,27 +365,60 @@ export class DesktopLifecycle {
       return candidate;
     } catch (error) {
       if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
-      this.recordServiceFailure(error);
+      this.recordServiceFailure(error, profileId);
       return undefined;
     }
+  }
+
+  /** Share only concurrent OMP discovery; later repair attempts must revalidate the executable. */
+  private discoverServiceExecutable(): Promise<string | undefined> {
+    if (this.serviceExecutablePromise !== undefined) return this.serviceExecutablePromise;
+    const discovery = Promise.resolve().then(() => this.executableFactory());
+    this.serviceExecutablePromise = discovery;
+    const clearDiscovery = (): void => {
+      if (this.serviceExecutablePromise === discovery) this.serviceExecutablePromise = undefined;
+    };
+    void discovery.then(clearDiscovery, clearDiscovery);
+    return discovery;
   }
 
   private assertServiceRecoveryActive(): void {
     if (this.stopping) throw new ServiceRecoveryCancelledError();
   }
 
-  private recordServiceFailure(error: unknown): void {
-    this.startupServiceError = error;
-    this.serviceAvailabilityIssue = error instanceof OmpAppserverCompatibilityError
+  private recordServiceFailure(error: unknown, profileId = "default"): void {
+    const issue: ServiceAvailabilityIssue = error instanceof OmpAppserverCompatibilityError
       ? { code: "omp_incompatible", message: error.message }
       : {
           code: "service_unavailable",
           message: runtimeError(error, "local").message || "The local OMP service is unavailable. Choose Check again to retry.",
         };
+    if (profileId === "default") {
+      this.startupServiceError = error;
+      this.serviceAvailabilityIssue = issue;
+    } else {
+      this.serviceAvailabilityIssues.set(profileId, issue);
+    }
+  }
+
+  private getServiceAvailabilityIssue(profileId: string): ServiceAvailabilityIssue | undefined {
+    const profile = decodeLocalProfileId(profileId);
+    return profile === "default"
+      ? this.serviceAvailabilityIssue
+      : this.serviceAvailabilityIssues.get(profile);
+  }
+
+  private releaseServiceManager(profileId: string): void {
+    const profile = decodeLocalProfileId(profileId);
+    if (profile === "default") return;
+    this.serviceManagers.delete(profile);
+    this.serviceRecoveryPromises.delete(profile);
+    this.serviceAvailabilityIssues.delete(profile);
   }
 
   private bindWindow(handle: DesktopWindowHandle): void {
     this.rendererLoaded = false;
+    this.updateRendererReady = false;
     const manager = this.manager;
     if (manager === undefined) return;
     this.mainWindow = handle.window;
@@ -328,6 +430,7 @@ export class DesktopLifecycle {
       getServiceManager: () => this.serviceManager,
       acquireServiceManager: () => this.acquireServiceManager(),
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
+      ...(this.profileRuntime === undefined ? {} : { profileRuntime: this.profileRuntime }),
       drainPairLinks: () => this.pendingPairs.drain(),
       ...(this.peerShare === undefined ? {} : { peerShare: this.peerShare }),
       ...(this.workspaceRoots === undefined ? {} : { workspaceRoots: this.workspaceRoots }),
@@ -338,8 +441,13 @@ export class DesktopLifecycle {
         });
         return choice.canceled ? null : (choice.filePaths[0] ?? null);
       },
+      drainPendingUpdateOpen: () => this.markUpdateRendererReady(),
+      ...(this.updateController === undefined ? {} : { updateController: this.updateController }),
     });
     this.ipc.install();
+    handle.window.webContents.on("did-start-loading", () => {
+      this.updateRendererReady = false;
+    });
     handle.window.webContents.once("did-finish-load", () => {
       this.rendererLoaded = true;
       if (this.startupServiceError !== undefined) {
@@ -348,14 +456,34 @@ export class DesktopLifecycle {
       }
       const links = this.pendingPairs.drain();
       for (const link of links) this.ipc?.emitPairLink(link);
+      this.updateController?.schedulePassiveCheck();
     });
     handle.window.on("closed", () => {
       if (this.mainWindow === handle.window) {
         this.mainWindow = undefined;
         this.rendererLoaded = false;
+        this.updateRendererReady = false;
         this.ipc?.uninstall();
         this.ipc = undefined;
       }
     });
+  }
+
+  private openUpdatesFromMenu(): void {
+    if (this.stopping) return;
+    if (this.mainWindow === undefined && this.manager !== undefined) {
+      this.bindWindow(this.windowFactory());
+    }
+    this.mainWindow?.show();
+    this.mainWindow?.focus();
+    if (this.updateRendererReady) this.ipc?.emitOpenUpdateSettings();
+    else this.pendingUpdateOpen = true;
+  }
+
+  private markUpdateRendererReady(): boolean {
+    this.updateRendererReady = true;
+    const openSettings = this.pendingUpdateOpen;
+    this.pendingUpdateOpen = false;
+    return openSettings;
   }
 }

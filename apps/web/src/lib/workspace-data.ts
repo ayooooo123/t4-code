@@ -13,6 +13,10 @@ export interface WorkspaceHost {
   readonly id: string;
   readonly name: string;
   readonly kind: "local" | "remote";
+  /** Native OMP profile id for local hosts. Absent for fixtures and remote hosts. */
+  readonly profileId?: string;
+  /** True when the host reported only part of its durable session index. */
+  readonly sessionInventoryTruncated?: boolean;
 }
 
 export interface WorkspaceProject {

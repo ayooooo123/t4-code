@@ -7,7 +7,16 @@ import type {
   ConnectionStateEvent,
   ConnectResult,
   DisconnectResult,
+  LocalProfileAddRequest,
+  LocalProfileListResult,
+  LocalProfileRemoveResult,
+  LocalProfileRequest,
+  LocalProfileResult,
+  LocalProfileUpdateRequest,
   DesktopTarget,
+  DesktopUpdateOpenEvent,
+  DesktopUpdateRendererReadyResult,
+  DesktopUpdateState,
   PairLinkEvent,
   PairRequest,
   PairResult,
@@ -64,6 +73,19 @@ export interface DesktopShellPort {
   readonly workspaceRootSelect?: (request: WorkspaceRootSelectRequest) => Promise<void>;
   readonly workspaceRootChoose?: () => Promise<WorkspaceRootChooseResult>;
   readonly workspaceProjectCreate?: (request: { readonly name: string }) => Promise<WorkspaceProjectCreateResult>;
+  readonly listProfiles?: () => Promise<LocalProfileListResult>;
+  readonly addProfile?: (request: LocalProfileAddRequest) => Promise<LocalProfileResult>;
+  readonly updateProfile?: (request: LocalProfileUpdateRequest) => Promise<LocalProfileResult>;
+  readonly removeProfile?: (request: LocalProfileRequest) => Promise<LocalProfileRemoveResult>;
+  readonly profileStatus?: (request: LocalProfileRequest) => Promise<LocalProfileResult>;
+  readonly profileStart?: (request: LocalProfileRequest) => Promise<LocalProfileResult>;
+  readonly profileStop?: (request: LocalProfileRequest) => Promise<LocalProfileResult>;
+  readonly profileRestart?: (request: LocalProfileRequest) => Promise<LocalProfileResult>;
+  readonly getUpdateState?: () => Promise<DesktopUpdateState>;
+  readonly checkForUpdate?: () => Promise<DesktopUpdateState>;
+  readonly downloadUpdate?: () => Promise<DesktopUpdateState>;
+  readonly restartToUpdate?: () => Promise<DesktopUpdateState>;
+  readonly updateRendererReady?: () => Promise<DesktopUpdateRendererReadyResult>;
   readonly listTargets: () => Promise<TargetListResult>;
   readonly addTarget: (request: TargetAddRequest) => Promise<TargetAddResult>;
   readonly removeTarget: (request: TargetRequest) => Promise<TargetRemoveResult>;
@@ -73,6 +95,8 @@ export interface DesktopShellPort {
   readonly onConnectionState: (listener: (event: ConnectionStateEvent) => void) => () => void;
   readonly onRuntimeError: (listener: (event: RuntimeErrorEvent) => void) => () => void;
   readonly onPairLink?: (listener: (event: PairLinkEvent) => void) => () => void;
+  readonly onUpdateState?: (listener: (state: DesktopUpdateState) => void) => () => void;
+  readonly onOpenUpdateSettings?: (listener: (event: DesktopUpdateOpenEvent) => void) => () => void;
 }
 
 export type DesktopRuntimeStartState = "idle" | "starting" | "started" | "stopped" | "error";

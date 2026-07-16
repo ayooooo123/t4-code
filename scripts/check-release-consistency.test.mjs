@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
+
+import { load as parseYaml } from "js-yaml";
 
 import {
   collectReleaseConsistencyErrors,
@@ -16,29 +19,52 @@ function changed(path, replace) {
   return copy;
 }
 
+function requiredWorkflowJob(workflow, name) {
+  const parsed = parseYaml(workflow);
+  assert.ok(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+  const job = parsed.jobs?.[name];
+  assert.ok(job && typeof job === "object" && !Array.isArray(job), `missing workflow job ${name}`);
+  return job;
+}
+
+function requiredNamedStep(job, name) {
+  assert.ok(Array.isArray(job.steps), "workflow job must contain steps");
+  const matches = job.steps.filter((step) => step?.name === name);
+  assert.equal(matches.length, 1, `expected one workflow step named ${name}`);
+  return matches[0];
+}
+
+function resolveWorkflowExpression(expression, context) {
+  assert.equal(typeof expression, "string");
+  const match = expression.match(/^\$\{\{\s*([A-Za-z0-9_.]+)\s*\}\}$/u);
+  assert.ok(match, `expected one direct workflow expression, received ${expression}`);
+  assert.ok(Object.hasOwn(context, match[1]), `missing workflow context value ${match[1]}`);
+  return context[match[1]];
+}
+
 test("current source tree has one consistent release version", () => {
-  assert.deepEqual(collectReleaseConsistencyErrors(files, "v0.1.11"), []);
+  assert.deepEqual(collectReleaseConsistencyErrors(files, "v0.1.21"), []);
 });
 
 test("rejects a tag that differs from the package version", () => {
   assert.ok(
     collectReleaseConsistencyErrors(files, "v9.9.9").some((error) =>
-      error.includes("release tag v9.9.9 does not match v0.1.11"),
+      error.includes("release tag v9.9.9 does not match v0.1.21"),
     ),
   );
 });
 
 test("rejects workspace, site, README, and runtime version drift", () => {
   const cases = [
-    ["apps/web/package.json", (text) => text.replace('"version": "0.1.11"', '"version": "0.1.3"')],
+    ["apps/web/package.json", (text) => text.replace('"version": "0.1.21"', '"version": "0.1.3"')],
     [
       "apps/site/src/release.ts",
-      (text) => text.replace('RELEASE_TAG = "v0.1.11"', 'RELEASE_TAG = "v0.1.3"'),
+      (text) => text.replace('RELEASE_TAG = "v0.1.21"', 'RELEASE_TAG = "v0.1.3"'),
     ],
-    ["README.md", (text) => text.replace("Download v0.1.11", "Download v0.1.3")],
+    ["README.md", (text) => text.replace("Download v0.1.21", "Download v0.1.3")],
     [
       "apps/desktop/src/target-manager.ts",
-      (text) => text.replace('version: "0.1.11"', 'version: "0.1.3"'),
+      (text) => text.replace('version: "0.1.21"', 'version: "0.1.3"'),
     ],
     [
       "apps/site/src/docs/content.ts",
@@ -66,9 +92,113 @@ test("rejects version drift in a newly added workspace package", () => {
   );
 });
 
+test("rejects updater channel, stable manifest, and publication-contract drift", () => {
+  const cases = [
+    ["electron-builder.config.mjs", (text) => text.replace('repo: "t4-code"', 'repo: "renamed"')],
+    [
+      "scripts/generate-release-manifest.mjs",
+      (text) =>
+        text.replace("RELEASE_MANIFEST_SCHEMA_VERSION = 1", "RELEASE_MANIFEST_SCHEMA_VERSION = 2"),
+    ],
+    ["scripts/wait-for-release-assets.mjs", (text) => text.replace(', "latest-linux.yml"', "")],
+    [
+      ".github/workflows/release.yml",
+      (text) => text.replace("artifacts/latest-linux.yml", "artifacts/missing-linux.yml"),
+    ],
+    [
+      ".github/workflows/release.yml",
+      (text) =>
+        text.replace(
+          "needs: [verify, ci-authority, build-android, build-linux, build-macos]",
+          "needs: [verify, build-android, build-linux, build-macos]",
+        ),
+    ],
+    [
+      ".github/workflows/ci.yml",
+      (text) => text.replace("needs: [core, tooling, android-debug]", "needs: [core, tooling]"),
+    ],
+    [
+      "scripts/reconcile-release-assets.mjs",
+      (text) => text.replace('method: "DELETE"', 'method: "POST"'),
+    ],
+    [
+      "scripts/dispatch-site-deployment.mjs",
+      (text) => text.replace("body: { ref: tag", 'body: { ref: "main"'),
+    ],
+    [
+      "scripts/wait-for-exact-ci.mjs",
+      (text) =>
+        text.replace(
+          'WORKFLOW_PATH = ".github/workflows/ci.yml"',
+          'WORKFLOW_PATH = ".github/workflows/release.yml"',
+        ),
+    ],
+    [
+      ".github/workflows/deploy-site.yml",
+      (text) =>
+        text.replace("startsWith(github.ref, 'refs/tags/')", "github.ref == 'refs/heads/main'"),
+    ],
+  ];
+  for (const [path, replace] of cases) {
+    assert.ok(
+      collectReleaseConsistencyErrors(changed(path, replace)).length > 0,
+      `${path} updater drift should fail`,
+    );
+  }
+});
+
+test("historical repair runs CI authority from trusted control while querying old source", () => {
+  const trustedControlSha = "a".repeat(40);
+  const historicalSourceSha = "b".repeat(40);
+  const waiterPath = "scripts/wait-for-exact-ci.mjs";
+  const historicalFixtureRoot = resolve(
+    repoRoot,
+    "scripts/fixtures/historical-release-without-ci-waiter",
+  );
+  const sourceTrees = new Map([
+    [trustedControlSha, repoRoot],
+    [historicalSourceSha, historicalFixtureRoot],
+  ]);
+  const context = {
+    "github.sha": trustedControlSha,
+    "needs.verify.outputs.source_sha": historicalSourceSha,
+  };
+
+  assert.ok(existsSync(resolve(repoRoot, waiterPath)));
+  assert.equal(existsSync(resolve(historicalFixtureRoot, waiterPath)), false);
+
+  const authorityJob = requiredWorkflowJob(
+    files.get(".github/workflows/release.yml"),
+    "ci-authority",
+  );
+  const checkoutStep = requiredNamedStep(authorityJob, "Check out trusted CI-authority source");
+  const authorityStep = requiredNamedStep(authorityJob, "Require successful exact-SHA main CI");
+  const checkoutIndex = authorityJob.steps.indexOf(checkoutStep);
+  const authorityIndex = authorityJob.steps.indexOf(authorityStep);
+  assert.ok(checkoutIndex >= 0 && checkoutIndex < authorityIndex);
+
+  let checkoutSha;
+  for (const step of authorityJob.steps.slice(0, authorityIndex)) {
+    if (typeof step.uses === "string" && step.uses.startsWith("actions/checkout@")) {
+      checkoutSha = resolveWorkflowExpression(step.with?.ref, context);
+    }
+  }
+  assert.equal(checkoutSha, trustedControlSha);
+  const checkoutRoot = sourceTrees.get(checkoutSha);
+  assert.ok(checkoutRoot, "authority checkout must resolve a known fixture tree");
+  assert.ok(existsSync(resolve(checkoutRoot, waiterPath)));
+
+  assert.match(authorityStep.run, /node scripts\/wait-for-exact-ci\.mjs/u);
+  const commitVariable = authorityStep.run.match(/--commit\s+"\$([A-Z][A-Z0-9_]*)"/u)?.[1];
+  assert.ok(commitVariable, "authority command must pass one environment SHA to --commit");
+  const queriedSha = resolveWorkflowExpression(authorityStep.env[commitVariable], context);
+  assert.equal(queriedSha, historicalSourceSha);
+  assert.notEqual(checkoutSha, queriedSha);
+});
+
 test("rejects app-wire matrix changes until the release surfaces agree", () => {
   const drifted = changed("compat/omp-app-matrix.json", (text) =>
-    text.replace('"version": "0.5.3"', '"version": "0.5.1"'),
+    text.replace('"version": "0.5.7"', '"version": "0.5.1"'),
   );
   assert.ok(collectReleaseConsistencyErrors(drifted).length > 0);
 });
@@ -76,7 +206,7 @@ test("rejects app-wire matrix changes until the release surfaces agree", () => {
 test("rejects app-wire provenance changes until the release surfaces agree", () => {
   const drifted = changed("compat/omp-app-matrix.json", (text) =>
     text.replace(
-      '"sourceCommit": "15527d1f00bac22705f63f80b29c0c30e67fc5da"',
+      '"sourceCommit": "ee1b794f1d0638b3d6797c5220e5eafe69d693db"',
       '"sourceCommit": "0000000000000000000000000000000000000000"',
     ),
   );
@@ -90,7 +220,7 @@ test("rejects app-wire provenance changes until the release surfaces agree", () 
 test("rejects drift between the compatibility matrix and vendored app-wire manifest", () => {
   const drifted = changed("vendor/app-wire/manifest.json", (text) =>
     text.replace(
-      '"sourceTreeHash": "4961ea9c522a3bbf9a9900424dd475a48148c729"',
+      '"sourceTreeHash": "421e29e6ed9203113345906e2d24c042949d0f61"',
       '"sourceTreeHash": "0000000000000000000000000000000000000000"',
     ),
   );
@@ -105,13 +235,13 @@ test("rejects drift in verified OMP runtime provenance", () => {
   const cases = [
     (text) =>
       text.replace(
-        "15527d1f00bac22705f63f80b29c0c30e67fc5da",
+        "ee1b794f1d0638b3d6797c5220e5eafe69d693db",
         "0000000000000000000000000000000000000000",
       ),
-    (text) => text.replace('"sourceTag": "t4code-16.5.1-appserver-1"', '"sourceTag": "wrong-tag"'),
+    (text) => text.replace('"sourceTag": "t4code-17.0.0-appserver-4"', '"sourceTag": "wrong-tag"'),
     (text) =>
       text.replace(
-        '"upstreamCommit": "14b5da76a9aece9a469288718d22c3d624daf033"',
+        '"upstreamCommit": "d5cd24f39a951bfbd50dc8f50bcf095d59694d6c"',
         '"upstreamCommit": "0000000000000000000000000000000000000000"',
       ),
     (text) => text.replace('"complete-session-event-projection"', '"Wrong integration patch"'),
@@ -133,31 +263,31 @@ test("accepts a coordinated app-wire provenance update without editing the workf
     "compat/omp-app-matrix.json",
     coordinated
       .get("compat/omp-app-matrix.json")
-      .replace('"version": "0.5.3"', '"version": "0.5.4"')
-      .replace("oh-my-pi-app-wire-0.5.3.tgz", "oh-my-pi-app-wire-0.5.4.tgz"),
+      .replace('"version": "0.5.7"', '"version": "0.5.8"')
+      .replace("oh-my-pi-app-wire-0.5.7.tgz", "oh-my-pi-app-wire-0.5.8.tgz"),
   );
   coordinated.set(
     "apps/site/src/release.ts",
     coordinated
       .get("apps/site/src/release.ts")
-      .replace('APP_WIRE_VERSION = "0.5.3"', 'APP_WIRE_VERSION = "0.5.4"'),
+      .replace('APP_WIRE_VERSION = "0.5.7"', 'APP_WIRE_VERSION = "0.5.8"'),
   );
   coordinated.set(
     "README.md",
     coordinated
       .get("README.md")
-      .replace("`@oh-my-pi/app-wire` 0.5.3", "`@oh-my-pi/app-wire` 0.5.4"),
+      .replace("`@oh-my-pi/app-wire` 0.5.7", "`@oh-my-pi/app-wire` 0.5.8"),
   );
   coordinated.set(
     "docs/CURRENT_RELEASE_NOTES.md",
-    coordinated.get("docs/CURRENT_RELEASE_NOTES.md").replace("app-wire 0.5.3", "app-wire 0.5.4"),
+    coordinated.get("docs/CURRENT_RELEASE_NOTES.md").replace("app-wire 0.5.7", "app-wire 0.5.8"),
   );
   coordinated.set(
     "vendor/app-wire/manifest.json",
     coordinated
       .get("vendor/app-wire/manifest.json")
-      .replace('"version": "0.5.3"', '"version": "0.5.4"')
-      .replace("oh-my-pi-app-wire-0.5.3.tgz", "oh-my-pi-app-wire-0.5.4.tgz"),
+      .replace('"version": "0.5.7"', '"version": "0.5.8"')
+      .replace("oh-my-pi-app-wire-0.5.7.tgz", "oh-my-pi-app-wire-0.5.8.tgz"),
   );
 
   assert.deepEqual(collectReleaseConsistencyErrors(coordinated), []);
@@ -173,29 +303,91 @@ test("rejects stale README release URLs while allowing historical prose", () => 
   const staleLink = changed("README.md", (text) => `${text}\n[Old release](${oldReleaseUrl})\n`);
   assert.ok(
     collectReleaseConsistencyErrors(staleLink).some((error) =>
-      error.includes("release URL for v0.1.3; expected v0.1.11"),
+      error.includes("release URL for v0.1.3; expected v0.1.21"),
     ),
   );
   assert.deepEqual(collectReleaseConsistencyErrors(files), []);
 });
 
 test("deploys release site source only after artifact publication", () => {
+  const ciWorkflow = files.get(".github/workflows/ci.yml");
   const releaseWorkflow = files.get(".github/workflows/release.yml");
   const deployWorkflow = files.get(".github/workflows/deploy-site.yml");
+
+  assert.ok(ciWorkflow.includes("android-debug:"));
+  assert.ok(ciWorkflow.includes("core:"));
+  assert.ok(ciWorkflow.includes("tooling:"));
+  assert.ok(ciWorkflow.includes("name: verify"));
+  assert.ok(ciWorkflow.includes("if: ${{ always() }}"));
+  assert.ok(ciWorkflow.includes("needs: [core, tooling, android-debug]"));
+  assert.ok(ciWorkflow.includes('test "$CORE_RESULT" = success'));
+  assert.ok(ciWorkflow.includes('test "$TOOLING_RESULT" = success'));
+  assert.ok(ciWorkflow.includes('test "$ANDROID_RESULT" = success'));
+  assert.ok(ciWorkflow.includes("github.event_name == 'pull_request' && github.ref || github.sha"));
+  assert.ok(ciWorkflow.includes("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"));
+  assert.ok(ciWorkflow.includes('java-version: "21"'));
+  assert.ok(
+    ciWorkflow.includes('sdkmanager --install "platforms;android-36" "build-tools;36.0.0"'),
+  );
+  assert.ok(ciWorkflow.includes("pnpm --filter @t4-code/mobile check:android:debug"));
+  assert.ok(!ciWorkflow.includes("T4_ANDROID_KEYSTORE_BASE64"));
+  assert.equal(
+    JSON.parse(files.get("apps/mobile/package.json")).scripts["check:android:debug"],
+    "pnpm sync:android && node ./scripts/run-gradle.mjs testDebugUnitTest assembleDebug lintDebug",
+  );
 
   assert.ok(releaseWorkflow.includes("github.ref == 'refs/heads/main'"));
   assert.ok(releaseWorkflow.includes("Check out trusted release-control source"));
   assert.ok(releaseWorkflow.includes("fetch-depth: 0"));
   assert.ok(releaseWorkflow.includes("Resolve immutable release source"));
+  assert.ok(releaseWorkflow.includes('expected_tag="v${tag_version}"'));
+  assert.ok(
+    releaseWorkflow.includes(
+      '[[ "$EVENT_NAME" == "push" && "$TRUSTED_CONTROL_SHA" != "$source_sha" ]]',
+    ),
+  );
+  assert.ok(!releaseWorkflow.includes("trusted_version="));
   assert.ok(
     releaseWorkflow.includes('git merge-base --is-ancestor "$source_sha" refs/remotes/origin/main'),
   );
   assert.ok(releaseWorkflow.includes("ref: ${{ steps.source.outputs.source_sha }}"));
   assert.ok(releaseWorkflow.includes("ref: ${{ needs.verify.outputs.source_sha }}"));
-  assert.ok(releaseWorkflow.includes("needs: [verify, build-android, build-linux, build-macos]"));
+  assert.ok(releaseWorkflow.includes("ci-authority:"));
+  assert.ok(releaseWorkflow.includes("actions: read"));
+  assert.ok(releaseWorkflow.includes("node scripts/wait-for-exact-ci.mjs"));
+  assert.ok(releaseWorkflow.includes('--commit "$SOURCE_SHA"'));
+  assert.ok(releaseWorkflow.includes("timeout-minutes: 50"));
+  assert.ok(releaseWorkflow.includes("--timeout-ms 2700000"));
+  const ciAuthority = releaseWorkflow.slice(
+    releaseWorkflow.indexOf("  ci-authority:"),
+    releaseWorkflow.indexOf("  build-linux:"),
+  );
+  assert.ok(ciAuthority.includes("ref: ${{ github.sha }}"));
+  assert.ok(!ciAuthority.includes("ref: ${{ needs.verify.outputs.source_sha }}"));
+  assert.ok(
+    releaseWorkflow.includes(
+      "needs: [verify, ci-authority, build-android, build-linux, build-macos]",
+    ),
+  );
+  const releaseVerify = releaseWorkflow.slice(
+    releaseWorkflow.indexOf("  verify:"),
+    releaseWorkflow.indexOf("  ci-authority:"),
+  );
+  for (const duplicate of [
+    "pnpm install",
+    "pnpm check",
+    "pnpm test",
+    "pnpm build",
+    "playwright install",
+  ]) {
+    assert.ok(!releaseVerify.includes(duplicate));
+  }
   assert.ok(releaseWorkflow.includes("pnpm --filter @t4-code/mobile build:android:release"));
   assert.ok(releaseWorkflow.includes("T4_ANDROID_KEYSTORE_BASE64"));
-  assert.ok(releaseWorkflow.includes("apksigner verify --verbose"));
+  assert.ok(releaseWorkflow.includes("node scripts/inspect-android-release.mjs"));
+  assert.ok(releaseWorkflow.includes('--metadata "$metadata"'));
+  assert.ok(releaseWorkflow.includes('--aapt "$build_tools/aapt"'));
+  assert.ok(releaseWorkflow.includes('--apksigner "$build_tools/apksigner"'));
   assert.ok(
     releaseWorkflow.includes("Confirm the release tag still resolves to the verified source"),
   );
@@ -203,30 +395,65 @@ test("deploys release site source only after artifact publication", () => {
     releaseWorkflow.includes('test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$SOURCE_SHA"'),
   );
   assert.ok(!releaseWorkflow.includes("ref: ${{ env.RELEASE_TAG }}"));
-  assert.ok(releaseWorkflow.includes("Dispatch site deployment after release publication"));
-  assert.ok(releaseWorkflow.includes("needs: publish"));
+  assert.ok(
+    releaseWorkflow.includes(
+      "Preserve an exact release or prepare an incomplete release for repair",
+    ),
+  );
+  assert.ok(releaseWorkflow.includes("Verify the exact remote release bundle"));
+  assert.ok(
+    releaseWorkflow.indexOf("--mode prepare") <
+      releaseWorkflow.indexOf("softprops/action-gh-release@"),
+  );
+  assert.ok(
+    releaseWorkflow.includes("if: steps.release-assets.outputs.publish_required == 'true'"),
+  );
+  assert.ok(
+    releaseWorkflow.indexOf("softprops/action-gh-release@") <
+      releaseWorkflow.indexOf("--mode verify"),
+  );
+  assert.ok(releaseWorkflow.includes("needs: [verify, publish]"));
   assert.ok(releaseWorkflow.includes("actions: write"));
-  assert.ok(releaseWorkflow.includes("GH_REPO: ${{ github.repository }}"));
-  assert.ok(releaseWorkflow.includes("gh workflow run deploy-site.yml"));
-  assert.ok(releaseWorkflow.includes("--ref main"));
-  assert.ok(releaseWorkflow.includes('-f release_tag="$RELEASE_TAG"'));
+  assert.ok(releaseWorkflow.includes("node scripts/dispatch-site-deployment.mjs"));
+  assert.ok(releaseWorkflow.includes('--tag "$RELEASE_TAG"'));
+  assert.ok(releaseWorkflow.includes('--commit "$SOURCE_SHA"'));
+  assert.ok(!releaseWorkflow.includes("gh workflow run deploy-site.yml"));
+  const dispatchSite = releaseWorkflow.slice(releaseWorkflow.indexOf("  dispatch-site:"));
+  assert.ok(dispatchSite.includes("ref: ${{ github.sha }}"));
+  assert.ok(!dispatchSite.includes("ref: ${{ needs.verify.outputs.source_sha }}"));
+  assert.ok(!releaseWorkflow.includes("--ref main"));
+
+  const exactCiWaiter = files.get("scripts/wait-for-exact-ci.mjs");
+  assert.ok(exactCiWaiter.includes('WORKFLOW = "ci.yml"'));
+  assert.ok(exactCiWaiter.includes('WORKFLOW_NAME = "CI"'));
+  assert.ok(exactCiWaiter.includes('WORKFLOW_PATH = ".github/workflows/ci.yml"'));
+  assert.ok(exactCiWaiter.includes('MAIN_BRANCH = "main"'));
+  assert.ok(exactCiWaiter.includes("run.head_sha === commit"));
+  assert.ok(exactCiWaiter.includes('run.event === "push"'));
+  assert.ok(exactCiWaiter.includes("run.head_branch === MAIN_BRANCH"));
+  assert.ok(exactCiWaiter.includes('status === "completed" && conclusion === "success"'));
 
   assert.ok(deployWorkflow.includes("workflow_dispatch:"));
   assert.ok(deployWorkflow.includes("release_tag:"));
-  assert.ok(deployWorkflow.includes("github.ref == 'refs/heads/main'"));
+  assert.ok(deployWorkflow.includes("dispatch_nonce:"));
+  assert.ok(deployWorkflow.includes("inputs.dispatch_nonce || github.sha"));
+  assert.ok(deployWorkflow.includes("startsWith(github.ref, 'refs/tags/')"));
+  assert.ok(deployWorkflow.includes('[[ "$GITHUB_REF" != "refs/tags/${expected_tag}" ]]'));
   assert.ok(deployWorkflow.includes('expected_tag="v${TRUSTED_VERSION}"'));
   assert.ok(deployWorkflow.includes('release_tag="$expected_tag"'));
   assert.ok(deployWorkflow.includes("releases/tags/${release_tag}"));
-  assert.ok(deployWorkflow.includes('git merge-base --is-ancestor "$source_sha" "$MAIN_SHA"'));
+  assert.ok(deployWorkflow.includes('[[ "$source_sha" != "$TRUSTED_SHA" ]]'));
+  assert.ok(deployWorkflow.includes('git merge-base --is-ancestor "$source_sha" "$TRUSTED_SHA"'));
   assert.ok(deployWorkflow.includes("ref: ${{ steps.immutable_source.outputs.source_sha }}"));
   assert.ok(!deployWorkflow.includes('source_sha="$MAIN_SHA"'));
   assert.ok(!deployWorkflow.includes("cache: pnpm"));
   assert.ok(
     deployWorkflow.indexOf("Resolve immutable deployment source") >
-      deployWorkflow.indexOf("Check whether an ordinary main push references an existing release"),
+      deployWorkflow.indexOf("Classify the stable release referenced by an ordinary main push"),
   );
   assert.ok(!deployWorkflow.includes("source_ref:"));
   assert.ok(!deployWorkflow.includes("release_published:"));
-  assert.ok(deployWorkflow.includes("steps.existing_release.outcome == 'failure'"));
+  assert.ok(deployWorkflow.includes("steps.release_state.outputs.state == 'not-published'"));
+  assert.ok(!deployWorkflow.includes("continue-on-error: true"));
   assert.ok(deployWorkflow.includes("branches: [main, master]"));
 });

@@ -13,6 +13,8 @@ import type {
   WorkspaceSession,
 } from "../lib/workspace-data.ts";
 import { resolveCurrentHostTargetId } from "../lib/host-target.ts";
+import { sessionIsWorking } from "../features/session-runtime/session-management.ts";
+import { hostSessionInventoryIsComplete } from "../features/session-runtime/session-inventory.ts";
 
 /** Composite route id for one live session; unambiguous and URL-safe. */
 export function sessionViewId(hostId: string, sessionId: string): string {
@@ -45,6 +47,20 @@ export interface LiveProjectAddress {
   readonly projectId: string;
 }
 
+export interface LiveProjectCreateTarget {
+  readonly address: LiveProjectAddress;
+  readonly label: string;
+  readonly profileId?: string;
+  readonly current: boolean;
+}
+
+/** Never make a cross-profile account/model-routing choice silently. */
+export function requiresProfileChoiceForCreate(
+  targets: readonly LiveProjectCreateTarget[],
+): boolean {
+  return targets.length > 1 || (targets.length === 1 && targets[0]?.current === false);
+}
+
 /** Resolve a project view id, rejecting malformed ids and unbound hosts. */
 export function resolveLiveProject(
   snapshot: DesktopRuntimeSnapshot,
@@ -65,6 +81,50 @@ export function resolveLiveProject(
   }
   return null;
 }
+
+/**
+ * Resolve every connected local OMP profile that can address the same stable
+ * project id. Named profile appservers share only this opaque id; the renderer
+ * never receives or forwards an absolute cwd. Remote hosts stay pinned to their
+ * original target because equal project ids do not imply equal filesystems.
+ */
+export function resolveLiveProjectCreateTargets(
+  snapshot: DesktopRuntimeSnapshot,
+  viewId: string,
+): readonly LiveProjectCreateTarget[] {
+  const source = resolveLiveProject(snapshot, viewId);
+  if (source === null) return [];
+  const sourceTarget = snapshot.targets.get(source.targetId);
+  if (sourceTarget?.kind !== "local") {
+    return [{ address: source, label: sourceTarget?.label ?? "This host", current: true }];
+  }
+  const candidates: LiveProjectCreateTarget[] = [];
+  for (const target of snapshot.targets.values()) {
+    if (target.kind !== "local" || snapshot.connections.get(target.targetId) !== "connected")
+      continue;
+    const hostId = snapshot.targetHosts.get(target.targetId);
+    if (hostId === undefined) continue;
+    candidates.push({
+      address: { targetId: target.targetId, hostId, projectId: source.projectId },
+      label: target.label,
+      profileId:
+        target.targetId === "local"
+          ? "default"
+          : target.targetId.startsWith("local:")
+            ? target.targetId.slice("local:".length)
+            : target.targetId,
+      current: target.targetId === source.targetId,
+    });
+  }
+  candidates.sort((left, right) => {
+    if (left.current !== right.current) return left.current ? -1 : 1;
+    return (
+      left.label.localeCompare(right.label) ||
+      left.address.targetId.localeCompare(right.address.targetId)
+    );
+  });
+  return candidates;
+}
 /** Warm per-session projection for a view id, when the runtime holds one. */
 export function warmSessionProjection(
   snapshot: DesktopRuntimeSnapshot,
@@ -75,7 +135,10 @@ export function warmSessionProjection(
 }
 
 /** Display name for a project: advertised name, else the id's basename. */
-function projectDisplayName(project: { readonly projectId: string; readonly name?: string }): string {
+function projectDisplayName(project: {
+  readonly projectId: string;
+  readonly name?: string;
+}): string {
   if (project.name !== undefined && project.name !== "") return project.name;
   const id = String(project.projectId);
   const segments = id.split(/[\\/]+/).filter((segment) => segment !== "");
@@ -108,13 +171,34 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
   const cached = derived.get(snapshot);
   if (cached !== undefined) return cached;
 
+  const indexedSessionCountByHost = new Map<string, number>();
+  for (const ref of snapshot.projection.sessionIndex.values()) {
+    const hostId = String(ref.hostId);
+    indexedSessionCountByHost.set(hostId, (indexedSessionCountByHost.get(hostId) ?? 0) + 1);
+  }
+
   const hosts: WorkspaceHost[] = [];
   for (const [hostId, meta] of snapshot.hosts) {
     const target = snapshot.targets.get(meta.targetId);
+    const inventoryMetadata = snapshot.projection.sessionIndexMetadata.get(hostId);
     hosts.push({
       id: hostId,
       name: target?.label ?? "This machine",
       kind: target?.kind ?? "local",
+      ...(target?.kind === "local"
+        ? {
+            profileId:
+              target.targetId === "local"
+                ? "default"
+                : target.targetId.startsWith("local:")
+                  ? target.targetId.slice("local:".length)
+                  : "default",
+          }
+        : {}),
+      sessionInventoryTruncated:
+        inventoryMetadata === undefined ||
+        inventoryMetadata.truncated ||
+        (indexedSessionCountByHost.get(hostId) ?? 0) < inventoryMetadata.totalCount,
     });
   }
 
@@ -134,10 +218,7 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       const name = projectDisplayName(ref.project);
       projects.set(projectId, { id: projectId, name, path: name, hostId });
       if (advertisedProjectName !== null) projectsWithAdvertisedNames.add(projectId);
-    } else if (
-      advertisedProjectName !== null &&
-      !projectsWithAdvertisedNames.has(projectId)
-    ) {
+    } else if (advertisedProjectName !== null && !projectsWithAdvertisedNames.has(projectId)) {
       // A just-created session may omit the optional project name while
       // older refs for the same project still advertise it. Refs are sorted
       // newest-first, so upgrade the id fallback with the first real name and
@@ -153,9 +234,10 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
     const connection = hostConnection(snapshot, hostId);
     const warm = warmSessionProjection(snapshot, hostId, sessionId);
     const offline = connection.state !== "connected";
+    const inventoryReady = hostSessionInventoryIsComplete(snapshot, hostId);
     const freshness = offline
       ? "offline"
-      : warm !== undefined && warm.freshness !== "fresh"
+      : !inventoryReady || (warm !== undefined && warm.freshness !== "fresh")
         ? "cached"
         : "live";
     const pendingApprovals = warm?.confirmations.size ?? (ref.pendingApproval === true ? 1 : 0);
@@ -164,12 +246,20 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       typeof rawArchivedAt === "string" && Number.isFinite(Date.parse(rawArchivedAt))
         ? rawArchivedAt
         : null;
+    // Ref activity is current only with a fresh connected projection. Cached
+    // and offline rows must surface freshness instead of a stale Working pill.
+    // Last-known activity still prevents inventing a completion timestamp:
+    // losing freshness is not evidence that the turn completed.
+    const lastKnownWorking = sessionIsWorking(ref);
+    const displayWorking = freshness === "live" && lastKnownWorking;
     let status: SessionStatus | null = null;
     if (connection.state === "connecting") status = "connecting";
-    else if (pendingApprovals > 0) status = "pendingApproval";
-    else if (ref.pendingUserInput === true) status = "awaitingInput";
-    else if (ref.proposedPlan !== undefined && ref.proposedPlan !== "") status = "planReady";
-    else if (ref.status === "active") status = "working";
+    else if (freshness === "live") {
+      if (pendingApprovals > 0) status = "pendingApproval";
+      else if (ref.pendingUserInput === true) status = "awaitingInput";
+      else if (ref.proposedPlan !== undefined && ref.proposedPlan !== "") status = "planReady";
+      else if (displayWorking) status = "working";
+    }
     sessions.push({
       id: sessionViewId(hostId, sessionId),
       projectId,
@@ -178,7 +268,7 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       status,
       freshness,
       pendingApprovals,
-      latestTurnCompletedAt: ref.status === "active" ? null : ref.updatedAt,
+      latestTurnCompletedAt: lastKnownWorking ? null : ref.updatedAt,
       createdAt: ref.updatedAt,
       updatedAt: ref.updatedAt,
       lastActivity: "",

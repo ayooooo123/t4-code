@@ -124,7 +124,7 @@ const install: DocTopic = {
     },
     {
       kind: "p",
-      text: `T4 Code v${RELEASE_VERSION} was verified with OMP ${OMP_RUNTIME_VERSION} integration tag [\`${OMP_RUNTIME_TAG}\`](${OMP_RUNTIME_URL}), commit \`${OMP_RUNTIME_COMMIT}\`. That public integration is based on the [official upstream v${OMP_RUNTIME_VERSION} tag](${OMP_UPSTREAM_URL}) at commit [\`${OMP_UPSTREAM_COMMIT.slice(0, 8)}\`](${OMP_URL}/commit/${OMP_UPSTREAM_COMMIT}). The build bounds snapshots and replay payloads for growing sessions. It also publishes host-wide session updates and keeps rename, archive, restore, and permanent delete under OMP authority. T4 Code vendors \`@oh-my-pi/app-wire\` ${APP_WIRE_VERSION}.`,
+      text: `T4 Code v${RELEASE_VERSION} was verified with OMP ${OMP_RUNTIME_VERSION} integration tag [\`${OMP_RUNTIME_TAG}\`](${OMP_RUNTIME_URL}), commit \`${OMP_RUNTIME_COMMIT}\`. That public integration is based on the [official upstream v${OMP_RUNTIME_VERSION} tag](${OMP_UPSTREAM_URL}) at commit [\`${OMP_UPSTREAM_COMMIT.slice(0, 8)}\`](${OMP_URL}/commit/${OMP_UPSTREAM_COMMIT}). The build scopes each app server to its OMP profile, answers host-scoped \`usage.read\` and \`broker.status\` queries with redacted results, reports each model's real thinking levels and fast support, and keeps rename, archive, restore, and permanent delete under OMP authority. T4 Code vendors \`@oh-my-pi/app-wire\` ${APP_WIRE_VERSION}.`,
     },
     {
       kind: "note",
@@ -136,7 +136,7 @@ const install: DocTopic = {
 const firstRun: DocTopic = {
   id: "first-run",
   title: "First run",
-  lede: "Desktop builds can manage a local Oh My Pi app server. Android connects to the T4 gateway on your computer.",
+  lede: "Desktop builds can manage local Oh My Pi app servers, one per profile. Android connects to the T4 gateway on your computer.",
   blocks: [
     {
       kind: "note",
@@ -172,6 +172,15 @@ const firstRun: DocTopic = {
         "**macOS**: a launch agent. Logs: `~/Library/Logs/T4 Code/appserver`.",
       ],
     },
+    { kind: "h2", id: "first-run-profiles", text: "Named OMP profiles" },
+    {
+      kind: "p",
+      text: "OMP keeps named profiles under `~/.omp/profiles`, each with its own agent configuration. Desktop T4 Code discovers them next to the default profile and lists each one as its own local host, with its own app server, socket, and service registration.",
+    },
+    {
+      kind: "p",
+      text: "The Hosts screen (reachable from Settings) starts, stops, or restarts a profile and can mark it **Start with T4**. The default profile starts automatically; named profiles stay stopped until you start them or opt them in. Logs for a named profile land in a `profiles/<id>` folder under the log directories above.",
+    },
     {
       kind: "p",
       text: "Oh My Pi stays the source of truth the whole time. T4 Code shows you what the host reports; it never invents state of its own.",
@@ -191,16 +200,20 @@ const localSessions: DocTopic = {
     },
     {
       kind: "p",
+      text: "On desktop, the visible **New** action becomes **New ▾** when several local OMP profile targets are configured. Its chooser lists the current and other connected profiles, configured profiles that are offline as **Not connected**, and an **Open Hosts** shortcut to start them. The profile you pick owns the session; with one eligible target, **New** creates directly there.",
+    },
+    {
+      kind: "p",
       text: "New session references retain the project name OMP reports. The rail does not replace that name with an opaque project ID while the new session is attaching.",
     },
     { kind: "h2", id: "local-sessions-folders", text: "What a working folder means" },
     {
       kind: "p",
-      text: "A heading in the left rail is the working directory reported by the sessions beneath it. It is not a separate T4 Code project record. A folder group disappears when it has no Current or Archived sessions to show.",
+      text: "A heading in the left rail is the working directory reported by the sessions beneath it. It is not a separate T4 Code project record. When every session in a folder is archived, its empty shortcut can be removed from Working folders without touching the folder or any OMP session.",
     },
     {
       kind: "note",
-      text: "This release does not independently alias, pin, reorder, or hide working-folder groups. Those controls need a server-owned workspace registry so desktop and phone agree; a browser-only preference would drift between clients.",
+      text: "Removing a shortcut is view state for that T4 Code client, so desktop and phone can differ. Archived sessions remain visible, and their folder menu can restore the shortcut. A new or restored Current session always makes the folder visible. T4 Code still does not alias, pin, reorder, delete, or rename the underlying folder.",
     },
     {
       kind: "h2",
@@ -268,11 +281,24 @@ const remotePairing: DocTopic = {
     },
     {
       kind: "p",
-      text: `The v${RELEASE_VERSION} mobile test went through the Tailnet \`.ts.net\` HTTPS URL in a 320 × 568 touch browser. It reached connected state, created a session, selected a model, sent a prompt, received the reply, and kept exactly two durable transcript rows through five reloads. Follow the [Tailnet setup guide](${REPO_URL}/blob/${RELEASE_TAG}/docs/TAILNET_REMOTE.md) to install the source-hosted gateway.`,
+      text: `The mobile release test goes through the Tailnet \`.ts.net\` HTTPS URL in a 320 × 568 touch browser: connected state, a created session, a selected model, a prompt and its reply, and exactly two durable transcript rows kept through five reloads. Follow the [Tailnet setup guide](${REPO_URL}/blob/${RELEASE_TAG}/docs/TAILNET_REMOTE.md) to install the source-hosted gateway.`,
     },
     {
       kind: "p",
       text: "The gateway pings each browser WebSocket every 30 seconds. A half-open tunnel that does not pong is terminated and removed from the active-session count within 60 seconds; responsive sessions stay connected.",
+    },
+    { kind: "h2", id: "remote-pairing-android-hosts", text: "Saved hosts on Android" },
+    {
+      kind: "p",
+      text: "The Android app keeps up to 16 saved Tailnet gateway addresses, stored as plain HTTPS origins with no secrets inside. Switch, add, and remove are separate actions in the host list, and installs that already had a saved address migrate it into the list automatically.",
+    },
+    {
+      kind: "p",
+      text: "Adding a host probes the address first and saves only on success. Back or Escape cancels a probe in flight, and a probe that finishes after you cancel cannot save. Removing a host deletes exactly that entry; pairing credentials stay scoped to each host in the Android Keystore, so removing one host never touches another's credentials.",
+    },
+    {
+      kind: "p",
+      text: "Each saved host is one remote app server serving one OMP profile. Android does not list multiple profiles behind a single saved address; running several profiles side by side is a desktop feature, one local app server per profile.",
     },
   ],
 };
@@ -294,12 +320,12 @@ const sessionControls: DocTopic = {
     { kind: "h2", id: "session-controls-thinking", text: "Thinking effort" },
     {
       kind: "p",
-      text: "Thinking effort levels, from least to most: `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.",
+      text: "The thinking menu shows `Off`, `Auto`, and then only the concrete effort levels the current model supports, in the order the host reports them. Change models and the menu changes with it. On models that cannot turn reasoning off, `Off` maps to the provider's minimum effort; models without thinking support show the control disabled with the reason.",
     },
     { kind: "h2", id: "session-controls-fast", text: "Fast mode" },
     {
       kind: "p",
-      text: "Fast mode is a single toggle. Like every other control, the value you see is the host's last confirmed value, not a local guess.",
+      text: "Fast mode is a single toggle, offered only when the host reports the current model supports it. Like every other control, the value you see is the host's last confirmed value, not a local guess. That includes changes made from another client: flip fast mode on your phone and the desktop follows the host's confirmation.",
     },
     { kind: "h2", id: "session-controls-slash", text: "Slash commands" },
     {
@@ -382,6 +408,25 @@ const settings: DocTopic = {
     {
       kind: "p",
       text: "Settings load from the connected host and save back to it. If the connection drops before the host confirms a save, your edits stay staged locally; check the host before saving again. There is no hidden second settings store.",
+    },
+    { kind: "h2", id: "settings-hosts", text: "One editor, many hosts" },
+    {
+      kind: "p",
+      text: "With more than one host connected, the header carries an explicit host selector. Each host keeps its own drafts, so switching hosts never mixes staged edits, and the screen always names the host your changes will land on.",
+    },
+    { kind: "h2", id: "settings-broker", text: "Account broker status" },
+    {
+      kind: "p",
+      text: "For hosts that grant it, the header shows one sentence about where the active host's accounts come from: local files, a connected broker endpoint, or a missing token. The status never includes credentials, and hosts that cannot answer are labeled unsupported instead of guessed at.",
+    },
+    { kind: "h2", id: "settings-usage", text: "Account usage" },
+    {
+      kind: "p",
+      text: "The Usage screen lists every connected host that both advertises and grants the `usage.read` command. Pick a host to see its provider accounts, limits, usage windows, and reset times, grouped the way the host reports them.",
+    },
+    {
+      kind: "p",
+      text: "Reports are fetched when you ask and marked with their age; anything older than five minutes is labeled stale rather than silently trusted. T4 Code keeps the display-safe fields (provider, account label, limits, windows) and drops provider-specific metadata and the raw payload before anything reaches the screen.",
     },
     { kind: "h2", id: "settings-roles", text: "Model roles" },
     {

@@ -5,7 +5,9 @@
 // feeds newer host revisions in (drafts survive), and names connection and
 // protocol failures so the screen never spins forever. Saves flow through
 // the live settings.write controller; the restart banner gains a real,
-// serialized service restart for the local host only.
+// serialized service restart for the local host only. The header offers an
+// explicit connected-host selection (each host keeps its own drafts) and the
+// active host's account-broker status.
 import type { DesktopRuntimeController } from "@t4-code/client";
 import {
   Button,
@@ -15,18 +17,19 @@ import {
   DialogHeader,
   DialogPopup,
   DialogTitle,
-  Spinner,
 } from "@t4-code/ui";
-import { CircleAlert } from "lucide-react";
 import { useRef, useState, useSyncExternalStore } from "react";
 
 import { rendererPlatform } from "../../state/store-instance.ts";
+import { useAppUpdateState } from "../updates/update-store.ts";
 import type { SaveChallenge } from "./live-controller.ts";
+import type { HostSelection } from "./HostSelector.tsx";
 import {
   createLiveSettingsScreenModel,
   type LiveSettingsScreenModel,
 } from "./live-screen-model.ts";
 import { SettingsWorkspace, type RestartAction } from "./SettingsWorkspace.tsx";
+import { UnavailableSettingsWorkspace } from "./UnavailableSettingsWorkspace.tsx";
 
 interface PendingChallenge {
   readonly challenge: SaveChallenge;
@@ -38,7 +41,7 @@ interface RestartState {
   readonly notice: string | null;
 }
 
-const WAIT_COPY: Record<"no-host" | "connecting" | "not-published", { title: string; detail: string; spin: boolean }> = {
+const WAIT_COPY: Record<"no-host" | "connecting" | "disconnected" | "not-published", { title: string; detail: string; spin: boolean }> = {
   "no-host": {
     title: "No host is connected",
     detail: "Settings open once a host answers. Connect or pair one under Hosts.",
@@ -48,6 +51,11 @@ const WAIT_COPY: Record<"no-host" | "connecting" | "not-published", { title: str
     title: "Connecting to the host",
     detail: "Settings open as soon as the connection is up.",
     spin: true,
+  },
+  disconnected: {
+    title: "This host is not connected",
+    detail: "Reconnect it under Hosts, or pick another connected host above.",
+    spin: false,
   },
   "not-published": {
     title: "Waiting for the host's settings",
@@ -81,6 +89,7 @@ export function LiveSettingsScreen({
   }
   const model = modelRef.current;
   const state = useSyncExternalStore(model.subscribe, model.getState, model.getState);
+  const update = useAppUpdateState();
 
   const shell = rendererPlatform.shell;
   const restartAction: RestartAction | undefined =
@@ -116,31 +125,25 @@ export function LiveSettingsScreen({
         }
       : undefined;
 
+  const hostSelection: HostSelection = {
+    choices: state.hosts,
+    activeTargetId: state.phase === "ready" ? state.active.targetId : state.activeTargetId,
+    onSelect: (targetId) => model.selectHost(targetId),
+  };
+
   if (state.phase !== "ready") {
     const copy =
       state.phase === "error"
         ? { title: "Settings can't load", detail: state.message, spin: false }
         : WAIT_COPY[state.detail];
     return (
-      <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-        {copy.spin ? (
-          <Spinner />
-        ) : (
-          <CircleAlert aria-hidden="true" className="size-5 text-muted-foreground" />
-        )}
-        <p className="font-medium text-sm">{copy.title}</p>
-        <p className="max-w-[48ch] text-muted-foreground text-xs" role={state.phase === "error" ? "alert" : undefined}>
-          {copy.detail}
-        </p>
-        <div className="flex items-center gap-1.5 pt-2">
-          <Button onClick={onOpenHosts} size="sm" variant="outline">
-            Manage hosts
-          </Button>
-          <Button onClick={onBack} size="sm" variant="ghost">
-            Back
-          </Button>
-        </div>
-      </div>
+      <UnavailableSettingsWorkspace
+        copy={{ ...copy, error: state.phase === "error" }}
+        hostSelection={hostSelection}
+        onBack={onBack}
+        onOpenHosts={onOpenHosts}
+        update={update}
+      />
     );
   }
 
@@ -148,7 +151,9 @@ export function LiveSettingsScreen({
     <>
       <SettingsWorkspace
         api={state.api}
+        brokerStatus={{ view: state.broker, onRefresh: () => model.refreshBrokerStatus() }}
         catalogChoices={{ models: state.models, agents: state.agents }}
+        hostSelection={hostSelection}
         onBack={onBack}
         onOpenHosts={onOpenHosts}
         scopes={["global", "session"]}

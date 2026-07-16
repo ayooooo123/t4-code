@@ -23,7 +23,9 @@ import {
   renderPlist,
   renderSystemd,
   sanitizeDiagnostic,
+  serviceLabelForProfile,
   validateAbsolutePath,
+  validateProfileId,
   validateSpec,
 } from "./rendering.ts";
 
@@ -64,14 +66,17 @@ export function validateServiceSpec(spec: ServiceSpec): ServiceSpec {
 }
 
 export function renderLinuxSystemdDefinition(spec: ServiceSpec): string {
-  return renderSystemd(validateSpec(spec), "dev.oh-my-pi.appserver");
+  const validated = validateSpec(spec);
+  return renderSystemd(validated, serviceLabelForProfile(validated.profileId));
 }
 
 export function renderMacLaunchAgentDefinition(spec: ServiceSpec): string {
-  return renderPlist(validateSpec(spec), "dev.oh-my-pi.appserver");
+  const validated = validateSpec(spec);
+  return renderPlist(validated, serviceLabelForProfile(validated.profileId));
 }
 
 export const sanitizeServiceDiagnostic = sanitizeDiagnostic;
+export { serviceLabelForProfile, validateProfileId };
 
 function stateFromResult(result: ServiceRunnerResult, platform: Platform): ServiceState {
   const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
@@ -301,7 +306,7 @@ export class LinuxSystemdUserManager extends BaseManager {
   constructor(spec: ServiceSpec, options: LinuxSystemdUserManagerOptions) {
     super(spec, options.fs, options.runner);
     validateAbsolutePath(options.homeDirectory, "home directory");
-    this.label = "dev.oh-my-pi.appserver";
+    this.label = serviceLabelForProfile(this.spec.profileId);
     this.definitionPath = join(
       options.homeDirectory,
       ".config/systemd/user",
@@ -372,7 +377,7 @@ export class LinuxSystemdUserManager extends BaseManager {
 
 export class MacLaunchAgentManager extends BaseManager {
   readonly platform = "macos" as const;
-  readonly label = "dev.oh-my-pi.appserver";
+  readonly label: string;
   readonly definitionPath: string;
   readonly domain: string;
   constructor(spec: ServiceSpec, options: MacLaunchAgentManagerOptions) {
@@ -380,6 +385,7 @@ export class MacLaunchAgentManager extends BaseManager {
     validateAbsolutePath(options.homeDirectory, "home directory");
     if (!Number.isInteger(options.uid) || options.uid < 0 || options.uid > 4_000_000_000)
       throw new ServiceValidationError("Invalid uid.");
+    this.label = serviceLabelForProfile(this.spec.profileId);
     this.domain = `gui/${options.uid}`;
     this.definitionPath = join(
       options.homeDirectory,

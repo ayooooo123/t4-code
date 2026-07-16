@@ -5,7 +5,7 @@
 // runtime's words, and removing a host says exactly what it does: it
 // deletes the credential stored on this computer, nothing more.
 import type { DesktopRuntimeSnapshot } from "@t4-code/client";
-import type { ServiceInspection } from "@t4-code/protocol/desktop-ipc";
+import type { LocalProfile, ServiceInspection } from "@t4-code/protocol/desktop-ipc";
 import {
   Badge,
   Button,
@@ -20,7 +20,7 @@ import {
   IconButton,
   Spinner,
 } from "@t4-code/ui";
-import { ArrowLeft, Cable, Check, Copy, Plus } from "lucide-react";
+import { ArrowLeft, Cable, Check, Copy, Plus, UsersRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { ToneBadge } from "../onboarding/bits.tsx";
@@ -34,7 +34,12 @@ import {
   type TargetCapabilityGroupId,
   type TargetRow,
 } from "./model.ts";
-import { useTargets, type ServiceActionId, type TargetsStoreApi } from "./targets-store.ts";
+import {
+  useTargets,
+  type ProfileActionId,
+  type ServiceActionId,
+  type TargetsStoreApi,
+} from "./targets-store.ts";
 
 // ─── Local service card ─────────────────────────────────────────────────────
 
@@ -55,34 +60,67 @@ function ServiceCard({ api }: { readonly api: TargetsStoreApi }) {
   const service = useTargets(api, (state) => state.service);
   const inspection = service.inspection;
   const busy = service.pending !== null;
-  const status: ServiceStatusCopy | null = inspection === null
-    ? null
-    : inspection.issue?.code === "omp_incompatible"
-      ? { label: "OMP update required", tone: "error" }
-      : inspection.issue?.code === "omp_not_found"
-        ? { label: "OMP not found", tone: "error" }
-        : inspection.issue?.code === "service_unavailable"
-          ? { label: "Service unavailable", tone: "error" }
-          : SERVICE_STATUS_COPY[inspection.service];
+  const status: ServiceStatusCopy | null =
+    inspection === null
+      ? null
+      : inspection.issue?.code === "omp_incompatible"
+        ? { label: "OMP update required", tone: "error" }
+        : inspection.issue?.code === "omp_not_found"
+          ? { label: "OMP not found", tone: "error" }
+          : inspection.issue?.code === "service_unavailable"
+            ? { label: "Service unavailable", tone: "error" }
+            : SERVICE_STATUS_COPY[inspection.service];
 
-  const actions: readonly { readonly id: ServiceActionId; readonly label: string; readonly show: boolean }[] =
+  const actions: readonly {
+    readonly id: ServiceActionId;
+    readonly label: string;
+    readonly show: boolean;
+  }[] =
     inspection === null || inspection.issue !== undefined
       ? []
       : [
-          { id: "install", label: inspection.definition === "drifted" ? "Repair the service" : "Install the service", show: inspection.definition !== "current" },
-          { id: "start", label: "Start", show: inspection.definition === "current" && (inspection.service === "stopped" || inspection.service === "failed") },
-          { id: "restart", label: "Restart", show: inspection.definition === "current" && inspection.service === "running" },
-          { id: "stop", label: "Stop", show: inspection.definition === "current" && (inspection.service === "running" || inspection.service === "starting") },
+          {
+            id: "install",
+            label:
+              inspection.definition === "drifted" ? "Repair the service" : "Install the service",
+            show: inspection.definition !== "current",
+          },
+          {
+            id: "start",
+            label: "Start",
+            show:
+              inspection.definition === "current" &&
+              (inspection.service === "stopped" || inspection.service === "failed"),
+          },
+          {
+            id: "restart",
+            label: "Restart",
+            show: inspection.definition === "current" && inspection.service === "running",
+          },
+          {
+            id: "stop",
+            label: "Stop",
+            show:
+              inspection.definition === "current" &&
+              (inspection.service === "running" || inspection.service === "starting"),
+          },
         ];
 
   return (
-    <section aria-labelledby="local-service-heading" className="flex flex-col gap-1.5 rounded-lg border border-border bg-card px-4 py-3">
+    <section
+      aria-labelledby="local-service-heading"
+      className="flex flex-col gap-1.5 rounded-lg border border-border bg-card px-4 py-3"
+    >
       <div className="flex min-w-0 items-center gap-2">
         <h2 className="min-w-0 flex-1 truncate font-medium text-sm" id="local-service-heading">
           Local OMP runtime
         </h2>
         {service.pending !== null ? (
-          <ToneBadge label={service.pending === "inspect" ? "Checking" : "Working"} live tone="working" />
+          <ToneBadge
+            label={service.pending === "inspect" ? "Checking" : "Working"}
+            live
+            tone="working"
+          />
         ) : status !== null ? (
           <ToneBadge label={status.label} tone={status.tone} />
         ) : (
@@ -94,16 +132,18 @@ function ServiceCard({ api }: { readonly api: TargetsStoreApi }) {
           {inspection.issue !== undefined
             ? inspection.issue.message
             : inspection.definition === "missing"
-            ? "No service is installed for the local runtime yet."
-            : inspection.definition === "drifted"
-              ? "The installed service definition is out of date."
-              : inspection.service === "running"
-                ? "The local runtime is installed and running."
-                : "The local runtime is installed."}
+              ? "No service is installed for the local runtime yet."
+              : inspection.definition === "drifted"
+                ? "The installed service definition is out of date."
+                : inspection.service === "running"
+                  ? "The local runtime is installed and running."
+                  : "The local runtime is installed."}
         </p>
       )}
       {inspection !== null && inspection.diagnostics.length > 0 && (
-        <p className="rounded-md bg-secondary px-2.5 py-1.5 font-mono text-muted-foreground text-xs">{inspection.diagnostics}</p>
+        <p className="rounded-md bg-secondary px-2.5 py-1.5 font-mono text-muted-foreground text-xs">
+          {inspection.diagnostics}
+        </p>
       )}
       {service.error !== null && (
         <p className="text-destructive-foreground text-xs" role="alert">
@@ -125,10 +165,262 @@ function ServiceCard({ api }: { readonly api: TargetsStoreApi }) {
               {action.label}
             </Button>
           ))}
-        <Button disabled={busy} onClick={() => void api.getState().inspectService()} size="xs" variant="ghost">
+        <Button
+          disabled={busy}
+          onClick={() => void api.getState().inspectService()}
+          size="xs"
+          variant="ghost"
+        >
           Check again
         </Button>
       </div>
+    </section>
+  );
+}
+
+// ─── Local OMP profiles ────────────────────────────────────────────────────
+
+function serviceStatus(inspection: ServiceInspection): ServiceStatusCopy {
+  if (inspection.issue?.code === "omp_incompatible")
+    return { label: "OMP update required", tone: "error" };
+  if (inspection.issue?.code === "omp_not_found") return { label: "OMP not found", tone: "error" };
+  if (inspection.issue?.code === "service_unavailable")
+    return { label: "Service unavailable", tone: "error" };
+  return SERVICE_STATUS_COPY[inspection.service];
+}
+
+function profileSummary(profile: LocalProfile): string {
+  const inspection = profile.service;
+  if (inspection.issue !== undefined) return inspection.issue.message;
+  if (inspection.definition === "missing") return "Not installed as a background service.";
+  if (inspection.definition === "drifted") return "The service definition needs repair.";
+  if (inspection.service === "running") return "The background service is running.";
+  if (inspection.service === "starting") return "The runtime is starting.";
+  if (inspection.service === "failed") return "The runtime service failed.";
+  return "Installed, but not running.";
+}
+
+function profileActions(profile: LocalProfile): readonly {
+  readonly id: Exclude<ProfileActionId, "update" | "remove">;
+  readonly label: string;
+}[] {
+  if (profile.service.issue !== undefined) return [{ id: "status", label: "Check again" }];
+  if (
+    profile.service.definition !== "current" ||
+    profile.service.service === "stopped" ||
+    profile.service.service === "failed" ||
+    profile.service.service === "unknown"
+  ) {
+    return [
+      {
+        id: "start",
+        label: profile.service.definition === "current" ? "Start" : "Install and start",
+      },
+      { id: "status", label: "Check" },
+    ];
+  }
+  if (profile.service.service === "starting") {
+    return [
+      { id: "stop", label: "Stop" },
+      { id: "status", label: "Check" },
+    ];
+  }
+  return [
+    { id: "restart", label: "Restart" },
+    { id: "stop", label: "Stop" },
+    { id: "status", label: "Check" },
+  ];
+}
+
+function ProfileCard({
+  api,
+  profile,
+}: {
+  readonly api: TargetsStoreApi;
+  readonly profile: LocalProfile;
+}) {
+  const busyAction = useTargets(api, (state) => state.profileBusy[profile.profileId]);
+  const error = useTargets(api, (state) => state.profileErrors[profile.profileId]);
+  const busy = busyAction !== undefined;
+  const status = serviceStatus(profile.service);
+
+  return (
+    <li className="flex flex-col gap-1.5 rounded-lg border border-border bg-card px-4 py-3">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <span className="min-w-0 truncate font-medium text-sm">{profile.label}</span>
+        {profile.isDefault && <Badge variant="outline">Default</Badge>}
+        <code className="min-w-0 truncate text-muted-foreground text-xs">{profile.profileId}</code>
+        <span className="flex-1" />
+        {busyAction !== undefined ? (
+          <ToneBadge label={busyAction === "status" ? "Checking" : "Working"} live tone="working" />
+        ) : (
+          <ToneBadge label={status.label} tone={status.tone} />
+        )}
+      </div>
+      <p className="text-muted-foreground text-xs">{profileSummary(profile)}</p>
+      {profile.service.diagnostics.length > 0 && (
+        <p className="overflow-x-auto rounded-md bg-secondary px-2.5 py-1.5 font-mono text-muted-foreground text-xs">
+          {profile.service.diagnostics}
+        </p>
+      )}
+      {error !== undefined && (
+        <p className="text-destructive-foreground text-xs" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+        {profileActions(profile).map((action) => (
+          <Button
+            disabled={busy}
+            key={action.id}
+            onClick={() => void api.getState().runProfileAction(profile.profileId, action.id)}
+            size="xs"
+            variant={action.id === "start" ? "outline" : "ghost"}
+          >
+            {busyAction === action.id && <Spinner />}
+            {action.label}
+          </Button>
+        ))}
+        <span className="flex-1" />
+        {!profile.isDefault && (
+          <>
+            <label className="flex cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 text-muted-foreground text-xs hover:bg-accent hover:text-foreground">
+              <input
+                checked={profile.autoStart}
+                className="size-3.5 accent-primary"
+                disabled={busy}
+                onChange={(event) =>
+                  void api.getState().setProfileAutoStart(profile.profileId, event.target.checked)
+                }
+                type="checkbox"
+              />
+              Start with T4
+            </label>
+            <Button
+              disabled={busy}
+              onClick={() => api.getState().askRemoveProfile(profile.profileId)}
+              size="xs"
+              variant="ghost"
+            >
+              Remove…
+            </Button>
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function AddProfileForm({ api }: { readonly api: TargetsStoreApi }) {
+  const draft = useTargets(api, (state) => state.profileDraft);
+  const errors = useTargets(api, (state) => state.profileDraftErrors);
+  const adding = useTargets(api, (state) => state.profileAdding);
+  const setDraft = (next: Partial<typeof draft>) =>
+    api.getState().setProfileDraft({ ...draft, ...next });
+
+  return (
+    <form
+      className="grid gap-2 rounded-lg border border-border bg-card px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void api.getState().submitProfile();
+      }}
+    >
+      <div className="flex min-w-0 flex-col gap-1">
+        <label className="font-medium text-muted-foreground text-xs" htmlFor="profile-id">
+          Profile ID
+        </label>
+        <input
+          aria-invalid={errors.profileId !== undefined}
+          className={cn(FIELD_CLASS, errors.profileId !== undefined && "border-destructive")}
+          id="profile-id"
+          onChange={(event) => setDraft({ profileId: event.target.value })}
+          placeholder="fable-swarm"
+          spellCheck={false}
+          value={draft.profileId}
+        />
+        {errors.profileId !== undefined && (
+          <span className="text-destructive-foreground text-xs" role="alert">
+            {errors.profileId}
+          </span>
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col gap-1">
+        <label className="font-medium text-muted-foreground text-xs" htmlFor="profile-label">
+          Display name <span className="font-normal">(optional)</span>
+        </label>
+        <input
+          aria-invalid={errors.label !== undefined}
+          className={cn(FIELD_CLASS, errors.label !== undefined && "border-destructive")}
+          id="profile-label"
+          onChange={(event) => setDraft({ label: event.target.value })}
+          placeholder="Fable Swarm"
+          value={draft.label}
+        />
+        {errors.label !== undefined && (
+          <span className="text-destructive-foreground text-xs" role="alert">
+            {errors.label}
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap items-end gap-1.5">
+        <label className="flex h-8 cursor-pointer items-center gap-1.5 rounded-md px-1.5 text-muted-foreground text-xs hover:bg-accent hover:text-foreground">
+          <input
+            checked={draft.autoStart}
+            className="size-3.5 accent-primary"
+            onChange={(event) => setDraft({ autoStart: event.target.checked })}
+            type="checkbox"
+          />
+          Start with T4
+        </label>
+        <Button disabled={adding} size="sm" type="submit">
+          {adding && <Spinner />}
+          Add
+        </Button>
+      </div>
+      <p className="text-muted-foreground text-xs sm:col-span-3">
+        Native OMP profiles are discovered automatically. Add one here only when you previously hid
+        it from T4 Code or want to register a new named profile.
+      </p>
+    </form>
+  );
+}
+
+function ProfilesSection({ api }: { readonly api: TargetsStoreApi }) {
+  const profiles = useTargets(api, (state) => state.profiles);
+  const pending = useTargets(api, (state) => state.profilesPending);
+  const error = useTargets(api, (state) => state.profilesError);
+  return (
+    <section aria-labelledby="profiles-heading" className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <UsersRound aria-hidden="true" className="size-4 text-muted-foreground" />
+        <h2 className="font-heading font-semibold text-foreground text-sm" id="profiles-heading">
+          Local OMP profiles
+        </h2>
+        <span className="flex-1" />
+        {pending && <ToneBadge label="Checking" live tone="working" />}
+      </div>
+      <p className="text-muted-foreground text-xs">
+        Each profile runs in its own OMP service, with separate sessions, configuration, and model
+        routing.
+      </p>
+      {error !== null && (
+        <p className="text-destructive-foreground text-xs" role="alert">
+          {error}
+        </p>
+      )}
+      {profiles.length > 0 ? (
+        <ul className="flex flex-col gap-2">
+          {profiles.map((profile) => (
+            <ProfileCard api={api} key={profile.profileId} profile={profile} />
+          ))}
+        </ul>
+      ) : !pending ? (
+        <p className="rounded-lg border border-border border-dashed px-4 py-4 text-center text-muted-foreground text-sm">
+          No local profiles were returned. Check the desktop runtime and try again.
+        </p>
+      ) : null}
+      <AddProfileForm api={api} />
     </section>
   );
 }
@@ -146,7 +438,8 @@ function CapabilityGrantSummary({
   if (requested === undefined) {
     return (
       <p className="text-muted-foreground text-xs">
-        The host granted: <span className="font-mono">{granted.length === 0 ? "nothing" : granted.join(", ")}</span>
+        The host granted:{" "}
+        <span className="font-mono">{granted.length === 0 ? "nothing" : granted.join(", ")}</span>
       </p>
     );
   }
@@ -208,7 +501,11 @@ export function PairForm({
           aria-describedby={error === undefined ? undefined : `${inputId}-error`}
           aria-invalid={error !== undefined}
           autoComplete="one-time-code"
-          className={cn(FIELD_CLASS, "w-28 text-center font-mono tracking-[0.3em]", error !== undefined && "border-destructive")}
+          className={cn(
+            FIELD_CLASS,
+            "w-28 text-center font-mono tracking-[0.3em]",
+            error !== undefined && "border-destructive",
+          )}
           id={inputId}
           inputMode="numeric"
           onChange={(event) => api.getState().setPairCode(targetId, event.target.value)}
@@ -239,7 +536,11 @@ export function PairForm({
           }}
           size="icon-xs"
         >
-          {copied ? <Check aria-hidden="true" className="text-success-foreground" /> : <Copy aria-hidden="true" />}
+          {copied ? (
+            <Check aria-hidden="true" className="text-success-foreground" />
+          ) : (
+            <Copy aria-hidden="true" />
+          )}
         </IconButton>
       </div>
       <p className="text-muted-foreground text-xs">
@@ -271,7 +572,9 @@ function TargetCard({ api, row }: { readonly api: TargetsStoreApi; readonly row:
       <div className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{row.target.label}</span>
         {remote && row.target.mode !== undefined && (
-          <Badge variant="outline">{row.target.mode === "serve" ? "Tailscale Serve" : "Direct"}</Badge>
+          <Badge variant="outline">
+            {row.target.mode === "serve" ? "Tailscale Serve" : "Direct"}
+          </Badge>
         )}
         {!remote && <Badge variant="outline">This computer</Badge>}
         <ToneBadge label={meta.label} live={meta.live} tone={meta.tone} />
@@ -290,7 +593,9 @@ function TargetCard({ api, row }: { readonly api: TargetsStoreApi; readonly row:
         </p>
       )}
       {remote && <CapabilityGrantSummary granted={row.grantedCapabilities} requested={requested} />}
-      {row.state === "pairing-required" && <PairForm api={api} requested={requested} targetId={row.target.targetId} />}
+      {row.state === "pairing-required" && (
+        <PairForm api={api} requested={requested} targetId={row.target.targetId} />
+      )}
       <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
         {(row.state === "disconnected" || row.state === "error") && (
           <Button
@@ -303,7 +608,9 @@ function TargetCard({ api, row }: { readonly api: TargetsStoreApi; readonly row:
             {row.state === "error" ? "Try again" : "Connect"}
           </Button>
         )}
-        {(row.state === "connected" || row.state === "connecting" || row.state === "pairing-required") && (
+        {(row.state === "connected" ||
+          row.state === "connecting" ||
+          row.state === "pairing-required") && (
           <Button
             disabled={busy}
             onClick={() => void api.getState().disconnect(row.target.targetId)}
@@ -358,7 +665,9 @@ function AddHostForm({ api }: { readonly api: TargetsStoreApi }) {
           {errors[name]}
         </span>
       ) : (
-        props.hint !== undefined && <span className="text-muted-foreground text-xs">{props.hint}</span>
+        props.hint !== undefined && (
+          <span className="text-muted-foreground text-xs">{props.hint}</span>
+        )
       )}
     </label>
   );
@@ -376,13 +685,19 @@ function AddHostForm({ api }: { readonly api: TargetsStoreApi }) {
         <Plus aria-hidden="true" className="size-4" />
         Add a computer over Tailscale
       </h2>
-      <div aria-label="How to reach it" className="flex items-center gap-0.5 self-start rounded-lg border border-border p-0.5" role="group">
+      <div
+        aria-label="How to reach it"
+        className="flex items-center gap-0.5 self-start rounded-lg border border-border p-0.5"
+        role="group"
+      >
         {(["direct", "serve"] as const).map((mode) => (
           <button
             aria-pressed={draft.mode === mode}
             className={cn(
               "h-6.5 cursor-pointer rounded-md px-2 font-medium text-xs outline-none transition-colors duration-(--motion-duration-fast) focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
-              draft.mode === mode ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              draft.mode === mode
+                ? "bg-secondary text-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground",
             )}
             key={mode}
             onClick={() => setDraft({ mode })}
@@ -401,7 +716,12 @@ function AddHostForm({ api }: { readonly api: TargetsStoreApi }) {
             ? { placeholder: "100.64.0.12 or host.tailnet.ts.net" }
             : { placeholder: "https://host.tailnet.ts.net" },
         )}
-        {field("port", "Port", { hint: draft.mode === "serve" ? "Leave empty for 443." : "The port the host's runtime listens on." })}
+        {field("port", "Port", {
+          hint:
+            draft.mode === "serve"
+              ? "Leave empty for 443."
+              : "The port the host's runtime listens on.",
+        })}
         {field("expectedHostId", "Expected host ID (optional)", {
           hint: "If set, the connection is refused when a different host answers.",
         })}
@@ -415,7 +735,10 @@ function AddHostForm({ api }: { readonly api: TargetsStoreApi }) {
           const checked = locked || draft.groups.has(group.id);
           return (
             <label
-              className={cn("flex items-start gap-2.5 rounded-md px-2 py-1.5", locked ? "opacity-72" : "cursor-pointer hover:bg-secondary/60")}
+              className={cn(
+                "flex items-start gap-2.5 rounded-md px-2 py-1.5",
+                locked ? "opacity-72" : "cursor-pointer hover:bg-secondary/60",
+              )}
               key={group.id}
             >
               <input
@@ -462,25 +785,83 @@ function AddHostForm({ api }: { readonly api: TargetsStoreApi }) {
 
 // ─── Remove confirmation ────────────────────────────────────────────────────
 
-function RemoveDialog({ api, rows }: { readonly api: TargetsStoreApi; readonly rows: readonly TargetRow[] }) {
+function RemoveDialog({
+  api,
+  rows,
+}: {
+  readonly api: TargetsStoreApi;
+  readonly rows: readonly TargetRow[];
+}) {
   const removing = useTargets(api, (state) => state.removing);
   const row = rows.find((entry) => entry.target.targetId === removing);
   const label = row?.target.label ?? "this host";
   return (
-    <Dialog onOpenChange={(open) => (open ? undefined : api.getState().cancelRemove())} open={removing !== null}>
+    <Dialog
+      onOpenChange={(open) => (open ? undefined : api.getState().cancelRemove())}
+      open={removing !== null}
+    >
       <DialogPopup showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>Remove {label}?</DialogTitle>
           <DialogDescription>
-            This forgets the connection and deletes the credential stored on this computer. It does not tell{" "}
-            {label} anything — that host still lists this device as paired until you revoke it there (run{" "}
-            <span className="font-mono">omp appserver devices</span> on that computer).
+            This forgets the connection and deletes the credential stored on this computer. It does
+            not tell {label} anything — that host still lists this device as paired until you revoke
+            it there (run <span className="font-mono">omp appserver devices</span> on that
+            computer).
           </DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <DialogClose render={<Button size="sm" variant="ghost" />}>Keep it</DialogClose>
-          <Button onClick={() => void api.getState().confirmRemove()} size="sm" variant="destructive">
+          <Button
+            onClick={() => void api.getState().confirmRemove()}
+            size="sm"
+            variant="destructive"
+          >
             Remove {label}
+          </Button>
+        </DialogFooter>
+      </DialogPopup>
+    </Dialog>
+  );
+}
+
+function RemoveProfileDialog({ api }: { readonly api: TargetsStoreApi }) {
+  const removing = useTargets(api, (state) => state.removingProfile);
+  const profile = useTargets(api, (state) =>
+    state.profiles.find((candidate) => candidate.profileId === state.removingProfile),
+  );
+  const label = profile?.label ?? "this profile";
+  const busy = useTargets(
+    api,
+    (state) =>
+      state.removingProfile !== null && state.profileBusy[state.removingProfile] === "remove",
+  );
+  return (
+    <Dialog
+      onOpenChange={(open) => (open ? undefined : api.getState().cancelRemoveProfile())}
+      open={removing !== null}
+    >
+      <DialogPopup showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>Remove {label} from T4 Code?</DialogTitle>
+          <DialogDescription>
+            T4 Code will stop and unregister this profile's background service. Any turns currently
+            running in this profile will end. Its OMP profile, configuration, authentication
+            references, and sessions stay on disk.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <DialogClose render={<Button disabled={busy} size="sm" variant="ghost" />}>
+            Keep it
+          </DialogClose>
+          <Button
+            disabled={busy}
+            onClick={() => void api.getState().confirmRemoveProfile()}
+            size="sm"
+            variant="destructive"
+          >
+            {busy && <Spinner />}
+            Remove from T4 Code
           </Button>
         </DialogFooter>
       </DialogPopup>
@@ -494,12 +875,15 @@ export function TargetsScreen({
   api,
   snapshot,
   serviceAvailable,
+  profilesAvailable,
   onBack,
 }: {
   readonly api: TargetsStoreApi;
   readonly snapshot: DesktopRuntimeSnapshot;
   /** Whether this desktop build exposes local service management. */
   readonly serviceAvailable: boolean;
+  /** Whether this desktop build exposes isolated named-profile management. */
+  readonly profilesAvailable: boolean;
   readonly onBack: () => void;
 }) {
   const announcement = useTargets(api, (state) => state.announcement);
@@ -507,8 +891,9 @@ export function TargetsScreen({
 
   // One initial service check per mount; later checks are user-driven.
   useEffect(() => {
-    if (serviceAvailable) void api.getState().inspectService();
-  }, [api, serviceAvailable]);
+    if (profilesAvailable) void api.getState().loadProfiles();
+    else if (serviceAvailable) void api.getState().inspectService();
+  }, [api, profilesAvailable, serviceAvailable]);
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-background text-foreground">
@@ -518,13 +903,21 @@ export function TargetsScreen({
         </IconButton>
         <Cable aria-hidden="true" className="size-4 text-muted-foreground" />
         <h1 className="font-heading font-semibold text-base">Hosts</h1>
-        <p aria-live="polite" className="min-w-0 flex-1 truncate text-end text-muted-foreground text-xs" role="status">
+        <p
+          aria-live="polite"
+          className="min-w-0 flex-1 truncate text-end text-muted-foreground text-xs"
+          role="status"
+        >
           {announcement}
         </p>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-4">
-          {serviceAvailable && <ServiceCard api={api} />}
+          {profilesAvailable ? (
+            <ProfilesSection api={api} />
+          ) : serviceAvailable ? (
+            <ServiceCard api={api} />
+          ) : null}
           <section aria-labelledby="hosts-heading" className="flex flex-col gap-2">
             <h2 className="font-heading font-semibold text-foreground text-sm" id="hosts-heading">
               Connections
@@ -545,6 +938,7 @@ export function TargetsScreen({
         </div>
       </div>
       <RemoveDialog api={api} rows={rows} />
+      <RemoveProfileDialog api={api} />
     </div>
   );
 }

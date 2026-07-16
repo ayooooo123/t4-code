@@ -9,6 +9,7 @@ import {
   discoverOmpExecutable,
   NodeServiceRunner,
   OmpAppserverCompatibilityError,
+  probeOmpAppserver,
 } from "../src/service.ts";
 
 describe("desktop lifecycle boundaries", () => {
@@ -111,6 +112,49 @@ describe("desktop lifecycle boundaries", () => {
     expect(error.code).toBe("omp_appserver_status_json_required");
     expect(error.message.includes("requires `omp appserver status --json`")).toBe(true);
     expect(calls).toBe(1);
+  });
+  it("scopes named appserver probes without inheriting provider credentials", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t4-desktop-"));
+    const executable = join(root, "omp");
+    await writeFile(executable, "");
+    await chmod(executable, 0o755);
+    const calls: ProcessSpec[] = [];
+    const runner: ProcessRunner = {
+      spawn: async (spec) => {
+        calls.push(spec);
+        return {
+          kill: () => {},
+          result: Promise.resolve({
+            exitCode: 0,
+            signal: null,
+            stdout: JSON.stringify({
+              state: "running",
+              health: { ok: true, hostId: "host-fable", epoch: "epoch-fable" },
+            }),
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          }),
+        };
+      },
+    };
+
+    expect(await probeOmpAppserver(executable, {
+      profileId: "fable-swarm",
+      environment: {
+        HOME: "/home/test",
+        PATH: "/usr/bin:/bin",
+        ANTHROPIC_API_KEY: "must-not-inherit",
+      },
+      runner,
+    })).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args).toEqual(["appserver", "status", "--json"]);
+    expect(calls[0]?.env).toEqual({
+      HOME: "/home/test",
+      PATH: "/usr/bin:/bin",
+      OMP_PROFILE: "fable-swarm",
+    });
   });
   it("rejects malformed, oversized, and timed-out appserver probes", async () => {
     const root = await mkdtemp(join(tmpdir(), "t4-desktop-"));

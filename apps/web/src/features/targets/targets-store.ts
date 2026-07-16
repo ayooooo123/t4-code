@@ -12,12 +12,17 @@ import type {
   ConnectResult,
   DesktopTarget,
   DisconnectResult,
+  LocalProfile,
+  LocalProfileAddRequest,
+  LocalProfileRemoveResult,
+  LocalProfileUpdateRequest,
   PairResult,
   ServiceActionResult,
   ServiceInspection,
   TargetAddRequest,
   TargetRemoveResult,
 } from "@t4-code/protocol/desktop-ipc";
+import { decodeLocalProfileId } from "@t4-code/protocol/desktop-ipc";
 
 import {
   EMPTY_TARGET_DRAFT,
@@ -47,6 +52,32 @@ export interface ServicePort {
   readonly restart?: () => Promise<ServiceActionResult>;
 }
 
+/** Named-profile lifecycle exposed only by desktop builds that support it. */
+export interface ProfilesPort {
+  list(): Promise<readonly LocalProfile[]>;
+  add(profile: LocalProfileAddRequest["profile"]): Promise<LocalProfile>;
+  update(profileId: string, changes: LocalProfileUpdateRequest["changes"]): Promise<LocalProfile>;
+  remove(profileId: string): Promise<LocalProfileRemoveResult>;
+  status(profileId: string): Promise<LocalProfile>;
+  start(profileId: string): Promise<LocalProfile>;
+  stop(profileId: string): Promise<LocalProfile>;
+  restart(profileId: string): Promise<LocalProfile>;
+}
+
+export interface ProfileDraft {
+  readonly profileId: string;
+  readonly label: string;
+  readonly autoStart: boolean;
+}
+
+export const EMPTY_PROFILE_DRAFT: ProfileDraft = Object.freeze({
+  profileId: "",
+  label: "",
+  autoStart: false,
+});
+
+export type ProfileActionId = "status" | "start" | "stop" | "restart" | "update" | "remove";
+
 export type ServiceActionId = "install" | "start" | "stop" | "restart";
 
 export interface ServiceState {
@@ -74,6 +105,16 @@ export interface TargetsState {
   /** Target waiting on the remove confirmation dialog. */
   readonly removing: string | null;
   readonly service: ServiceState;
+  /** Desktop-owned native OMP profiles; empty until the first real list lands. */
+  readonly profiles: readonly LocalProfile[];
+  readonly profilesPending: boolean;
+  readonly profilesError: string | null;
+  readonly profileDraft: ProfileDraft;
+  readonly profileDraftErrors: Readonly<Partial<Record<"profileId" | "label", string>>>;
+  readonly profileAdding: boolean;
+  readonly profileBusy: Readonly<Record<string, ProfileActionId>>;
+  readonly profileErrors: Readonly<Record<string, string>>;
+  readonly removingProfile: string | null;
   readonly announcement: string;
 }
 
@@ -90,6 +131,18 @@ export interface TargetsActions {
   confirmRemove(): Promise<void>;
   inspectService(): Promise<void>;
   runServiceAction(action: ServiceActionId): Promise<void>;
+  loadProfiles(): Promise<void>;
+  setProfileDraft(draft: ProfileDraft): void;
+  resetProfileDraft(): void;
+  submitProfile(): Promise<void>;
+  setProfileAutoStart(profileId: string, autoStart: boolean): Promise<void>;
+  runProfileAction(
+    profileId: string,
+    action: Exclude<ProfileActionId, "update" | "remove">,
+  ): Promise<void>;
+  askRemoveProfile(profileId: string): void;
+  cancelRemoveProfile(): void;
+  confirmRemoveProfile(): Promise<void>;
 }
 
 export type TargetsStoreApi = StoreApi<TargetsState & TargetsActions>;
@@ -100,9 +153,42 @@ function sanitizedError(error: unknown, fallback: string): string {
   return redactedMessage(message).slice(0, 300).trim();
 }
 
-export function createTargetsStore(port: TargetActionsPort, service: ServicePort): TargetsStoreApi {
+function sortProfiles(profiles: readonly LocalProfile[]): readonly LocalProfile[] {
+  return Object.freeze(
+    [...profiles].sort((left, right) => {
+      if (left.isDefault !== right.isDefault) return left.isDefault ? -1 : 1;
+      return left.label.localeCompare(right.label) || left.profileId.localeCompare(right.profileId);
+    }),
+  );
+}
+
+function validateProfileDraft(
+  draft: ProfileDraft,
+  existing: readonly LocalProfile[],
+): Readonly<Partial<Record<"profileId" | "label", string>>> {
+  const errors: Partial<Record<"profileId" | "label", string>> = {};
+  try {
+    const profileId = decodeLocalProfileId(draft.profileId.trim());
+    if (profileId === "default") errors.profileId = "The default profile is already managed.";
+    else if (existing.some((profile) => profile.profileId === profileId))
+      errors.profileId = "That profile is already listed.";
+  } catch {
+    errors.profileId = "Use lowercase letters, numbers, dots, dashes, or underscores.";
+  }
+  if (draft.label.trim().length > 128) errors.label = "Keep the name under 129 characters.";
+  return errors;
+}
+
+export function createTargetsStore(
+  port: TargetActionsPort,
+  service: ServicePort,
+  profilesPort?: ProfilesPort,
+): TargetsStoreApi {
   // Local service actions run strictly one after another.
   let serviceQueue: Promise<void> = Promise.resolve();
+  // A list request may finish after a profile action. Do not let its older
+  // snapshot overwrite the newer action result already returned by desktop.
+  let profileMutationGeneration = 0;
 
   return createStore<TargetsState & TargetsActions>()((set, get) => {
     function setBusy(targetId: string, action: TargetBusyAction | null): void {
@@ -117,6 +203,30 @@ export function createTargetsStore(port: TargetActionsPort, service: ServicePort
       if (message === null) delete targetErrors[targetId];
       else targetErrors[targetId] = message;
       set({ targetErrors });
+    }
+
+    function setProfileBusy(profileId: string, action: ProfileActionId | null): void {
+      const profileBusy = { ...get().profileBusy };
+      if (action === null) delete profileBusy[profileId];
+      else profileBusy[profileId] = action;
+      set({ profileBusy });
+    }
+
+    function setProfileError(profileId: string, message: string | null): void {
+      const profileErrors = { ...get().profileErrors };
+      if (message === null) delete profileErrors[profileId];
+      else profileErrors[profileId] = message;
+      set({ profileErrors });
+    }
+
+    function upsertProfile(profile: LocalProfile): void {
+      profileMutationGeneration += 1;
+      set({
+        profiles: sortProfiles([
+          ...get().profiles.filter((current) => current.profileId !== profile.profileId),
+          profile,
+        ]),
+      });
     }
 
     async function inspectNow(): Promise<void> {
@@ -148,6 +258,15 @@ export function createTargetsStore(port: TargetActionsPort, service: ServicePort
       targetErrors: {},
       removing: null,
       service: { inspection: null, pending: null, error: null },
+      profiles: [],
+      profilesPending: false,
+      profilesError: null,
+      profileDraft: EMPTY_PROFILE_DRAFT,
+      profileDraftErrors: {},
+      profileAdding: false,
+      profileBusy: {},
+      profileErrors: {},
+      removingProfile: null,
       announcement: "",
 
       setDraft(draft) {
@@ -249,7 +368,10 @@ export function createTargetsStore(port: TargetActionsPort, service: ServicePort
           set({
             pairErrors: {
               ...get().pairErrors,
-              [targetId]: sanitizedError(error, "Pairing failed. The code stays here so you can retry."),
+              [targetId]: sanitizedError(
+                error,
+                "Pairing failed. The code stays here so you can retry.",
+              ),
             },
           });
         } finally {
@@ -327,10 +449,135 @@ export function createTargetsStore(port: TargetActionsPort, service: ServicePort
         await task;
         set({ service: { ...get().service, pending: null } });
       },
+
+      async loadProfiles() {
+        if (profilesPort === undefined || get().profilesPending) return;
+        const startedAtMutation = profileMutationGeneration;
+        set({ profilesPending: true, profilesError: null });
+        try {
+          const profiles = await profilesPort.list();
+          if (startedAtMutation === profileMutationGeneration) {
+            set({ profiles: sortProfiles(profiles) });
+          }
+        } catch (error) {
+          set({
+            profilesError: sanitizedError(error, "Could not load local OMP profiles."),
+          });
+        } finally {
+          set({ profilesPending: false });
+        }
+      },
+      setProfileDraft(profileDraft) {
+        set({ profileDraft, profileDraftErrors: {}, profilesError: null });
+      },
+      resetProfileDraft() {
+        set({ profileDraft: EMPTY_PROFILE_DRAFT, profileDraftErrors: {}, profilesError: null });
+      },
+      async submitProfile() {
+        if (profilesPort === undefined || get().profileAdding) return;
+        const draft = get().profileDraft;
+        const profileDraftErrors = validateProfileDraft(draft, get().profiles);
+        if (Object.keys(profileDraftErrors).length > 0) {
+          set({ profileDraftErrors });
+          return;
+        }
+        set({ profileAdding: true, profileDraftErrors: {}, profilesError: null });
+        try {
+          const profile = await profilesPort.add({
+            profileId: draft.profileId.trim(),
+            ...(draft.label.trim().length === 0 ? {} : { label: draft.label.trim() }),
+            autoStart: draft.autoStart,
+          });
+          upsertProfile(profile);
+          set({
+            profileDraft: EMPTY_PROFILE_DRAFT,
+            announcement: `Added ${profile.label}.`,
+          });
+        } catch (error) {
+          set({
+            profilesError: sanitizedError(error, "Could not add that local OMP profile."),
+          });
+        } finally {
+          set({ profileAdding: false });
+        }
+      },
+      async setProfileAutoStart(profileId, autoStart) {
+        if (profilesPort === undefined || get().profileBusy[profileId] !== undefined) return;
+        setProfileBusy(profileId, "update");
+        setProfileError(profileId, null);
+        try {
+          const profile = await profilesPort.update(profileId, { autoStart });
+          upsertProfile(profile);
+          set({
+            announcement: `${profile.label} will ${autoStart ? "start" : "stay stopped"} when T4 Code opens.`,
+          });
+        } catch (error) {
+          setProfileError(profileId, sanitizedError(error, "Could not change automatic startup."));
+        } finally {
+          setProfileBusy(profileId, null);
+        }
+      },
+      async runProfileAction(profileId, action) {
+        if (profilesPort === undefined || get().profileBusy[profileId] !== undefined) return;
+        setProfileBusy(profileId, action);
+        setProfileError(profileId, null);
+        try {
+          const profile = await profilesPort[action](profileId);
+          upsertProfile(profile);
+          const verb =
+            action === "status"
+              ? "Checked"
+              : action === "stop"
+                ? "Stopped"
+                : action === "restart"
+                  ? "Restarted"
+                  : "Started";
+          set({ announcement: `${verb} ${profile.label}.` });
+        } catch (error) {
+          setProfileError(profileId, sanitizedError(error, `Could not ${action} that profile.`));
+        } finally {
+          setProfileBusy(profileId, null);
+        }
+      },
+      askRemoveProfile(profileId) {
+        const profile = get().profiles.find((candidate) => candidate.profileId === profileId);
+        if (profile === undefined || profile.isDefault) return;
+        set({ removingProfile: profileId });
+      },
+      cancelRemoveProfile() {
+        set({ removingProfile: null });
+      },
+      async confirmRemoveProfile() {
+        if (profilesPort === undefined) return;
+        const profileId = get().removingProfile;
+        if (profileId === null || get().profileBusy[profileId] !== undefined) return;
+        const label =
+          get().profiles.find((profile) => profile.profileId === profileId)?.label ?? profileId;
+        setProfileBusy(profileId, "remove");
+        setProfileError(profileId, null);
+        try {
+          const result = await profilesPort.remove(profileId);
+          if (!result.removed) throw new Error("The desktop kept this profile registration.");
+          profileMutationGeneration += 1;
+          set({
+            profiles: get().profiles.filter((profile) => profile.profileId !== profileId),
+            removingProfile: null,
+            announcement: `Removed ${label} from T4 Code. Its OMP profile data was left in place.`,
+          });
+        } catch (error) {
+          set({ removingProfile: null });
+          setProfileError(profileId, sanitizedError(error, "Could not remove that profile."));
+        } finally {
+          setProfileBusy(profileId, null);
+        }
+      },
     };
   });
 }
 
-export function useTargets<T>(api: TargetsStoreApi, selector: (state: TargetsState & TargetsActions) => T): T {
+export function useTargets<T>(
+  api: TargetsStoreApi,
+  selector: (state: TargetsState & TargetsActions) => T,
+): T {
   return useStore(api, selector);
 }

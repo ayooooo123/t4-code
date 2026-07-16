@@ -17,6 +17,8 @@ const JITI = resolve(
 const FIXTURE_PROCESS = resolve(REPO_ROOT, "e2e/fixture-process.ts");
 const SESSION_VIEW_ID = "host-stream/session-stream";
 const SESSION_TITLE = "stream-v1 fixture";
+// Chromium can report an exact 44 CSS px box a few floating-point ulps below 44.
+const MIN_TOUCH_TARGET_PX = 43.99;
 const CONNECTED_COPY =
   "This Tailnet connection is live. Choose a session from the list on the left to inspect it.";
 
@@ -719,8 +721,8 @@ for (const viewport of [
     expect(geometry.top).toBeGreaterThanOrEqual(0);
     expect(geometry.right).toBeLessThanOrEqual(geometry.viewportWidth + 0.5);
     expect(geometry.bottom).toBeLessThanOrEqual(geometry.viewportHeight + 0.5);
-    expect(geometry.width).toBeGreaterThanOrEqual(44);
-    expect(geometry.height).toBeGreaterThanOrEqual(44);
+    expect(geometry.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(geometry.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
     expect(geometry.documentWidth).toBeLessThanOrEqual(geometry.viewportWidth);
     expect(geometry.bodyWidth).toBeLessThanOrEqual(geometry.viewportWidth);
 
@@ -757,8 +759,8 @@ for (const viewport of [
       expect(actionGeometry.top, name).toBeGreaterThanOrEqual(0);
       expect(actionGeometry.right, name).toBeLessThanOrEqual(actionGeometry.viewportWidth + 0.5);
       expect(actionGeometry.bottom, name).toBeLessThanOrEqual(actionGeometry.viewportHeight + 0.5);
-      expect(actionGeometry.width, name).toBeGreaterThanOrEqual(44);
-      expect(actionGeometry.height, name).toBeGreaterThanOrEqual(44);
+      expect(actionGeometry.width, name).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+      expect(actionGeometry.height, name).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
     }
     // Stop is a challenged command in real OMP. Exercise the actual
     // request -> confirmation -> confirm -> original-request response
@@ -785,8 +787,8 @@ for (const viewport of [
     expect(approvalGeometry.top).toBeGreaterThanOrEqual(0);
     expect(approvalGeometry.right).toBeLessThanOrEqual(approvalGeometry.viewportWidth + 0.5);
     expect(approvalGeometry.bottom).toBeLessThanOrEqual(approvalGeometry.viewportHeight + 0.5);
-    expect(approvalGeometry.width).toBeGreaterThanOrEqual(44);
-    expect(approvalGeometry.height).toBeGreaterThanOrEqual(44);
+    expect(approvalGeometry.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(approvalGeometry.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
     await approve.click();
     await expect(page.getByText("Approval needed", { exact: true })).toBeHidden();
     await fixture.advanceBy(30);
@@ -818,8 +820,8 @@ test("manages a session from a phone and converges another live client", async (
     const initialActions = rail.getByRole("button", { name: `Actions for ${SESSION_TITLE}` });
     const initialActionsBox = await initialActions.boundingBox();
     expect(initialActionsBox).not.toBeNull();
-    expect(initialActionsBox!.width).toBeGreaterThanOrEqual(44);
-    expect(initialActionsBox!.height).toBeGreaterThanOrEqual(44);
+    expect(initialActionsBox!.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(initialActionsBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
     await initialActions.click();
     const renameAction = page.getByRole("button", { name: "Rename", exact: true });
     await expect(renameAction).toBeVisible();
@@ -850,6 +852,7 @@ test("manages a session from a phone and converges another live client", async (
     await expect(rail).toBeHidden();
     await expect(page).toHaveURL(/#\/$/u);
 
+    await page.setViewportSize({ width: 320, height: 568 });
     await page.getByRole("button", { name: "Show session list", exact: true }).click();
     await expect(rail).toBeVisible();
     await expect(rail.getByText("No current sessions.", { exact: true })).toBeVisible();
@@ -862,7 +865,7 @@ test("manages a session from a phone and converges another live client", async (
     const archivedFilter = rail.getByRole("button", { name: "Archived · 1", exact: true });
     const archivedFilterBox = await archivedFilter.boundingBox();
     expect(archivedFilterBox).not.toBeNull();
-    expect(archivedFilterBox!.height).toBeGreaterThanOrEqual(44);
+    expect(archivedFilterBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
 
     await expect(observer.getByText(/Archived · read-only/u).first()).toBeVisible();
     await expect(observer.getByRole("textbox", { name: "Message the session" })).toHaveCount(0);
@@ -986,6 +989,74 @@ test("manages a session from a phone and converges another live client", async (
     await expect(
       observerRail.getByRole("button", { name: "Current · 1", exact: true }),
     ).toHaveAttribute("aria-pressed", "true");
+
+    // Once the remaining current session is archived, the empty project can
+    // be removed from Current without deleting its archived history. The
+    // dismissal is local view state and must survive a reload.
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    await expect(rail).toBeVisible();
+    await rail.getByRole("button", { name: "Actions for New session 1", exact: true }).click();
+    await page.getByRole("button", { name: "Archive", exact: true }).click();
+    await expect(rail).toBeHidden();
+    await expect(page).toHaveURL(/#\/$/u);
+
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    await expect(rail).toBeVisible();
+    const projectMenuTrigger = rail.getByRole("button", { name: /^Actions for /u });
+    await expect(projectMenuTrigger).toHaveCount(1);
+    const projectActionName = await projectMenuTrigger.getAttribute("aria-label");
+    expect(projectActionName).not.toBeNull();
+    if (projectActionName === null) throw new Error("project action label is missing");
+    const projectTriggerBox = await projectMenuTrigger.boundingBox();
+    expect(projectTriggerBox).not.toBeNull();
+    expect(projectTriggerBox!.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(projectTriggerBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    await projectMenuTrigger.click();
+    const removeEmptyProject = page.getByRole("button", {
+      name: /^Remove shortcut\b/u,
+    });
+    const removeBox = await removeEmptyProject.boundingBox();
+    expect(removeBox).not.toBeNull();
+    expect(removeBox!.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(removeBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(removeBox!.x).toBeGreaterThanOrEqual(0);
+    expect(removeBox!.y).toBeGreaterThanOrEqual(0);
+    expect(removeBox!.x + removeBox!.width).toBeLessThanOrEqual(320.5);
+    expect(removeBox!.y + removeBox!.height).toBeLessThanOrEqual(568.5);
+    await removeEmptyProject.click();
+    await expect(removeEmptyProject).toHaveCount(0);
+    await expect(
+      rail.getByRole("navigation", { name: "Working folders and sessions" }),
+    ).toBeFocused();
+    await expect(rail.getByRole("button", { name: /^New session in /u })).toHaveCount(0);
+    await expect(rail.getByRole("button", { name: "Archived · 1", exact: true })).toBeVisible();
+    await observerRail.getByRole("button", { name: "Current · 0", exact: true }).click();
+    await expect(observerRail.getByRole("button", { name: /^New session in /u })).toBeVisible();
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(page.getByText(CONNECTED_COPY, { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    const reloadedRail = page.getByRole("dialog", { name: "Working folders and sessions" });
+    await expect(reloadedRail).toBeVisible();
+    await expect(reloadedRail.getByRole("button", { name: projectActionName })).toHaveCount(0);
+    await expect(reloadedRail.getByRole("button", { name: /^New session in /u })).toHaveCount(0);
+    await reloadedRail.getByRole("button", { name: "Archived · 1", exact: true }).click();
+    await expect(page).toHaveURL((url) => {
+      const route = decodeURIComponent(url.hash.replace(/^#\/sessions\//u, ""));
+      return route === createdViewId;
+    });
+    await expect(page.getByText(/Archived · read-only/u).first()).toBeVisible();
+
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    await expect(reloadedRail).toBeVisible();
+    await reloadedRail.getByRole("button", { name: projectActionName }).click();
+    await page.getByRole("button", { name: /^Show shortcut\b/u }).click();
+    await expect(reloadedRail.locator("[data-project-disclosure]").first()).toBeFocused();
+    await reloadedRail.getByRole("button", { name: "Current · 0", exact: true }).click();
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    await expect(reloadedRail).toBeVisible();
+    await expect(reloadedRail.getByRole("button", { name: projectActionName })).toBeVisible();
+    await expect(reloadedRail.getByRole("button", { name: /^New session in /u })).toBeVisible();
   } finally {
     await observerContext.close();
   }

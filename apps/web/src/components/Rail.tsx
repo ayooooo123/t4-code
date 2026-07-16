@@ -12,7 +12,6 @@ import {
   DialogHeader,
   DialogPopup,
   DialogTitle,
-  IconButton,
   Spinner,
   StatusPill,
   Tooltip,
@@ -24,6 +23,7 @@ import { useNavigate } from "@tanstack/react-router";
 import {
   Archive,
   Cable,
+  ChevronDown,
   ChevronRight,
   CircleStop,
   MoreHorizontal,
@@ -31,6 +31,8 @@ import {
   Plus,
   RotateCcw,
   Trash2,
+  UsersRound,
+  X,
 } from "lucide-react";
 import {
   type FormEvent,
@@ -43,6 +45,7 @@ import {
 
 import type { SessionListView, WorkspaceSession } from "../lib/workspace-data.ts";
 import { formatRelativeTime, type ProjectGroup, type SessionRow } from "../lib/session-tree.ts";
+import { composerStore } from "../features/composer/composer-store.ts";
 import { createLiveSession } from "../features/session-runtime/live-create.ts";
 import {
   archiveLiveSession,
@@ -57,7 +60,9 @@ import { resolveSessionManagementNavigation } from "../features/session-runtime/
 import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
 import {
   deriveWorkspaceData,
+  requiresProfileChoiceForCreate,
   resolveLiveProject,
+  resolveLiveProjectCreateTargets,
   resolveLiveSession,
 } from "../platform/live-workspace.ts";
 import { useWorkspace, workspaceStore } from "../state/store-instance.ts";
@@ -136,6 +141,11 @@ function SessionRowItem({
         else if (action === "archive") await archiveLiveSession(controller, address);
         else if (action === "restore") await restoreLiveSession(controller, address);
         else await deleteLiveSession(controller, address);
+        // Archive/restore preserves the same draft contract as A to B to A.
+        // Only confirmed permanent deletion releases its staged blob URLs.
+        if (action === "delete") {
+          composerStore.getState().disposeSession(session.id);
+        }
         const verb =
           action === "rename"
             ? "renamed"
@@ -419,11 +429,13 @@ function SessionRowItem({
           showCloseButton={false}
         >
           <DialogHeader>
-            <DialogTitle className="text-base">Terminate runtime for “{session.title}”?</DialogTitle>
+            <DialogTitle className="text-base">
+              Terminate runtime for “{session.title}”?
+            </DialogTitle>
             <DialogDescription>
               This stops the process handling this session and ends any in-flight turn. The
-              transcript, draft, artifacts, and generated output stay intact. Archive or delete
-              only after the host reports the runtime closed.
+              transcript, draft, artifacts, and generated output stay intact. Archive or delete only
+              after the host reports the runtime closed.
             </DialogDescription>
             {error !== null && (
               <p className="text-destructive-foreground text-xs" role="alert">
@@ -521,33 +533,106 @@ function SessionRowItem({
   );
 }
 
-function ProjectHeaderRow({ group, allowCreate }: { group: ProjectGroup; allowCreate: boolean }) {
+function ProjectHeaderRow({
+  group,
+  allowCreate,
+  shortcutHidden,
+  onDismiss,
+  onRestore,
+  view,
+}: {
+  group: ProjectGroup;
+  allowCreate: boolean;
+  shortcutHidden: boolean;
+  onDismiss: () => void;
+  onRestore: () => void;
+  view: SessionListView;
+}) {
   const navigate = useNavigate();
   const snapshot = useDesktopRuntimeSnapshot();
   const controller = desktopRuntime();
   const [pending, setPending] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const disclosureRef = useRef<HTMLButtonElement | null>(null);
 
   const address = snapshot !== null ? resolveLiveProject(snapshot, group.project.id) : null;
+  const createTargets =
+    snapshot === null
+      ? []
+      : resolveLiveProjectCreateTargets(snapshot, group.project.id).filter(
+          (target) => sessionCreateSupport(snapshot, target.address).supported,
+        );
   const createSupport =
-    address !== null && snapshot !== null
-      ? sessionCreateSupport(snapshot, address)
-      : { supported: false, reason: "Connect to this host to create a session" };
-  const canCreate =
-    allowCreate &&
-    createSupport.supported &&
-    controller !== null &&
+    createTargets.length > 0
+      ? { supported: true, reason: null }
+      : address !== null && snapshot !== null
+        ? sessionCreateSupport(snapshot, address)
+        : { supported: false, reason: "Connect to this host to create a session" };
+  const projectIsLocal =
+    snapshot !== null &&
     address !== null &&
-    !pending;
+    snapshot.targets.get(address.targetId)?.kind === "local";
+  const configuredLocalProfiles =
+    projectIsLocal && snapshot !== null
+      ? [...snapshot.targets.values()].filter((target) => target.kind === "local")
+      : [];
+  // Every configured local profile that cannot create here right now is still
+  // shown, with why: disconnected profiles say so, connected-but-unsupported
+  // profiles surface the host's reason.
+  const unavailableLocalProfiles =
+    snapshot === null || address === null
+      ? []
+      : configuredLocalProfiles
+          .filter(
+            (profile) =>
+              !createTargets.some((target) => target.address.targetId === profile.targetId),
+          )
+          .map((profile) => {
+            if (snapshot.connections.get(profile.targetId) !== "connected") {
+              return { label: profile.label, reason: "Not connected", targetId: profile.targetId };
+            }
+            const hostId = snapshot.targetHosts.get(profile.targetId);
+            const support =
+              hostId === undefined
+                ? null
+                : sessionCreateSupport(snapshot, {
+                    hostId,
+                    projectId: address.projectId,
+                    targetId: profile.targetId,
+                  });
+            return {
+              label: profile.label,
+              reason: support?.reason ?? "Unavailable",
+              targetId: profile.targetId,
+            };
+          });
+  const canCreate = allowCreate && createTargets.length > 0 && controller !== null && !pending;
+  // Never fall back to an opaque direct create while other configured profiles
+  // exist or nothing can create: the chooser stays, listing each configured
+  // profile as available or unavailable and linking host management.
+  const chooseCreateProfile =
+    requiresProfileChoiceForCreate(createTargets) ||
+    configuredLocalProfiles.length > 1 ||
+    (projectIsLocal && createTargets.length === 0);
+  // The chooser opens whenever it has something to show — even when no target
+  // can create right now, it explains why and links host management. Only the
+  // per-profile create rows are gated on a live connection.
+  const createMenuAvailable =
+    allowCreate && !pending && (canCreate || configuredLocalProfiles.length > 0);
+  const emptyCurrentProject = view === "current" && group.sessions.length === 0;
+  const inventoryTruncated = group.host.sessionInventoryTruncated === true;
+  const showProjectMenu = emptyCurrentProject || (view === "archived" && shortcutHidden);
 
   const handleCreate = useCallback(
-    async (event: React.MouseEvent) => {
-      event.stopPropagation();
-      if (!canCreate || controller === null || address === null) return;
+    async (targetAddress: NonNullable<typeof address>) => {
+      if (!canCreate || controller === null) return;
       setPending(true);
       setError(null);
       try {
-        const result = await createLiveSession(controller, address);
+        const result = await createLiveSession(controller, targetAddress);
+        setCreateMenuOpen(false);
         workspaceStore.getState().setRailOverlayOpen(false);
         void navigate({ params: { sessionId: result.viewId }, to: "/sessions/$sessionId" });
       } catch (cause) {
@@ -556,7 +641,7 @@ function ProjectHeaderRow({ group, allowCreate }: { group: ProjectGroup; allowCr
         setPending(false);
       }
     },
-    [canCreate, controller, address, pending, navigate],
+    [canCreate, controller, navigate],
   );
 
   return (
@@ -565,9 +650,11 @@ function ProjectHeaderRow({ group, allowCreate }: { group: ProjectGroup; allowCr
         <button
           aria-expanded={group.expanded}
           className="flex min-h-11 min-w-0 flex-1 items-center gap-1 rounded-md px-1.5 py-1 text-left outline-none transition-colors duration-(--motion-duration-fast) hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background sm:min-h-0"
+          data-project-disclosure={group.project.id}
           onClick={() =>
             workspaceStore.getState().setProjectExpanded(group.project.id, !group.expanded)
           }
+          ref={disclosureRef}
           type="button"
         >
           <ChevronRight
@@ -584,6 +671,14 @@ function ProjectHeaderRow({ group, allowCreate }: { group: ProjectGroup; allowCr
               <span className="truncate">{group.host.name}</span>
             </span>
           )}
+          {group.host.kind === "local" &&
+            group.host.profileId !== undefined &&
+            group.host.profileId !== "default" && (
+              <span className="flex min-w-0 items-center gap-1 text-muted-foreground text-xs">
+                <UsersRound aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate">{group.host.name}</span>
+              </span>
+            )}
           <span className="flex-1" />
           {!group.expanded && group.unreadCount > 0 && (
             <span
@@ -596,34 +691,205 @@ function ProjectHeaderRow({ group, allowCreate }: { group: ProjectGroup; allowCr
           )}
           <span className="text-muted-foreground text-xs">{group.sessions.length}</span>
         </button>
-        {allowCreate && (
+        {allowCreate && chooseCreateProfile ? (
+          <Popover.Root onOpenChange={setCreateMenuOpen} open={createMenuOpen}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Popover.Trigger
+                    aria-label={`New session in ${group.project.name} — choose the OMP profile that will own it`}
+                    className="flex h-11 shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 font-medium text-muted-foreground text-xs outline-none transition-colors duration-(--motion-duration-fast) hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring sm:h-6 sm:px-1.5"
+                    disabled={!createMenuAvailable}
+                  >
+                    {pending ? (
+                      <Spinner className="size-3" />
+                    ) : (
+                      <Plus aria-hidden="true" className="size-3" />
+                    )}
+                    New
+                    <ChevronDown aria-hidden="true" className="size-3" />
+                  </Popover.Trigger>
+                }
+              />
+              <TooltipPopup side="right">Choose the OMP profile for a new session</TooltipPopup>
+            </Tooltip>
+            <Popover.Portal>
+              <Popover.Positioner align="end" className="z-50" side="bottom" sideOffset={4}>
+                <Popover.Popup className="w-[min(15rem,calc(100vw-1rem))] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-(--overlay-shadow) outline-none">
+                  <Popover.Title className="truncate px-2 pt-1 font-medium text-xs">
+                    New session in {group.project.name}
+                  </Popover.Title>
+                  <Popover.Description className="px-2 pb-1.5 text-muted-foreground text-xs leading-snug">
+                    The OMP profile you choose will own this session.
+                  </Popover.Description>
+                  {createTargets.map((target) => (
+                    <button
+                      className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                      disabled={pending}
+                      key={target.address.targetId}
+                      onClick={() => void handleCreate(target.address)}
+                      type="button"
+                    >
+                      <UsersRound
+                        aria-hidden="true"
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                      <span className="flex min-w-0 flex-1 flex-col py-1">
+                        <span className="truncate text-sm">{target.label}</span>
+                        {target.profileId !== undefined && (
+                          <span className="truncate font-mono text-muted-foreground text-[11px]">
+                            {target.profileId}
+                          </span>
+                        )}
+                      </span>
+                      {target.current && <Badge variant="outline">Current</Badge>}
+                    </button>
+                  ))}
+                  {createTargets.length === 0 && (
+                    <p className="px-2 py-1.5 text-muted-foreground text-xs leading-snug">
+                      No connected profile can start a session here yet.
+                    </p>
+                  )}
+                  {unavailableLocalProfiles.map((profile) => (
+                    <div
+                      aria-disabled="true"
+                      className="flex min-h-11 w-full items-center gap-2 rounded-md px-2 text-left opacity-64 sm:min-h-8"
+                      key={profile.targetId}
+                    >
+                      <UsersRound
+                        aria-hidden="true"
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                      <span className="flex min-w-0 flex-1 flex-col py-1">
+                        <span className="truncate text-sm">{profile.label}</span>
+                        <span className="truncate text-muted-foreground text-[11px]">
+                          {profile.reason}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                  {(unavailableLocalProfiles.length > 0 || createTargets.length === 0) && (
+                    <button
+                      className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                      onClick={() => {
+                        setCreateMenuOpen(false);
+                        workspaceStore.getState().setRailOverlayOpen(false);
+                        void navigate({ to: "/hosts" });
+                      }}
+                      type="button"
+                    >
+                      <Cable aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="flex min-w-0 flex-1 flex-col py-1">
+                        <span className="truncate text-sm">Open Hosts</span>
+                        <span className="truncate text-muted-foreground text-[11px]">
+                          Connect a profile to use it here
+                        </span>
+                      </span>
+                    </button>
+                  )}
+                </Popover.Popup>
+              </Popover.Positioner>
+            </Popover.Portal>
+          </Popover.Root>
+        ) : allowCreate ? (
           <Tooltip>
             <TooltipTrigger
               render={
-                <IconButton
+                <button
                   aria-disabled={!canCreate}
                   aria-label={`New session in ${group.project.name}`}
                   className={cn(
-                    "size-11 shrink-0 sm:size-6",
-                    !canCreate && "cursor-not-allowed opacity-64",
+                    "flex h-11 shrink-0 items-center gap-1 rounded-md px-2 font-medium text-muted-foreground text-xs outline-none transition-colors duration-(--motion-duration-fast) focus-visible:ring-2 focus-visible:ring-ring sm:h-6 sm:px-1.5",
+                    canCreate
+                      ? "cursor-pointer hover:bg-accent hover:text-foreground"
+                      : "cursor-not-allowed opacity-64",
                   )}
-                  onClick={handleCreate}
-                  size="icon-xs"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (!canCreate) return;
+                    const target = createTargets[0];
+                    if (target !== undefined) void handleCreate(target.address);
+                  }}
                   title={createSupport.reason ?? undefined}
-                  variant="ghost"
+                  type="button"
                 >
                   {pending ? (
                     <Spinner className="size-3" />
                   ) : (
                     <Plus aria-hidden="true" className="size-3" />
                   )}
-                </IconButton>
+                  New
+                </button>
               }
             />
             <TooltipPopup side="right">
               {createSupport.reason ?? `New session in ${group.project.name}`}
             </TooltipPopup>
           </Tooltip>
+        ) : null}
+        {showProjectMenu && (
+          <Popover.Root onOpenChange={setMenuOpen} open={menuOpen}>
+            <Popover.Trigger
+              aria-label={`Actions for ${group.project.name}`}
+              className="flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring sm:size-6"
+            >
+              <MoreHorizontal aria-hidden="true" className="size-4" />
+            </Popover.Trigger>
+            <Popover.Portal>
+              <Popover.Positioner align="end" className="z-50" side="bottom" sideOffset={4}>
+                <Popover.Popup className="max-h-[min(22rem,calc(100dvh-1rem))] w-[min(17rem,calc(100vw-1rem))] overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-(--overlay-shadow) outline-none">
+                  <Popover.Title className="truncate px-2 pt-1 pb-1.5 font-medium text-muted-foreground text-xs">
+                    {group.project.name}
+                  </Popover.Title>
+                  {emptyCurrentProject ? (
+                    <button
+                      aria-disabled={inventoryTruncated || pending || undefined}
+                      className={cn(
+                        "flex min-h-11 w-full items-start gap-2 rounded-md px-2 py-2 text-left outline-none transition-colors duration-(--motion-duration-fast) focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8",
+                        inventoryTruncated || pending
+                          ? "cursor-not-allowed text-muted-foreground opacity-64"
+                          : "cursor-pointer hover:bg-accent",
+                      )}
+                      onClick={() => {
+                        if (inventoryTruncated || pending) return;
+                        setMenuOpen(false);
+                        onDismiss();
+                      }}
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                      <span className="min-w-0">
+                        <span className="block text-sm">Remove shortcut</span>
+                        <span className="block text-muted-foreground text-xs leading-snug">
+                          {inventoryTruncated
+                            ? "This host is showing a partial session list, so this shortcut can't be removed safely."
+                            : "Only changes this T4 Code client. The folder and OMP sessions stay unchanged."}
+                        </span>
+                      </span>
+                    </button>
+                  ) : (
+                    <button
+                      className="flex min-h-11 w-full cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-left outline-none transition-colors duration-(--motion-duration-fast) hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:min-h-8"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onRestore();
+                        requestAnimationFrame(() => disclosureRef.current?.focus());
+                      }}
+                      type="button"
+                    >
+                      <RotateCcw aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+                      <span className="min-w-0">
+                        <span className="block text-sm">Show shortcut</span>
+                        <span className="block text-muted-foreground text-xs leading-snug">
+                          Makes the empty folder shortcut available in this client again.
+                        </span>
+                      </span>
+                    </button>
+                  )}
+                </Popover.Popup>
+              </Popover.Positioner>
+            </Popover.Portal>
+          </Popover.Root>
         )}
       </div>
       {error !== null && (
@@ -653,12 +919,14 @@ function handleRailKeyDown(event: KeyboardEvent<HTMLElement>) {
 
 export function Rail({
   groups,
+  hiddenEmptyProjectIds,
   nowMs,
   view,
   currentCount,
   archivedCount,
 }: {
   groups: readonly ProjectGroup[];
+  hiddenEmptyProjectIds: ReadonlySet<string>;
   nowMs: number;
   view: SessionListView;
   currentCount: number;
@@ -666,12 +934,35 @@ export function Rail({
 }) {
   const activeSessionId = useWorkspace((state) => state.activeSessionId);
   const [announcement, setAnnouncement] = useState("");
+  const navRef = useRef<HTMLElement | null>(null);
+
+  const dismissProject = (group: ProjectGroup) => {
+    const disclosures = [
+      ...(navRef.current?.querySelectorAll<HTMLElement>("[data-project-disclosure]") ?? []),
+    ];
+    const currentIndex = disclosures.findIndex(
+      (element) => element.dataset.projectDisclosure === group.project.id,
+    );
+    const focusTarget =
+      disclosures[currentIndex + 1] ?? disclosures[currentIndex - 1] ?? navRef.current;
+    workspaceStore.getState().setEmptyProjectDismissed(group.project.id, true);
+    setAnnouncement(
+      `Removed ${group.project.name} from Working folders. The folder and OMP sessions are unchanged.`,
+    );
+    requestAnimationFrame(() => {
+      const target = focusTarget?.isConnected ? focusTarget : navRef.current;
+      target?.focus();
+    });
+  };
+
   let rowIndex = 0;
   return (
     <nav
       aria-label="Working folders and sessions"
-      className="flex h-full min-h-0 flex-col overflow-y-auto px-1.5 py-2"
+      className="flex h-full min-h-0 flex-col overflow-y-auto px-1.5 py-2 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       onKeyDown={handleRailKeyDown}
+      ref={navRef}
+      tabIndex={-1}
     >
       <div className="px-1.5 pb-2">
         <h2 className="font-medium text-foreground text-sm">Working folders</h2>
@@ -690,8 +981,25 @@ export function Rail({
         </p>
       )}
       {groups.map((group) => (
-        <section aria-label={group.project.name} className="mb-1" key={group.project.id}>
-          <ProjectHeaderRow allowCreate={view === "current"} group={group} />
+        <section
+          aria-label={group.project.name}
+          className="mb-1"
+          data-project-id={group.project.id}
+          key={group.project.id}
+        >
+          <ProjectHeaderRow
+            allowCreate={view === "current"}
+            group={group}
+            onDismiss={() => dismissProject(group)}
+            onRestore={() => {
+              workspaceStore.getState().setEmptyProjectDismissed(group.project.id, false);
+              setAnnouncement(
+                `Restored ${group.project.name} to Working folders on this T4 Code client.`,
+              );
+            }}
+            shortcutHidden={hiddenEmptyProjectIds.has(group.project.id)}
+            view={view}
+          />
           {group.expanded && (
             <div className="mt-0.5 flex flex-col gap-px">
               {group.sessions.map((row) => (

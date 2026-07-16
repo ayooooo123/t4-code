@@ -38,10 +38,9 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
         const eventTypes = session?.events.map((event) => event.event.type);
         if (
           session?.entries.length === 2 &&
-          eventTypes?.join(",") === "agent.start,turn.start,turn.end,agent.end"
-        ) {
-          resolveStreamed();
-        }
+          eventTypes?.join(",") ===
+            "agent.start,turn.start,message.settled,turn.end,agent.end"
+        ) resolveStreamed();
       });
       const prompt = client.command({ hostId: "host-stream", sessionId: "session-stream", command: "session.prompt", args: { message: "hello" } });
       await yieldLoop();
@@ -50,12 +49,20 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
       await yieldLoop();
       await streamed;
       disposeStream();
-      // Wait for the complete projected response rather than a subset of the
-      // live frames. The server emits the terminal frames asynchronously after
-      // its message updates, and the durable entry retires those updates.
+      // The subscription above proves both live events crossed the real
+      // WebSocket boundary. Once the matching durable entry arrives, the
+      // projection must retire those transient frames so the response cannot
+      // render twice. The settlement correlation marker remains available so
+      // a freshly recreated runtime can suppress a lagging pendingPrompt ref.
       expect(
         projection.snapshot.sessions.get(key)!.events.map((event) => event.event.type),
-      ).toEqual(["agent.start", "turn.start", "turn.end", "agent.end"]);
+      ).toEqual([
+        "agent.start",
+        "turn.start",
+        "message.settled",
+        "turn.end",
+        "agent.end",
+      ]);
       expect(projection.snapshot.sessions.get(key)!.entries).toHaveLength(2);
       expect(JSON.stringify(projection.snapshot)).not.toContain("deviceToken");
       const { promise: reconnected, resolve: resolveReconnect } = Promise.withResolvers<void>();

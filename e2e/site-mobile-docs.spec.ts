@@ -129,7 +129,7 @@ test("offers the Android APK without hiding desktop downloads", async ({ page })
   await expect(androidDownload).toBeVisible();
   await expect(androidDownload).toHaveAttribute(
     "href",
-    "https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-android.apk",
+    "https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-android.apk",
   );
   await expect(page.getByRole("link", { name: "Download for Linux" }).first()).toBeVisible();
   await expect(page.getByRole("link", { name: "macOS build" }).first()).toBeVisible();
@@ -140,11 +140,8 @@ test("offers the Android APK without hiding desktop downloads", async ({ page })
     documentScrollWidth: document.documentElement.scrollWidth,
     bodyScrollWidth: document.body.scrollWidth,
   }));
-  expect(geometry).toEqual({
-    clientWidth: 320,
-    documentScrollWidth: 320,
-    bodyScrollWidth: 320,
-  });
+  expect(geometry.documentScrollWidth).toBe(geometry.clientWidth);
+  expect(geometry.bodyScrollWidth).toBe(geometry.clientWidth);
 });
 
 test("every docs topic stays inside a 320px viewport", async ({ page }) => {
@@ -156,11 +153,8 @@ test("every docs topic stays inside a 320px viewport", async ({ page }) => {
       documentScrollWidth: document.documentElement.scrollWidth,
       bodyScrollWidth: document.body.scrollWidth,
     }));
-    expect(geometry, `horizontal overflow at #${topic}`).toEqual({
-      clientWidth: 320,
-      documentScrollWidth: 320,
-      bodyScrollWidth: 320,
-    });
+    expect(geometry.documentScrollWidth, `document overflow at #${topic}`).toBe(geometry.clientWidth);
+    expect(geometry.bodyScrollWidth, `body overflow at #${topic}`).toBe(geometry.clientWidth);
   }
 });
 

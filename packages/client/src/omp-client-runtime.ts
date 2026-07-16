@@ -98,7 +98,10 @@ export class OmpClient {
   private authenticationValue: "local" | "pairing-required" | "paired" | undefined;
   private granted = new Set<string>();
   private closedByUser = false;
+  private compatibilityFallbackUsed = false;
   private connectWaiters: ConnectWaiter[] = [];
+  private lastInboundAt: number | undefined;
+  private fatalError: OmpClientError | undefined;
 
   constructor(options: OmpClientOptions) {
     this.options = options;
@@ -139,10 +142,14 @@ export class OmpClient {
       () => !this.closedByUser && !isTerminalState(this.stateValue),
       {
         connected: (_transport, generation) => this.handleConnected(generation),
-        message: (raw, generation) => this.inboundQueue.enqueue(raw, generation),
+        reconnectBegin: () => this.transition("connecting"),
+        message: (raw, generation) => {
+          this.lastInboundAt = this.clock.now();
+          this.inboundQueue.enqueue(raw, generation);
+        },
         close: (code, reason) => this.handleDisconnect(code, reason),
         error: (error) => this.handleTransportError(error),
-        reconnectLimit: () => this.fatal(this.error("transport", "reconnect attempt limit reached")),
+        reconnectLimit: () => this.fatal(this.error("transport", "reconnect attempt limit reached", true)),
         reconnectWait: () => this.transition("reconnect-wait"),
         heartbeatFailure: () => this.handleDisconnect(undefined, "heartbeat timeout"),
       },
@@ -214,13 +221,78 @@ export class OmpClient {
     if (isTerminalState(this.stateValue)) throw this.error("closed", "client is closed");
     const ready = new Promise<void>((resolve, reject) => this.connectWaiters.push({ resolve, reject }));
     this.closedByUser = false;
-    if (this.stateValue === "idle") this.connection.begin();
+    if (this.stateValue === "idle") {
+      // The transport factory may itself await a WebSocket/Unix-socket open.
+      // Publish connecting before that await so failures can legally enter
+      // reconnect-wait/fatal and concurrent connect() calls share one attempt.
+      this.transition("connecting");
+      this.connection.begin();
+    }
     return ready;
+  }
+
+  /**
+   * Nudge a backgrounded client back to health. Fresh ready sockets and
+   * in-flight connection attempts are left alone; pending backoff is skipped,
+   * a stale ready socket is replaced, and retry-exhausted transport failures
+   * receive one fresh bounded reconnect budget.
+   */
+  wake(): void {
+    if (this.stateValue === "idle") {
+      void this.connect().catch(() => undefined);
+      return;
+    }
+    if (this.stateValue === "reconnect-wait") {
+      this.connection.beginReconnectNow();
+      return;
+    }
+    if (this.stateValue === "fatal") {
+      this.reviveRetryableTransportFailure();
+      return;
+    }
+    if (
+      (this.stateValue === "ready" || this.stateValue === "pairing") &&
+      this.inboundIsStale()
+    ) {
+      this.reconnectNow();
+    }
+  }
+
+  /** Force an immediate reconnect while preserving cursors and attachments. */
+  reconnectNow(): void {
+    if (this.stateValue === "idle") {
+      void this.connect().catch(() => undefined);
+      return;
+    }
+    if (this.stateValue === "reconnect-wait") {
+      this.connection.beginReconnectNow();
+      return;
+    }
+    if (this.stateValue === "fatal") {
+      this.reviveRetryableTransportFailure();
+      return;
+    }
+    if (
+      this.stateValue === "closed" ||
+      this.stateValue === "closing" ||
+      this.stateValue === "connecting" ||
+      this.stateValue === "handshaking"
+    ) return;
+
+    // Replacing a socket explicitly starts a new recovery episode. Reset the
+    // exhausted episode before scheduling so a ready connection that reached
+    // the previous cap can still receive one fresh, bounded reconnect budget.
+    // The replacement's attempt remains charged until its heartbeat and every
+    // attachment replay pass the normal reconnect-health gate.
+    this.connection.resetAttempts();
+    this.handleDisconnect(undefined, "foreground reconnect");
+    this.connection.beginReconnectNow();
   }
 
   async close(): Promise<void> {
     if (this.stateValue === "closed") return;
     this.closedByUser = true;
+    this.fatalError = undefined;
     this.clearInbound();
     this.heartbeatNonce = undefined;
     this.reconnectHealth.clear();
@@ -347,6 +419,7 @@ export class OmpClient {
 
   private handleConnected(_generation: number): void {
     this.reconnectHealth.clear();
+    this.fatalError = undefined;
     this.transition("connecting");
     this.transition("handshaking");
     this.sendHello();
@@ -355,8 +428,15 @@ export class OmpClient {
     }
   }
   private sendHello(): void {
+    const helloOptions =
+      this.compatibilityFallbackUsed && this.options.compatibilityRequestedFeatures !== undefined
+        ? {
+            ...this.options,
+            requestedFeatures: this.options.compatibilityRequestedFeatures,
+          }
+        : this.options;
     sendClientHello(
-      this.options,
+      helloOptions,
       [...this.cursorJournal.records.values()],
       (encoded) => this.connection.send(encoded),
       (input) => decodeOutgoingFrame(input),
@@ -506,8 +586,28 @@ export class OmpClient {
     if (pending?.kind === "pair") this.pendingRequests.settle(id, undefined, this.error("auth", "pairing request failed", false, { code: frame.code }));
   }
 
-  private handleDisconnect(_code?: number, _reason?: string): void {
+  private handleDisconnect(code?: number, reason?: string): void {
     if (this.closedByUser || isTerminalState(this.stateValue)) return;
+    const helloRejected =
+      this.stateValue === "handshaking" && code === 1008 && reason?.trim() === "invalid frame";
+    if (helloRejected) {
+      if (
+        !this.compatibilityFallbackUsed &&
+        this.options.compatibilityRequestedFeatures !== undefined
+      ) {
+        this.compatibilityFallbackUsed = true;
+        this.emitError(
+          this.error(
+            "protocol",
+            "Host uses an earlier feature set; reconnecting in compatibility mode.",
+            true,
+          ),
+        );
+      } else {
+        this.fatal(this.error("protocol", "Host rejected the protocol hello."));
+        return;
+      }
+    }
     this.clearTimer("handshakeTimer");
     this.heartbeatNonce = undefined;
     this.reconnectHealth.clear();
@@ -586,6 +686,7 @@ export class OmpClient {
 
   private fatal(error: OmpClientError): void {
     this.emitError(error);
+    this.fatalError = error;
     this.closedByUser = true;
     this.clearInbound();
     this.heartbeatNonce = undefined;
@@ -595,6 +696,28 @@ export class OmpClient {
     for (const waiter of this.connectWaiters.splice(0)) waiter.reject(error);
     this.connection.disconnect();
     if (this.stateValue !== "fatal" && this.stateValue !== "closed") this.transition("fatal");
+  }
+
+  private inboundIsStale(): boolean {
+    if (this.lastInboundAt === undefined) return true;
+    const configured = this.options.wakeStaleAfterMs;
+    const fallback =
+      (this.options.heartbeat?.intervalMs ?? 15_000) +
+      (this.options.heartbeat?.timeoutMs ?? 5_000);
+    const staleAfter =
+      configured !== undefined && Number.isFinite(configured) && configured > 0
+        ? configured
+        : fallback;
+    return this.clock.now() - this.lastInboundAt >= staleAfter;
+  }
+
+  private reviveRetryableTransportFailure(): void {
+    if (this.stateValue !== "fatal" || this.fatalError?.code !== "transport" || !this.fatalError.retryable) return;
+    this.closedByUser = false;
+    this.fatalError = undefined;
+    this.connection.resetAttempts();
+    this.transition("connecting");
+    this.connection.begin();
   }
 
   private error(code: ClientErrorCode, message: string, retryable = false, metadata?: Record<string, string | number | boolean>): OmpClientError {

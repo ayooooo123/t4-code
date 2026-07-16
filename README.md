@@ -4,43 +4,53 @@ T4 Code is a free, open-source (MIT) desktop app for [Oh My Pi](https://github.c
 
 ![T4 Code main window](docs/assets/t4-code-main.png)
 
-[**Download v0.1.11**](https://github.com/LycaonLLC/t4-code/releases/tag/v0.1.11) · [**Docs**](https://t4code.net/docs) · [**Get the source**](#build-from-source)
+[**Download v0.1.21**](https://github.com/LycaonLLC/t4-code/releases/tag/v0.1.21) · [**Docs**](https://t4code.net/docs) · [**Get the source**](#build-from-source)
 
 ## Requirements
 
-T4 Code needs an OMP build with desktop appserver support. For v0.1.11, use the public integration build below.
+T4 Code needs an OMP build with desktop appserver support. For v0.1.21, use the public integration build below.
 
-T4 Code v0.1.11 was verified with OMP 16.5.1 built from [`15527d1f`](https://github.com/lyc-aon/oh-my-pi/commit/15527d1f00bac22705f63f80b29c0c30e67fc5da), tagged [`t4code-16.5.1-appserver-1`](https://github.com/lyc-aon/oh-my-pi/tree/t4code-16.5.1-appserver-1). That public integration is based on the official upstream [`v16.5.1`](https://github.com/can1357/oh-my-pi/tree/v16.5.1) tag at [`14b5da76`](https://github.com/can1357/oh-my-pi/commit/14b5da76a9aece9a469288718d22c3d624daf033). It carries forward bounded replay and terminal events, complete desktop runtime projection, catalog-backed session management, deterministic failed-worker reaping, recoverable crash state, settled close state, ordered remote delivery, cross-client control convergence, and restart-safe session teardown. It also reconciles OMP 16.5.1's RPC disconnect cleanup with T4's persistent session-lock release. The official upstream v16.5.1 tag has no `appserver` command, so it cannot host T4 Code. The verified runtime is a normal build from the public `lyc-aon/oh-my-pi` source; T4 Code does not depend on private home-directory files, an auth broker, or a custom Codex CLI fork. T4 Code vendors `@oh-my-pi/app-wire` 0.5.3 from integration commit [`15527d1f`](https://github.com/lyc-aon/oh-my-pi/commit/15527d1f00bac22705f63f80b29c0c30e67fc5da), source tree `4961ea9c522a3bbf9a9900424dd475a48148c729`.
+T4 Code v0.1.21 was verified with OMP 17.0.0 built from [`ee1b794f`](https://github.com/lyc-aon/oh-my-pi/commit/ee1b794f1d0638b3d6797c5220e5eafe69d693db), tagged [`t4code-17.0.0-appserver-4`](https://github.com/lyc-aon/oh-my-pi/tree/t4code-17.0.0-appserver-4). That public integration is based on the official upstream [`v17.0.0`](https://github.com/can1357/oh-my-pi/tree/v17.0.0) tag at [`d5cd24f3`](https://github.com/can1357/oh-my-pi/commit/d5cd24f39a951bfbd50dc8f50bcf095d59694d6c). It scopes each appserver to its OMP profile, adds host-scoped `usage.read` and `broker.status` commands with redacted results, reports each model's real thinking levels and fast support, and bounds project catalog resolution, on top of T4's existing transcript, image, subagent, lifecycle, and maintenance integration. Fork CI rechecks the exact upstream ancestry and release gates before publishing binaries. The official upstream v17.0.0 tag has no `appserver` command, so it cannot host T4 Code. The verified runtime is a normal build from the public `lyc-aon/oh-my-pi` source; T4 Code does not depend on private home-directory files, an auth broker, or a custom Codex CLI fork. T4 Code vendors `@oh-my-pi/app-wire` 0.5.7 from integration commit [`ee1b794f`](https://github.com/lyc-aon/oh-my-pi/commit/ee1b794f1d0638b3d6797c5220e5eafe69d693db), source tree `421e29e6ed9203113345906e2d24c042949d0f61`.
 
-| Platform | Arch | Package |
-| --- | --- | --- |
-| Android | arm64, armv7, x86_64 | `.apk` (**signed**) |
-| Linux | x86_64 | `.deb`, AppImage |
-| macOS | Apple Silicon (arm64) | `.dmg`, `.zip` (**unsigned, see below**) |
+| Platform | Arch                  | Package                                  |
+| -------- | --------------------- | ---------------------------------------- |
+| Android  | arm64, armv7, x86_64  | `.apk` (**signed**)                      |
+| Linux    | x86_64                | `.deb`, AppImage                         |
+| macOS    | Apple Silicon (arm64) | `.dmg`, `.zip` (**unsigned, see below**) |
 
-No Windows build and no Intel Mac build in v0.1.11. The iOS TestFlight build is coming soon.
+No Windows build and no Intel Mac build in v0.1.21. The iOS TestFlight build is coming soon.
 
-## What changed in v0.1.11
+## What changed in v0.1.21
 
-- The verified host moves to official OMP 16.5.1. It brings interrupted-turn recovery, organization-scoped Anthropic credentials, complete credential rotation, correct subagent model selection, and bounded transcript retention.
-- The integration settles pending extension UI and host requests before it drains RPC work and releases the persistent session lock. app-wire remains at 0.5.3 with the same source tree and packaged bytes.
+- New sessions make profile ownership explicit. The visible **New** action becomes **New ▾** when several local OMP profile targets are configured. Its chooser lists the current and other connected profiles, configured profiles that are offline as **Not connected**, and an **Open Hosts** shortcut to start them. The profile you pick owns the session; with one eligible target, **New** creates directly there.
+- Android manages saved hosts. The app keeps up to 16 saved Tailnet gateway addresses, stored as plain HTTPS origins with no secrets inside, and switch, add, and remove are separate actions. Adding probes the address first and saves only on success; Back or Escape cancels a probe in flight, and a probe that finishes after you cancel cannot save. Removing a host deletes exactly that entry, and pairing credentials stay scoped to each host in the Android Keystore, so removing one host never touches another's credentials. Existing installs migrate their saved address into the list automatically.
+- Each saved Android host is one remote appserver serving one OMP profile. Android does not list multiple profiles behind a single saved address; running several profiles side by side remains a desktop feature, one local appserver per profile.
+
+<p>
+  <img src="docs/assets/t4-code-hosts.png" width="49%" alt="Hosts screen listing local OMP profiles (default, experiments, nightly) with running or stopped state, Start/Stop/Restart controls, a Start with T4 checkbox, and connections to this computer and a paired studio-mac host." />
+  <img src="docs/assets/t4-code-usage.png" width="49%" alt="Usage screen for the default OMP profile showing Anthropic and OpenAI account windows with used percentages and reset times, and an xAI API key with no usage data reported." />
+</p>
+<p>
+  <img src="docs/assets/t4-code-thinking-fast.gif" width="49%" alt="A running session with composer menus for model, thinking effort, and fast mode while the current turn keeps streaming." />
+  <img src="docs/assets/t4-code-tool-flow.gif" width="49%" alt="Semantic transcript rows in a live turn: an explanation with code, an edit with a diff badge, shell, agent, and browser tool rows, and a test command finishing 18 tests." />
+</p>
 
 ## Install
 
 ### Android
 
 1. On the Android phone, sign in to Tailscale with an account that can reach the T4 Code host.
-2. Download [`T4-Code-0.1.11-android.apk`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-android.apk).
+2. Download [`T4-Code-0.1.21-android.apk`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-android.apk).
 3. If Android asks, allow your browser or file manager to install unknown apps, then install the APK.
-4. Open T4 Code and enter the host's HTTPS Tailscale address, including its port.
+4. Open T4 Code and enter the host's HTTPS Tailscale address, including its port. The app saves the address; you can add more hosts later and switch between them.
 
 The APK does not contain an appserver or expose one to the public internet. It connects to the separately running Tailnet gateway on your OMP host.
 
 ### Linux (Debian/Ubuntu)
 
 ```sh
-wget https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-linux-amd64.deb
-sudo apt install ./T4-Code-0.1.11-linux-amd64.deb
+wget https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-linux-amd64.deb
+sudo apt install ./T4-Code-0.1.21-linux-amd64.deb
 ```
 
 Use `apt install` rather than `dpkg -i` so system dependencies resolve automatically.
@@ -48,17 +58,17 @@ Use `apt install` rather than `dpkg -i` so system dependencies resolve automatic
 ### Linux (AppImage)
 
 ```sh
-wget https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-linux-x86_64.AppImage
-chmod +x T4-Code-0.1.11-linux-x86_64.AppImage
-./T4-Code-0.1.11-linux-x86_64.AppImage
+wget https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-linux-x86_64.AppImage
+chmod +x T4-Code-0.1.21-linux-x86_64.AppImage
+./T4-Code-0.1.21-linux-x86_64.AppImage
 ```
 
 ### macOS (Apple Silicon)
 
 > [!WARNING]
-> **The macOS v0.1.11 build is unsigned and unnotarized.** Apple has not signed or notarized it, so Gatekeeper can report a "damaged" app or an unidentified developer. Only continue if you trust the release from this repository. You can always build from source instead.
+> **The macOS v0.1.21 build is unsigned and unnotarized.** Apple has not signed or notarized it, so Gatekeeper can report a "damaged" app or an unidentified developer. Only continue if you trust the release from this repository. You can always build from source instead.
 
-1. Download [`T4-Code-0.1.11-mac-arm64.dmg`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-mac-arm64.dmg) (or [`T4-Code-0.1.11-mac-arm64.zip`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.11/T4-Code-0.1.11-mac-arm64.zip)).
+1. Download [`T4-Code-0.1.21-mac-arm64.dmg`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-mac-arm64.dmg) (or [`T4-Code-0.1.21-mac-arm64.zip`](https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-mac-arm64.zip)).
 2. Drag `T4 Code.app` into `/Applications`.
 3. If Gatekeeper blocks the app and you choose to proceed, remove the quarantine attributes from the copied app bundle:
 
@@ -73,14 +83,15 @@ chmod +x T4-Code-0.1.11-linux-x86_64.AppImage
 - **Sessions.** Browse sessions grouped by their working folder, create new ones, and switch between them. Rename, terminate a stuck runtime, archive, restore, or permanently delete a session from its menu. Recently used sessions stay warm, so switching back is instant and nothing is replayed twice.
 - **Composer.** Send prompts, use slash commands (`/model`, `/compact`, `/retry`, `/review`, `/terminal`, and more), and change the session's model, thinking level, or fast mode inline.
 - **Panes.** Watch subagents (and cancel them), apply reviews, browse and preview files on the host, and attach to live terminals with real keyboard input and resize.
-- **Settings.** Edit host settings over the wire. Drafts stage locally and only apply when the host confirms; a dropped connection never silently writes anything.
+- **Settings.** Edit host settings over the wire, with an explicit host selector when several hosts are connected; each host keeps its own drafts. Edits stage locally and only apply when the host confirms; a dropped connection never silently writes anything.
+- **Hosts & usage.** Run one local appserver per OMP profile, pair remote machines, and read each connected host's account usage and broker status. Everything shown is redacted host truth.
 - **Keyboard.** `Ctrl/Cmd+K` search, `Ctrl/Cmd+B` sidebar, `Ctrl/Cmd+1..9` session switch, `Ctrl/Cmd+,` settings. Every workflow is keyboard-operable.
 
 Some actions depend on what the host supports. When a host can't do something (steer a single agent, discard a review, read a file), the control shows as disabled with the reason instead of pretending.
 
 ## Local and paired hosts
 
-**Local.** T4 Code looks for the `omp` executable via `$OMP_EXECUTABLE`, your `PATH`, and common install locations (`~/.local/bin`, `/usr/local/bin`, `/opt/omp/bin`, ...). It then manages the appserver for you: a systemd user service on Linux, a launch agent on macOS. Appserver logs land in `~/.local/state/t4-code/appserver` (Linux) or `~/Library/Logs/T4 Code/appserver` (macOS).
+**Local.** T4 Code looks for the `omp` executable via `$OMP_EXECUTABLE`, your `PATH`, and common install locations (`~/.local/bin`, `/usr/local/bin`, `/opt/omp/bin`, ...). It then manages one appserver per OMP profile for you: a systemd user service on Linux, a launch agent on macOS. Named profiles under `~/.omp/profiles` appear as their own local hosts and can auto-start with the app. Appserver logs land in `~/.local/state/t4-code/appserver` (Linux) or `~/Library/Logs/T4 Code/appserver` (macOS); named profiles log under `profiles/<id>` inside those directories.
 
 **Paired.** Connect to an OMP host on another machine through a `t4-code://pair/...` link generated on that host. Device credentials are encrypted with your OS keychain (Electron `safeStorage`) before they touch disk. Dropped connections reconnect automatically with backoff, and any settings you had staged stay staged until the host confirms.
 

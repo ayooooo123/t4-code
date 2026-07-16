@@ -11,13 +11,21 @@ import {
 } from "@t4-code/client";
 import { useSyncExternalStore } from "react";
 
+import { bindAuthoritativeComposerCleanup } from "../features/composer/authoritative-cleanup.ts";
 import { rendererPlatform } from "../state/store-instance.ts";
 
 const RUNTIME_SLOT = Symbol.for("t4-code.web.desktop-runtime");
 
 interface RuntimeSlot {
   controller: DesktopRuntimeController;
+  disposeComposerCleanup: () => void;
+  disposePageLifecycle?: () => void;
   started: boolean;
+}
+
+export interface RuntimePageLifecycleTarget {
+  addEventListener(type: "pagehide" | "pageshow", listener: EventListener): void;
+  removeEventListener(type: "pagehide" | "pageshow", listener: EventListener): void;
 }
 
 /** Anything that can carry the window's runtime slot (globalThis in prod). */
@@ -34,7 +42,12 @@ export function acquireRuntimeController(
 ): DesktopRuntimeController {
   let slot = holder[RUNTIME_SLOT];
   if (slot === undefined) {
-    slot = { controller: createDesktopRuntimeController({ shell }), started: false };
+    const controller = createDesktopRuntimeController({ shell });
+    slot = {
+      controller,
+      disposeComposerCleanup: bindAuthoritativeComposerCleanup(controller),
+      started: false,
+    };
     holder[RUNTIME_SLOT] = slot;
   }
   return slot.controller;
@@ -47,7 +60,12 @@ export function acquireRuntimeController(
  * not thrown — they are already recorded in the runtime snapshot the shell
  * renders.
  */
-export function startRuntimeController(shell: DesktopShellPort, holder: RuntimeSlotHolder): void {
+export function startRuntimeController(
+  shell: DesktopShellPort,
+  holder: RuntimeSlotHolder,
+  pageTarget: RuntimePageLifecycleTarget | null =
+    typeof window === "undefined" ? null : window,
+): void {
   const controller = acquireRuntimeController(shell, holder);
   const slot = holder[RUNTIME_SLOT];
   if (slot === undefined || slot.started) return;
@@ -55,15 +73,28 @@ export function startRuntimeController(shell: DesktopShellPort, holder: RuntimeS
   void controller.start().catch(() => {
     // Recorded in snapshot.runtimeErrors / startState by the controller.
   });
-  if (typeof window !== "undefined") {
-    window.addEventListener(
-      "pagehide",
-      () => {
-        void controller.stop();
-        delete holder[RUNTIME_SLOT];
-      },
-      { once: true },
-    );
+  if (pageTarget !== null && slot.disposePageLifecycle === undefined) {
+    const onPageHide: EventListener = (event) => {
+      // A persisted page is entering the back/forward cache. Its controller,
+      // shell, subscriptions, and cursor state must survive until pageshow.
+      if (Reflect.get(event, "persisted") === true) return;
+      slot.disposePageLifecycle?.();
+      slot.disposeComposerCleanup();
+      void controller.stop();
+      if (holder[RUNTIME_SLOT] === slot) delete holder[RUNTIME_SLOT];
+    };
+    const onPageShow: EventListener = () => {
+      // Browser-direct connection wake-up is owned by browser-shell-port.
+      // Keeping this listener paired with pagehide documents that persisted
+      // restores intentionally retain the same runtime slot.
+    };
+    slot.disposePageLifecycle = () => {
+      pageTarget.removeEventListener("pagehide", onPageHide);
+      pageTarget.removeEventListener("pageshow", onPageShow);
+      delete slot.disposePageLifecycle;
+    };
+    pageTarget.addEventListener("pagehide", onPageHide);
+    pageTarget.addEventListener("pageshow", onPageShow);
   }
 }
 

@@ -10,6 +10,12 @@ import type {
   ConnectResult,
   DesktopTarget,
   DisconnectResult,
+  LocalProfileAddRequest,
+  LocalProfileListResult,
+  LocalProfileRemoveResult,
+  LocalProfileRequest,
+  LocalProfileResult,
+  LocalProfileUpdateRequest,
   PairRequest,
   PairResult,
   RendererServerFrameEvent,
@@ -26,8 +32,20 @@ import type {
 } from "@t4-code/protocol/desktop-ipc";
 import { createDesktopRuntimeController, type DesktopRuntimeController, type DesktopShellPort } from "../src/desktop-runtime.ts";
 import { redactedMessage } from "../src/desktop-runtime-contracts.ts";
+import {
+  MAX_RETAINED_SESSION_EVENT_BYTES,
+  retainedJsonBytes,
+} from "../src/transcript-retention.ts";
 
 const target = (targetId: string, state: DesktopTarget["state"] = "disconnected"): DesktopTarget => ({ targetId, label: targetId, kind: targetId === "local" ? "local" : "remote", state, paired: true });
+const localProfile = (profileId: string) => ({
+  profileId,
+  label: profileId === "default" ? "Default" : "Fable Swarm",
+  targetId: profileId === "default" ? "local" : `local:${profileId}`,
+  autoStart: profileId === "default",
+  isDefault: profileId === "default",
+  service: { definition: "current" as const, service: "running" as const, diagnostics: "" },
+});
 const remoteTargetRequest = (targetId: string): TargetAddRequest => ({
   target: {
     targetId,
@@ -101,6 +119,30 @@ class FakeShell implements DesktopShellPort {
   async pair(request: PairRequest): Promise<PairResult> { return { targetId: request.targetId, paired: true }; }
   async addTarget(request: TargetAddRequest): Promise<TargetAddResult> { return { target: target(request.target.targetId) }; }
   async removeTarget(request: TargetRequest): Promise<TargetRemoveResult> { return { targetId: request.targetId, removed: true }; }
+  async listProfiles(): Promise<LocalProfileListResult> {
+    return { profiles: [localProfile("default"), localProfile("fable-swarm")] };
+  }
+  async addProfile(request: LocalProfileAddRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profile.profileId) };
+  }
+  async updateProfile(request: LocalProfileUpdateRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profileId) };
+  }
+  async removeProfile(request: LocalProfileRequest): Promise<LocalProfileRemoveResult> {
+    return { profileId: request.profileId, removed: true };
+  }
+  async profileStatus(request: LocalProfileRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profileId) };
+  }
+  async profileStart(request: LocalProfileRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profileId) };
+  }
+  async profileStop(request: LocalProfileRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profileId) };
+  }
+  async profileRestart(request: LocalProfileRequest): Promise<LocalProfileResult> {
+    return { profile: localProfile(request.profileId) };
+  }
   onServerFrame(listener: (event: RendererServerFrameEvent) => void): () => void { this.frames.add(listener); return () => this.frames.delete(listener); }
   onConnectionState(listener: (event: ConnectionStateEvent) => void): () => void { this.states.add(listener); return () => this.states.delete(listener); }
   onRuntimeError(listener: (event: RuntimeErrorEvent) => void): () => void { this.errors.add(listener); return () => this.errors.delete(listener); }
@@ -136,6 +178,20 @@ async function leaseRuntime(
   return { shell, runtime };
 }
 describe("desktop runtime projection", () => {
+  it("keeps the optional profile bridge structurally typed on DesktopShellPort", async () => {
+    const shell: DesktopShellPort = new FakeShell();
+    expect(await shell.listProfiles?.()).toEqual({
+      profiles: [localProfile("default"), localProfile("fable-swarm")],
+    });
+    expect(await shell.profileStart?.({ profileId: "fable-swarm" })).toEqual({
+      profile: localProfile("fable-swarm"),
+    });
+    expect(await shell.removeProfile?.({ profileId: "fable-swarm" })).toEqual({
+      profileId: "fable-swarm",
+      removed: true,
+    });
+  });
+
   it("redacts auth secrets and Linux/macOS home paths at the renderer boundary", () => {
     const safe = redactedMessage(
       [
@@ -200,6 +256,49 @@ describe("desktop runtime projection", () => {
       intent: { hostId: hostId("host-a"), command: "host.watch", args: { cursor: { epoch: "epoch-1", seq: 7 } } },
     });
     expect(runtime.getSnapshot().targetHosts.get("local")).toBe("host-a");
+  });
+  it("keeps post-welcome inventory when connected is reported afterward", async () => {
+    const shell = new FakeShell();
+    shell.emitWelcomeOnBootstrap = {
+      targetId: "local",
+      frame: welcome("host-a", [], []),
+    };
+    shell.connectTarget = async (request: TargetRequest): Promise<ConnectResult> => {
+      shell.emitFrame({
+        targetId: request.targetId,
+        frame: {
+          v: "omp-app/1",
+          type: "sessions",
+          hostId: hostId("host-a"),
+          cursor: { epoch: "epoch-1", seq: 0 },
+          sessions: [
+            {
+              hostId: hostId("host-a"),
+              project: { projectId: "project-a" as never },
+              sessionId: sessionId("session-a"),
+              revision: revision("revision-a"),
+              title: "Session A",
+              status: "idle",
+              updatedAt: "2026-07-15T00:00:00Z",
+            },
+          ],
+          totalCount: 1,
+          truncated: false,
+        },
+      });
+      shell.emitState({ targetId: request.targetId, state: "connected" });
+      return { targetId: request.targetId, state: "connected" };
+    };
+    const runtime = createDesktopRuntimeController({ shell });
+    await runtime.start();
+
+    expect(runtime.getSnapshot().projection.sessionIndexMetadata.get("host-a")).toEqual({
+      totalCount: 1,
+      truncated: false,
+    });
+    shell.emitState({ targetId: "local", state: "disconnected" });
+    expect(runtime.getSnapshot().projection.sessionIndexMetadata.has("host-a")).toBe(false);
+    expect(runtime.getSnapshot().projection.sessionIndex.size).toBe(1);
   });
   it("skips host.watch when session.list is rejected and continues independent bootstrap", async () => {
     const shell = new FakeShell();
@@ -315,6 +414,53 @@ describe("desktop runtime projection", () => {
     shell.emitFrame({ targetId: "one", frame: { v: "omp-app/1", type: "catalog", hostId: hostId("host-two"), revision: revision("revision-1"), items: [] } });
     expect(seen).toEqual(["one", "two"]);
     expect(runtime.getSnapshot().runtimeErrors.at(-1)?.code).toBe("protocol");
+  });
+  it("delivers only a bounded immutable tool event to renderer subscribers", async () => {
+    const shell = new FakeShell();
+    const runtime = createDesktopRuntimeController({ shell });
+    await runtime.start();
+    shell.emitFrame({ targetId: "local", frame: welcome("host-a", [], []) });
+    const received: RendererServerFrameEvent[] = [];
+    runtime.subscribeFrames((event) => {
+      if (event.frame.type === "event") received.push(event);
+    });
+    const rawOutput = `command-head\n${"x".repeat(300_000)}\ncommand-tail`;
+    const rawFrame = {
+      v: "omp-app/1" as const,
+      type: "event" as const,
+      cursor: { epoch: "epoch-1", seq: 1 },
+      hostId: hostId("host-a"),
+      sessionId: sessionId("session-a"),
+      event: {
+        type: "tool.result",
+        callId: "call-large",
+        result: {
+          images: [{ sha256: "c".repeat(64), mimeType: "image/png" }],
+          output: rawOutput,
+        },
+      },
+    };
+
+    shell.emitFrame({ targetId: "local", frame: rawFrame });
+
+    expect(rawFrame.event.result.output).toHaveLength(rawOutput.length);
+    expect(received).toHaveLength(1);
+    const delivered = received[0]?.frame;
+    if (delivered?.type !== "event") throw new Error("expected a retained event frame");
+    expect(Object.isFrozen(delivered)).toBe(true);
+    expect(Object.isFrozen(delivered.event)).toBe(true);
+    expect(retainedJsonBytes(delivered.event)).toBeLessThanOrEqual(
+      MAX_RETAINED_SESSION_EVENT_BYTES,
+    );
+    expect(JSON.stringify(delivered.event)).toContain("retained value truncated");
+    expect(JSON.stringify(delivered.event)).toContain("command-tail");
+    expect(JSON.stringify(delivered.event)).toContain("image/png");
+
+    const projectedEvents = runtime.getSnapshot().projection.sessions.get("host-a\u0000session-a")?.events;
+    expect(projectedEvents).toHaveLength(1);
+    expect(retainedJsonBytes(projectedEvents)).toBeLessThanOrEqual(
+      MAX_RETAINED_SESSION_EVENT_BYTES + 2,
+    );
   });
   it("isolates subscriber failures and blocks late events after stop", async () => {
     const shell = new FakeShell();

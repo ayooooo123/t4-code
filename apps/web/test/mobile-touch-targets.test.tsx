@@ -9,7 +9,10 @@ import {
   RuntimeOptions,
 } from "../src/features/composer/ComposerRuntimeOptions.tsx";
 import { ContextMeter } from "../src/features/composer/ContextMeter.tsx";
-import type { ComposerControlsSnapshot } from "../src/features/session-runtime/session-controls.ts";
+import {
+  thinkingValueLabel,
+  type ComposerControlsSnapshot,
+} from "../src/features/session-runtime/session-controls.ts";
 import { CopyButton } from "../src/features/transcript/Markdown.tsx";
 
 const CONTROLS: ComposerControlsSnapshot = {
@@ -30,10 +33,15 @@ const CONTROLS: ComposerControlsSnapshot = {
   thinkingSupported: true,
   thinkingUnsupportedReason: null,
   thinking: "medium",
+  thinkingEffective: "medium",
+  thinkingResolved: null,
+  thinkingOffFloored: false,
   thinkingLevels: ["medium", "high"],
   fastSupported: true,
   fastUnsupportedReason: null,
   fast: false,
+  fastAvailable: true,
+  fastActive: false,
   modeSupported: true,
   mode: "build",
   attachmentsSupported: true,
@@ -47,16 +55,22 @@ function buttonTags(markup: string): readonly string[] {
 
 describe("phone touch targets", () => {
   it("describes fast mode as provider priority without changing reasoning effort", () => {
-    expect(fastModeTooltip(false)).toBe(
-      "Request provider priority processing when supported; reasoning effort is unchanged",
+    expect(fastModeTooltip({ available: true, enabled: false, active: false })).toBe(
+      "Enable provider priority processing for this model; reasoning effort is unchanged",
     );
-    expect(fastModeTooltip(true)).toBe(
-      "Fast mode requests provider priority processing; reasoning effort is unchanged",
+    expect(fastModeTooltip({ available: true, enabled: true, active: true })).toBe(
+      "Provider priority is active for this model; reasoning effort is unchanged",
     );
+  });
+
+  it("does not invent an effective thinking level for older fixtures", () => {
+    expect(thinkingValueLabel({ thinking: "medium" })).toBe("Medium");
+    expect(thinkingValueLabel({ thinking: "auto" })).toBe("Auto");
   });
 
   it("renders every always-visible composer control at 44 CSS pixels", () => {
     const runOptions = renderToStaticMarkup(
+
       <RunOptionsMenu summary="Fixture model · Medium">
         <span>Options</span>
       </RunOptionsMenu>,
@@ -67,10 +81,12 @@ describe("phone touch targets", () => {
         attachments={[
           {
             id: "attachment-1",
-            kind: "file",
-            mediaType: "text/plain",
-            name: "notes.txt",
+            kind: "image",
+            mediaType: "image/png",
+            name: "proof.png",
             sizeBytes: 12,
+            file: new File(["proof"], "proof.png", { type: "image/png" }),
+            previewUrl: "blob:test/proof.png",
           },
         ]}
         onRemove={() => {}}
@@ -80,6 +96,7 @@ describe("phone touch targets", () => {
     expect(buttonTags(runOptions)[0]).toContain("min-h-11");
     expect(buttonTags(context)[0]).toContain("h-11");
     expect(buttonTags(attachments)[0]).toContain("size-11");
+    expect(attachments).toContain('<img alt="" class="size-4 shrink-0 rounded-sm object-cover"');
   });
 
   it("keeps all compact runtime triggers at 44 CSS pixels", () => {
@@ -133,9 +150,35 @@ describe("phone touch targets", () => {
     expect(session).toContain("flex size-11 shrink-0 cursor-pointer");
     expect(session).toContain("flex min-h-11 w-full cursor-pointer items-center");
     expect(rail).toContain("flex min-h-11 min-w-0 flex-1 items-center");
-    expect(rail).toContain('"size-11 shrink-0 sm:size-6"');
+    // Project-row create actions are labeled `New`, stay 44px on touch, and
+    // announce that the chosen OMP profile owns the session.
+    expect(rail.match(/flex h-11 shrink-0 [^"]*sm:h-6/g)).toHaveLength(2);
+    expect(rail).toContain("choose the OMP profile that will own it");
+    expect(rail).toContain("The OMP profile you choose will own this session.");
+    expect(rail).toContain("aria-label={`New session in ${group.project.name}`}");
+    expect(rail).toContain("Actions for ${group.project.name}");
+    expect(rail).toContain("Only changes this T4 Code client.");
+    expect(rail).toContain("flex size-11 shrink-0 cursor-pointer");
     expect(css).toContain('[data-slot="sheet-popup"]');
     expect(css).toContain('input:not([type="checkbox"]):not([type="radio"])');
     expect(css).toContain("min-height: 2.75rem");
+  });
+
+  it("keeps tool events and agent-tree rows usable at phone widths", () => {
+    const agents = readFileSync(
+      join(import.meta.dirname, "../src/features/panes/AgentsPane.tsx"),
+      "utf8",
+    );
+    const toolCss = readFileSync(
+      join(import.meta.dirname, "../src/features/transcript/tool-render/tool-render.css"),
+      "utf8",
+    );
+
+    expect(agents).toContain("flex min-h-11 cursor-pointer flex-col justify-center");
+    expect(agents).toContain("sm:min-h-0");
+    expect(toolCss).toContain("@media (max-width: 39.999rem)");
+    expect(toolCss).toContain(".tv-render .tv-agent-link,");
+    expect(toolCss).toContain(".tv-render .tv-image-button,");
+    expect(toolCss).toContain("min-height: 2.75rem");
   });
 });

@@ -8,6 +8,24 @@ import { BrowserWebSocketTransport } from "../src/platform/browser-transport.ts"
 
 const originalDocument = globalThis.document;
 const originalWindow = globalThis.window;
+const originalWebSocket = globalThis.WebSocket;
+
+class FakeLifecycleTarget {
+  visibilityState: DocumentVisibilityState = "visible";
+  private readonly listeners = new Map<string, Set<EventListener>>();
+  addEventListener(type: string, listener: EventListener): void {
+    const listeners = this.listeners.get(type) ?? new Set<EventListener>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+  removeEventListener(type: string, listener: EventListener): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+  dispatch(type: string): void {
+    const event = { type } as Event;
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
 
 function setBrowserLocation(search: string): void {
   Object.defineProperty(globalThis, "window", {
@@ -26,6 +44,7 @@ function setBackendScript(payload: string): void {
 afterEach(() => {
   Object.defineProperty(globalThis, "document", { configurable: true, value: originalDocument });
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
+  Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: originalWebSocket });
 });
 
 describe("browser platform boundary", () => {
@@ -99,10 +118,47 @@ describe("browser platform boundary", () => {
     expect(shell.serviceStop).toBeUndefined();
   });
 
+  it("wires coalesced lifecycle wakes to the active client and removes them on disconnect", async () => {
+    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws" }));
+    const windowTarget = new FakeLifecycleTarget();
+    const documentTarget = new FakeLifecycleTarget();
+    let wakes = 0;
+    const fakeClient = {
+      state: "ready",
+      connect: async () => undefined,
+      close: async () => undefined,
+      wake: () => {
+        wakes += 1;
+      },
+      onFrame: () => () => undefined,
+      onState: () => () => undefined,
+      onError: () => () => undefined,
+    };
+    const shell = createBrowserShellPort({
+      clientFactory: () => fakeClient as unknown as OmpClient,
+      lifecycle: { windowTarget, documentTarget },
+    });
+    if (shell === null) return;
+
+    await shell.bootstrap();
+    windowTarget.dispatch("online");
+    windowTarget.dispatch("pageshow");
+    await Promise.resolve();
+    expect(wakes).toBe(1);
+
+    await shell.disconnect({ targetId: "remote" });
+    windowTarget.dispatch("online");
+    await Promise.resolve();
+    expect(wakes).toBe(1);
+  });
+
   it("bounds transport URLs and cleans listeners on close", () => {
     expect(() => new BrowserWebSocketTransport({ url: "https://not-websocket" })).toThrow(
       /invalid browser transport URL/u,
     );
+    expect(
+      () => new BrowserWebSocketTransport({ url: "wss://omp.example/v1/ws", openTimeoutMs: 0 }),
+    ).toThrow(/invalid browser transport open timeout/u);
     const transport = new BrowserWebSocketTransport({ url: "wss://omp.example/v1/ws" });
     const unsubscribeMessage = transport.onMessage(() => undefined);
     const unsubscribeClose = transport.onClose(() => undefined);
@@ -113,6 +169,56 @@ describe("browser platform boundary", () => {
     transport.close();
     expect(() => transport.send("{}")).toThrow(/not connected/u);
   });
+
+  it("bounds a browser WebSocket that never opens", async () => {
+    let socketClosed = false;
+    class StalledWebSocket {
+      static readonly OPEN = 1;
+      readonly readyState = 0;
+      binaryType = "blob";
+      closed = false;
+
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      send(): void {}
+      close(): void {
+        this.closed = true;
+        socketClosed = true;
+      }
+    }
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: StalledWebSocket,
+    });
+    const transport = new BrowserWebSocketTransport({
+      url: "wss://omp.example/v1/ws",
+      openTimeoutMs: 1,
+    });
+    await expect(transport.open()).rejects.toThrow(/connection timed out/u);
+    expect(socketClosed).toBe(true);
+  });
+
+  it("settles an in-flight browser open when the transport closes", async () => {
+    class StalledWebSocket {
+      static readonly OPEN = 1;
+      readonly readyState = 0;
+      binaryType = "blob";
+
+      addEventListener(): void {}
+      removeEventListener(): void {}
+      send(): void {}
+      close(): void {}
+    }
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: StalledWebSocket,
+    });
+    const transport = new BrowserWebSocketTransport({ url: "wss://omp.example/v1/ws" });
+    const opening = transport.open();
+    transport.close();
+    await expect(opening).rejects.toThrow(/closed while opening/u);
+  });
+
   it("maps client results, stores pairing auth, and closes client on disconnect", async () => {
     setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws" }));
     let capturedOptions: OmpClientOptions | undefined;
@@ -173,6 +279,10 @@ describe("browser platform boundary", () => {
     expect(connectCalls).toBe(0);
     await shell.connect({ targetId: "remote" });
     expect(connectCalls).toBe(1);
+    expect(capturedOptions?.requestedFeatures).toContain("prompt.images");
+    expect(capturedOptions?.requestedFeatures).toContain("transcript.images");
+    expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("prompt.images");
+    expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("transcript.images");
     const pair = await shell.pair({ targetId: "remote", code: "123456" });
     expect(pair.paired).toBe(true);
     expect(capturedOptions?.authentication?.()).toEqual({

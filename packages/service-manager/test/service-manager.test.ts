@@ -6,6 +6,8 @@ import {
   ServiceValidationError,
   renderLinuxSystemdDefinition,
   renderMacLaunchAgentDefinition,
+  serviceLabelForProfile,
+  validateProfileId,
   type ServiceFileSystem,
   type ServiceRunner,
   type ServiceRunnerResult,
@@ -69,15 +71,17 @@ describe("extracted rendering contract", () => {
 });
 
 describe("service-manager definitions", () => {
-  it("renders systemd with exact argv semantics, restart, umask, network ordering and logs", () => {
+  it("renders systemd with exact argv semantics, child OOM isolation, restart, umask, network ordering and logs", () => {
     const definitionPath = "/home/alice/.config/systemd/user/dev.oh-my-pi.appserver.service";
     const content = renderLinuxSystemdDefinition(spec);
     expect(definitionPath).toBe("/home/alice/.config/systemd/user/dev.oh-my-pi.appserver.service");
     expect(content).toContain('ExecStart="/opt/omp/bin/omp" "appserver" "serve"');
     expect(content).toContain("Wants=network-online.target");
+    expect(content).toContain("OOMPolicy=continue");
     expect(content).toContain("Restart=on-failure");
     expect(content).toContain("UMask=0077");
     expect(content).toContain("StandardOutput=append:/home/alice/.omp/logs/appserver.log");
+    expect(content).toContain('Environment="OMP_PROFILE=default"');
   });
   it("renders plist as XML-safe ProgramArguments without shell", () => {
     const definitionPath = "/home/alice/Library/LaunchAgents/dev.oh-my-pi.appserver.plist";
@@ -87,6 +91,8 @@ describe("service-manager definitions", () => {
     expect(content).toContain("<string>appserver</string>");
     expect(content).toContain("<string>serve</string>");
     expect(content).toContain("<key>Umask</key><integer>63</integer>");
+    expect(content).toContain("<key>OMP_PROFILE</key>");
+    expect(content).toContain("<string>default</string>");
   });
   it("rejects path, argv, profile, uid and secret-bearing env injection", () => {
     expect(
@@ -96,6 +102,9 @@ describe("service-manager definitions", () => {
           options(new MemoryFs(), new MemoryRunner()),
         ),
     ).toThrow(ServiceValidationError);
+    for (const profileId of ["UPPER", "..", "work.", "con", "lpt9.logs", "a".repeat(65)]) {
+      expect(() => validateProfileId(profileId)).toThrow(ServiceValidationError);
+    }
     expect(
       () =>
         new LinuxSystemdUserManager(
@@ -124,6 +133,37 @@ describe("service-manager definitions", () => {
           uid: -1,
         }),
     ).toThrow(ServiceValidationError);
+  });
+  it("isolates named profiles while preserving the legacy default identity", () => {
+    expect(serviceLabelForProfile("default")).toBe("dev.oh-my-pi.appserver");
+    expect(serviceLabelForProfile("claude-fable")).toBe(
+      "dev.oh-my-pi.appserver.profile.claude-fable",
+    );
+    const named: ServiceSpec = {
+      ...spec,
+      profileId: "claude-fable",
+      logsDirectory: "/home/alice/.omp/logs/claude-fable",
+      environment: { OMP_PROFILE: "claude-fable" },
+    };
+    const linux = new LinuxSystemdUserManager(named, options(new MemoryFs(), new MemoryRunner()));
+    const mac = new MacLaunchAgentManager(named, {
+      ...options(new MemoryFs(), new MemoryRunner()),
+      uid: 501,
+    });
+    expect(linux.label).toBe("dev.oh-my-pi.appserver.profile.claude-fable");
+    expect(linux.definitionPath).toBe(
+      "/home/alice/.config/systemd/user/dev.oh-my-pi.appserver.profile.claude-fable.service",
+    );
+    expect(mac.label).toBe("dev.oh-my-pi.appserver.profile.claude-fable");
+    expect(mac.definitionPath).toBe(
+      "/home/alice/Library/LaunchAgents/dev.oh-my-pi.appserver.profile.claude-fable.plist",
+    );
+    expect(renderLinuxSystemdDefinition(named)).toContain(
+      'Environment="OMP_PROFILE=claude-fable"',
+    );
+    expect(renderMacLaunchAgentDefinition(named)).toContain(
+      "<key>OMP_PROFILE</key>",
+    );
   });
 });
 

@@ -7,7 +7,6 @@ import type { CatalogFrame, CatalogItem, SessionRef, SettingsFrame } from "@t4-c
 
 import {
   isThinkingLevel,
-  THINKING_LEVELS,
   type SessionMode,
   type ThinkingLevel,
 } from "./intents.ts";
@@ -56,16 +55,28 @@ export interface ComposerControlsSnapshot {
   readonly modelChoices: readonly ModelChoice[];
   readonly thinkingSupported: boolean;
   readonly thinkingUnsupportedReason: string | null;
-  /** Current thinking level (session state, else the host default). */
-  readonly thinking: string | null;
+  /** Configured selector: fixed level, Off, or per-prompt Auto. */
+  readonly thinking: ThinkingLevel | null;
+  /** Concrete level currently applied to the model; Auto is never published here. */
+  readonly thinkingEffective: ThinkingLevel | null;
+  /** Auto's classified result for the current turn; null while unresolved/not Auto. */
+  readonly thinkingResolved: ThinkingLevel | null;
+  /** Exact model-aware menu order: Off, Auto, then host-reported concrete efforts. */
   readonly thinkingLevels: readonly ThinkingLevel[];
+  /** Off maps to the provider's minimum rather than disabling reasoning. */
+  readonly thinkingOffFloored: boolean;
   readonly fastSupported: boolean;
   readonly fastUnsupportedReason: string | null;
+  /** The current model family exposes the `/fast` toggle. */
+  readonly fastAvailable: boolean;
+  /** `/fast` is enabled for the current model family. */
   readonly fast: boolean;
+  /** Priority will actually be encoded for the next request. */
+  readonly fastActive: boolean;
   /** No live protocol exists for mode; only the fixture supports it. */
   readonly modeSupported: boolean;
   readonly mode: SessionMode | null;
-  /** No live protocol carries attachments; only the fixture accepts them. */
+  /** The host negotiated the bounded `prompt.images` upload protocol. */
   readonly attachmentsSupported: boolean;
   /** Which control has a command in flight; the UI holds, never lies. */
   readonly pendingControl: PendingControl | null;
@@ -130,8 +141,57 @@ export interface SessionControlState {
   readonly modelSelector: string | null;
   readonly modelDisplayName: string | null;
   readonly modelRole: string | null;
-  readonly thinking: string | null;
+  readonly thinking: ThinkingLevel | null;
+  readonly thinkingEffective: ThinkingLevel | null;
+  readonly thinkingResolved: ThinkingLevel | null;
+  /** Concrete efforts only; Off and Auto are added by the client. */
+  readonly thinkingLevels: readonly ThinkingLevel[] | null;
+  readonly thinkingSupported: boolean | null;
+  readonly thinkingOffFloored: boolean | null;
   readonly fast: boolean | null;
+  readonly fastAvailable: boolean | null;
+  readonly fastActive: boolean | null;
+}
+
+const CONCRETE_THINKING_LEVELS: readonly ThinkingLevel[] = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+function isConcreteThinkingLevel(value: unknown): value is ThinkingLevel {
+  return (
+    typeof value === "string" &&
+    CONCRETE_THINKING_LEVELS.some((level) => level === value)
+  );
+}
+
+/**
+ * New hosts publish the exact concrete ladder for the active model. A
+ * malformed or partial shape is unknown, not permission to guess a global
+ * ladder. Empty is valid for reasoning models with no configurable effort.
+ */
+function readThinkingLevels(value: unknown): readonly ThinkingLevel[] | null {
+  if (!Array.isArray(value)) return null;
+  const levels: ThinkingLevel[] = [];
+  const seen = new Set<ThinkingLevel>();
+  for (const entry of value) {
+    if (!isConcreteThinkingLevel(entry) || seen.has(entry)) return null;
+    seen.add(entry);
+    levels.push(entry);
+  }
+  return levels;
+}
+
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function readEffectiveThinking(value: unknown): ThinkingLevel | null {
+  return value === "off" || isConcreteThinkingLevel(value) ? value : null;
 }
 
 /**
@@ -145,11 +205,18 @@ export function readSessionControlState(ref: SessionRef | undefined): SessionCon
   let modelSelector: string | null = null;
   let modelDisplayName: string | null = null;
   let modelRole: string | null = null;
-  let thinking: string | null = null;
+  let thinking: ThinkingLevel | null = null;
+  let thinkingEffective: ThinkingLevel | null = null;
+  let thinkingResolved: ThinkingLevel | null = null;
+  let thinkingLevels: readonly ThinkingLevel[] | null = null;
+  let thinkingSupported: boolean | null = null;
+  let thinkingOffFloored: boolean | null = null;
   let fast: boolean | null = null;
+  let fastAvailable: boolean | null = null;
+  let fastActive: boolean | null = null;
   if (ref !== undefined) {
     if (typeof ref.model === "string" && ref.model !== "") modelSelector = ref.model;
-    if (typeof ref.thinking === "string" && ref.thinking !== "") thinking = ref.thinking;
+    if (isThinkingLevel(ref.thinking)) thinking = ref.thinking;
     const live = ref.liveState;
     if (isRecord(live)) {
       const model = live.model;
@@ -173,13 +240,35 @@ export function readSessionControlState(ref: SessionRef | undefined): SessionCon
       if (modelRole === null && typeof live.modelRole === "string" && live.modelRole !== "") {
         modelRole = live.modelRole;
       }
-      if (thinking === null && typeof live.thinking === "string" && live.thinking !== "") {
+      if (thinking === null && isThinkingLevel(live.thinking)) {
         thinking = live.thinking;
       }
-      if (typeof live.fast === "boolean") fast = live.fast;
+      thinkingEffective = readEffectiveThinking(live.thinkingEffective);
+      thinkingResolved = isConcreteThinkingLevel(live.thinkingResolved)
+        ? live.thinkingResolved
+        : null;
+      thinkingLevels = readThinkingLevels(live.thinkingLevels);
+      thinkingSupported = readBoolean(live.thinkingSupported);
+      thinkingOffFloored = readBoolean(live.thinkingOffFloored);
+      fast = readBoolean(live.fast);
+      fastAvailable = readBoolean(live.fastAvailable);
+      fastActive = readBoolean(live.fastActive);
     }
   }
-  return { modelSelector, modelDisplayName, modelRole, thinking, fast };
+  return {
+    modelSelector,
+    modelDisplayName,
+    modelRole,
+    thinking,
+    thinkingEffective,
+    thinkingResolved,
+    thinkingLevels,
+    thinkingSupported,
+    thinkingOffFloored,
+    fast,
+    fastAvailable,
+    fastActive,
+  };
 }
 
 // ─── Command support ────────────────────────────────────────────────────────
@@ -359,11 +448,37 @@ export function deriveComposerControls(input: DeriveControlsInput): ComposerCont
 
   const thinkingDefault = settingCurrentValue(settings, "defaultThinkingLevel");
   const thinking =
-    state.thinking ?? (typeof thinkingDefault === "string" && thinkingDefault !== "" ? thinkingDefault : null);
+    state.thinking ?? (isThinkingLevel(thinkingDefault) ? thinkingDefault : null);
 
   const model = commandSupport(catalog, granted, MODEL_SET_COMMAND);
   const think = commandSupport(catalog, granted, THINKING_SET_COMMAND);
   const fast = commandSupport(catalog, granted, FAST_SET_COMMAND);
+
+  const thinkingSupported =
+    think.supported && state.thinkingSupported === true && state.thinkingLevels !== null;
+  const thinkingUnsupportedReason = !think.supported
+    ? think.reason
+    : state.thinkingSupported === false
+      ? "The current model does not support thinking."
+      : state.thinkingSupported !== true || state.thinkingLevels === null
+        ? "This host does not report this model's thinking levels yet."
+        : null;
+  const thinkingLevels: readonly ThinkingLevel[] = thinkingSupported
+    ? ["off", "auto", ...(state.thinkingLevels ?? [])]
+    : [];
+
+  const fastAvailable = state.fastAvailable === true;
+  const fastActive = state.fastActive === true;
+  const fastSupported = fast.supported && fastAvailable;
+  const fastUnsupportedReason = !fast.supported
+    ? fast.reason
+    : state.fastAvailable === null
+      ? "This host does not report Fast support for the current model yet."
+      : !fastAvailable && fastActive
+        ? "Provider priority is active through this model's provider settings."
+        : !fastAvailable
+          ? "Fast mode is unavailable for the current model."
+          : null;
 
   return {
     modelSupported: model.supported,
@@ -371,16 +486,22 @@ export function deriveComposerControls(input: DeriveControlsInput): ComposerCont
     modelLabel: label,
     modelSelectedId: selectedId,
     modelChoices: choices,
-    thinkingSupported: think.supported,
-    thinkingUnsupportedReason: think.reason,
+    thinkingSupported,
+    thinkingUnsupportedReason,
     thinking,
-    thinkingLevels: THINKING_LEVELS,
-    fastSupported: fast.supported,
-    fastUnsupportedReason: fast.reason,
+    thinkingEffective: state.thinkingEffective,
+    thinkingResolved: state.thinkingResolved,
+    thinkingLevels,
+    thinkingOffFloored: state.thinkingOffFloored === true,
+    fastSupported,
+    fastUnsupportedReason,
+    fastAvailable,
     fast: state.fast === true,
+    fastActive,
     modeSupported: false,
     mode: null,
-    attachmentsSupported: false,
+    attachmentsSupported:
+      granted.includes("sessions.prompt") && granted.includes("prompt.images"),
     pendingControl,
     controlError,
   };
@@ -394,7 +515,7 @@ export function thinkingLabel(level: string | null): string {
     case "auto":
       return "Auto";
     case "off":
-      return "Thinking off";
+      return "Off";
     case "minimal":
       return "Minimal";
     case "low":
@@ -408,4 +529,30 @@ export function thinkingLabel(level: string | null): string {
     case "max":
       return "Max";
   }
+}
+
+/** Compact configured/effective truth for the composer trigger and phone summary. */
+export function thinkingValueLabel(
+  controls: Pick<ComposerControlsSnapshot, "thinking"> &
+    Partial<
+      Pick<
+        ComposerControlsSnapshot,
+        "thinkingEffective" | "thinkingResolved" | "thinkingOffFloored"
+      >
+    >,
+): string {
+  const configured = thinkingLabel(controls.thinking);
+  const effective = controls.thinkingEffective ?? null;
+  const resolved = controls.thinkingResolved ?? null;
+  if (controls.thinking === "auto") {
+    return resolved === null ? configured : `${configured} · ${thinkingLabel(resolved)}`;
+  }
+  if (
+    effective !== null &&
+    effective !== controls.thinking &&
+    (controls.thinking !== "off" || controls.thinkingOffFloored === true)
+  ) {
+    return `${configured} · ${thinkingLabel(effective)} active`;
+  }
+  return configured;
 }

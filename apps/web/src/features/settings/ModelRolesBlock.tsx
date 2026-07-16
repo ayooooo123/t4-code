@@ -320,6 +320,7 @@ export function ModelRolesBlock({
                           </>
                         )}
                         <Button
+                          className="px-3"
                           onClick={() => setEditing(editorFor(role, selector, models))}
                           size="xs"
                           variant="outline"

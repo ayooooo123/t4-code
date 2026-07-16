@@ -14,6 +14,7 @@ import type {
   ConfirmRequest,
   ConfirmResult,
   DesktopTarget,
+  LocalProfile,
   RendererServerFrameEvent,
   TargetAddRequest,
 } from "@t4-code/protocol/desktop-ipc";
@@ -31,7 +32,13 @@ import {
   pairCommandForTarget,
   validateTargetDraft,
 } from "../src/features/targets/model.ts";
-import { createTargetsStore, type TargetActionsPort } from "../src/features/targets/targets-store.ts";
+import {
+  createTargetsStore,
+  EMPTY_PROFILE_DRAFT,
+  type ProfilesPort,
+  type TargetActionsPort,
+} from "../src/features/targets/targets-store.ts";
+import { deferred } from "./fake-shell.ts";
 
 const SRC_ROOT = join(import.meta.dirname, "../src");
 
@@ -62,7 +69,11 @@ function settingsFrame(settings: Record<string, unknown>, revision = "rev-1"): S
   } as unknown as SettingsFrame;
 }
 
-function build(items: readonly Record<string, unknown>[], values: Record<string, unknown> = {}, revision = "rev-1") {
+function build(
+  items: readonly Record<string, unknown>[],
+  values: Record<string, unknown> = {},
+  revision = "rev-1",
+) {
   return buildLiveSettingsCatalog({
     catalog: catalogFrame(items),
     settings: settingsFrame(values, revision),
@@ -75,17 +86,71 @@ function build(items: readonly Record<string, unknown>[], values: Record<string,
 describe("live settings catalog adapter", () => {
   it("maps every supported control type onto an editor", () => {
     const { catalog, issues } = build([
-      settingItem("appearance.compact", { label: "Compact", controlType: "boolean", default: false, effective: true, effectiveSource: "global", configured: true, sensitive: false, tab: "appearance" }),
-      settingItem("terminal.scrollback", { label: "Scrollback", controlType: "number", min: 100, max: 100000, default: 10000, effectiveSource: "default", configured: false, sensitive: false, tab: "shell" }),
-      settingItem("appearance.theme", { label: "Theme", controlType: "enum", options: ["dark", "light"], default: "dark", effectiveSource: "default", configured: false, sensitive: false, tab: "appearance" }),
-      settingItem("editor.command", { label: "Editor", controlType: "string", effectiveSource: "default", configured: false, sensitive: false }),
-      settingItem("extensions", { label: "Extensions", controlType: "array", maxItems: 32, effectiveSource: "default", configured: false, sensitive: false, tab: "tools" }),
-      settingItem("modelRoles", { label: "Model roles", controlType: "record", effectiveSource: "default", configured: false, sensitive: false, tab: "model" }),
+      settingItem("appearance.compact", {
+        label: "Compact",
+        controlType: "boolean",
+        default: false,
+        effective: true,
+        effectiveSource: "global",
+        configured: true,
+        sensitive: false,
+        tab: "appearance",
+      }),
+      settingItem("terminal.scrollback", {
+        label: "Scrollback",
+        controlType: "number",
+        min: 100,
+        max: 100000,
+        default: 10000,
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "shell",
+      }),
+      settingItem("appearance.theme", {
+        label: "Theme",
+        controlType: "enum",
+        options: ["dark", "light"],
+        default: "dark",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "appearance",
+      }),
+      settingItem("editor.command", {
+        label: "Editor",
+        controlType: "string",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+      }),
+      settingItem("extensions", {
+        label: "Extensions",
+        controlType: "array",
+        maxItems: 32,
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "tools",
+      }),
+      settingItem("modelRoles", {
+        label: "Model roles",
+        controlType: "record",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "model",
+      }),
     ]);
     expect(issues).toEqual([]);
-    const kinds = ["appearance.compact", "terminal.scrollback", "appearance.theme", "editor.command", "extensions", "modelRoles"].map(
-      (id) => catalog.settings.find((row) => row.id === id)?.control.kind,
-    );
+    const kinds = [
+      "appearance.compact",
+      "terminal.scrollback",
+      "appearance.theme",
+      "editor.command",
+      "extensions",
+      "modelRoles",
+    ].map((id) => catalog.settings.find((row) => row.id === id)?.control.kind);
     expect(kinds).toEqual(["boolean", "number", "enum", "text", "list", "map"]);
     const compact = catalog.settings.find((row) => row.id === "appearance.compact");
     expect(compact?.layers?.global?.value).toBe(true);
@@ -94,24 +159,66 @@ describe("live settings catalog adapter", () => {
 
   it("maps wire provenance onto layers: override→session, configOverlay→cli", () => {
     const { catalog } = build([
-      settingItem("a.session", { label: "A", controlType: "boolean", effective: true, effectiveSource: "override", configured: true, sensitive: false }),
-      settingItem("b.cli", { label: "B", controlType: "boolean", effective: false, effectiveSource: "configOverlay", configured: false, sensitive: false }),
+      settingItem("a.session", {
+        label: "A",
+        controlType: "boolean",
+        effective: true,
+        effectiveSource: "override",
+        configured: true,
+        sensitive: false,
+      }),
+      settingItem("b.cli", {
+        label: "B",
+        controlType: "boolean",
+        effective: false,
+        effectiveSource: "configOverlay",
+        configured: false,
+        sensitive: false,
+      }),
     ]);
-    expect(catalog.settings.find((row) => row.id === "a.session")?.layers?.session?.value).toBe(true);
+    expect(catalog.settings.find((row) => row.id === "a.session")?.layers?.session?.value).toBe(
+      true,
+    );
     expect(catalog.settings.find((row) => row.id === "b.cli")?.layers?.cli?.value).toBe(false);
   });
 
   it("degrades unrecognized metadata, control types, and value sources to read-only rows", () => {
     const { catalog, issues } = build([
-      settingItem("mystery.key", { label: "Mystery", controlType: "boolean", effectiveSource: "default", configured: false, sensitive: false, surprise: 1 }),
-      settingItem("novel.control", { label: "Novel", controlType: "hologram", effectiveSource: "default", configured: false, sensitive: false }),
-      settingItem("weird.source", { label: "Weird", controlType: "boolean", effective: true, effectiveSource: "quantum", configured: true, sensitive: false }),
+      settingItem("mystery.key", {
+        label: "Mystery",
+        controlType: "boolean",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        surprise: 1,
+      }),
+      settingItem("novel.control", {
+        label: "Novel",
+        controlType: "hologram",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+      }),
+      settingItem("weird.source", {
+        label: "Weird",
+        controlType: "boolean",
+        effective: true,
+        effectiveSource: "quantum",
+        configured: true,
+        sensitive: false,
+      }),
     ]);
     // All three stay visible; none is editable; nothing was guessed.
     expect(catalog.settings).toHaveLength(3);
-    expect(catalog.settings.find((row) => row.id === "mystery.key")?.control.kind).toBe("unvalidated-metadata");
-    expect(catalog.settings.find((row) => row.id === "novel.control")?.control.kind).toBe("hologram");
-    expect(catalog.settings.find((row) => row.id === "weird.source")?.control.kind).toBe("unvalidated-metadata");
+    expect(catalog.settings.find((row) => row.id === "mystery.key")?.control.kind).toBe(
+      "unvalidated-metadata",
+    );
+    expect(catalog.settings.find((row) => row.id === "novel.control")?.control.kind).toBe(
+      "hologram",
+    );
+    expect(catalog.settings.find((row) => row.id === "weird.source")?.control.kind).toBe(
+      "unvalidated-metadata",
+    );
     // The unknown control kind needs no adapter issue — the view model
     // renders its unsupported fallback; the other two are metadata refusals.
     expect(issues).toHaveLength(2);
@@ -119,8 +226,20 @@ describe("live settings catalog adapter", () => {
 
   it("shows sensitive settings as configured/unconfigured only, never a value", () => {
     const { catalog } = build([
-      settingItem("providers.apiKey", { label: "API key", controlType: "string", effectiveSource: "global", configured: true, sensitive: true }),
-      settingItem("providers.authToken", { label: "Auth token", controlType: "string", effectiveSource: "default", configured: false, sensitive: true }),
+      settingItem("providers.apiKey", {
+        label: "API key",
+        controlType: "string",
+        effectiveSource: "global",
+        configured: true,
+        sensitive: true,
+      }),
+      settingItem("providers.authToken", {
+        label: "Auth token",
+        controlType: "string",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: true,
+      }),
     ]);
     const set = catalog.settings.find((row) => row.id === "providers.apiKey");
     const missing = catalog.settings.find((row) => row.id === "providers.authToken");
@@ -132,7 +251,14 @@ describe("live settings catalog adapter", () => {
 
   it("refuses a sensitive setting that arrives with a value", () => {
     const { catalog, issues } = build([
-      settingItem("providers.apiKey", { label: "API key", controlType: "string", effective: "sk-oops", effectiveSource: "global", configured: true, sensitive: true }),
+      settingItem("providers.apiKey", {
+        label: "API key",
+        controlType: "string",
+        effective: "sk-oops",
+        effectiveSource: "global",
+        configured: true,
+        sensitive: true,
+      }),
     ]);
     const row = catalog.settings.find((entry) => entry.id === "providers.apiKey");
     expect(row?.control.kind).toBe("unvalidated-metadata");
@@ -142,7 +268,15 @@ describe("live settings catalog adapter", () => {
 
   it("disables platform-unavailable settings with a reason", () => {
     const { catalog } = build([
-      settingItem("power.sleepPrevention", { label: "Keep awake", controlType: "boolean", effectiveSource: "default", configured: false, sensitive: false, platform: "linux", availability: false }),
+      settingItem("power.sleepPrevention", {
+        label: "Keep awake",
+        controlType: "boolean",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        platform: "linux",
+        availability: false,
+      }),
     ]);
     const row = catalog.settings.find((entry) => entry.id === "power.sleepPrevention");
     expect(row?.unavailable?.reason).toBe("Not available on this computer.");
@@ -150,7 +284,15 @@ describe("live settings catalog adapter", () => {
 
   it("groups rows by tab and restricts editable scopes to what the host writes", () => {
     const result = build([
-      settingItem("appearance.compact", { label: "Compact", controlType: "boolean", effectiveSource: "default", configured: false, sensitive: false, tab: "appearance", scopes: ["global", "session"] }),
+      settingItem("appearance.compact", {
+        label: "Compact",
+        controlType: "boolean",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "appearance",
+        scopes: ["global", "session"],
+      }),
     ]);
     expect(result.catalog.sections.map((section) => section.id)).toEqual(["appearance"]);
     expect(result.editableScopes).toEqual(["global", "session"]);
@@ -167,7 +309,15 @@ interface FakeRuntimeOptions {
 }
 
 const BASE_ITEMS = [
-  settingItem("appearance.compact", { label: "Compact", controlType: "boolean", default: false, effectiveSource: "default", configured: false, sensitive: false, tab: "appearance" }),
+  settingItem("appearance.compact", {
+    label: "Compact",
+    controlType: "boolean",
+    default: false,
+    effectiveSource: "default",
+    configured: false,
+    sensitive: false,
+    tab: "appearance",
+  }),
 ];
 
 class FakeRuntime implements LiveSettingsRuntimePort {
@@ -184,7 +334,10 @@ class FakeRuntime implements LiveSettingsRuntimePort {
     this.options = options;
   }
 
-  private snapshotValue(): { catalogs: Map<string, CatalogFrame>; settings: Map<string, SettingsFrame> } {
+  private snapshotValue(): {
+    catalogs: Map<string, CatalogFrame>;
+    settings: Map<string, SettingsFrame>;
+  } {
     return {
       catalogs: new Map([["host-1", catalogFrame(BASE_ITEMS)]]),
       settings: new Map([["host-1", settingsFrame({}, this.revision)]]),
@@ -255,8 +408,13 @@ class FakeRuntime implements LiveSettingsRuntimePort {
       return { targetId: "local", requestId, commandId: `cmd-${this.requestSeq}`, accepted: true };
     }
     if (mode === "ok") this.respond(requestId, true);
-    if (mode === "stale") this.respond(requestId, false, { code: "stale_revision", message: "settings revision conflict" });
-    if (mode === "reject") this.respond(requestId, false, { code: "invalid", message: "unknown setting path: nope" });
+    if (mode === "stale")
+      this.respond(requestId, false, {
+        code: "stale_revision",
+        message: "settings revision conflict",
+      });
+    if (mode === "reject")
+      this.respond(requestId, false, { code: "invalid", message: "unknown setting path: nope" });
     return { targetId: "local", requestId, commandId: `cmd-${this.requestSeq}`, accepted: true };
   }
   private confirmGate: { resolve: () => void } | null = null;
@@ -273,7 +431,10 @@ class FakeRuntime implements LiveSettingsRuntimePort {
   }
 }
 
-function liveStore(runtime: FakeRuntime, onChallenge: () => Promise<"approve" | "deny"> = async () => "approve") {
+function liveStore(
+  runtime: FakeRuntime,
+  onChallenge: () => Promise<"approve" | "deny"> = async () => "approve",
+) {
   const built = build(BASE_ITEMS);
   const controller = createLiveSettingsController({
     runtime,
@@ -315,7 +476,15 @@ describe("live settings.write", () => {
   it("sends reset:true for a cleared layer value", async () => {
     const runtime = new FakeRuntime({ write: "ok" });
     const built = build([
-      settingItem("appearance.compact", { label: "Compact", controlType: "boolean", default: false, effective: true, effectiveSource: "global", configured: true, sensitive: false }),
+      settingItem("appearance.compact", {
+        label: "Compact",
+        controlType: "boolean",
+        default: false,
+        effective: true,
+        effectiveSource: "global",
+        configured: true,
+        sensitive: false,
+      }),
     ]);
     const store = createSettingsStore(
       built.catalog,
@@ -391,13 +560,21 @@ class FakeTargetsPort implements TargetActionsPort {
   }
   async addTarget(request: TargetAddRequest): Promise<DesktopTarget> {
     this.calls.push({ kind: "add", payload: request });
-    return { targetId: request.target.targetId, label: request.target.label, kind: "remote", state: "disconnected", paired: false };
+    return {
+      targetId: request.target.targetId,
+      label: request.target.label,
+      kind: "remote",
+      state: "disconnected",
+      paired: false,
+    };
   }
   async removeTarget(targetId: string): Promise<{ targetId: string; removed: boolean }> {
     this.calls.push({ kind: "remove", payload: targetId });
     return { targetId, removed: true };
   }
-  async connect(targetId: string): Promise<{ targetId: string; state: "connecting" | "connected" }> {
+  async connect(
+    targetId: string,
+  ): Promise<{ targetId: string; state: "connecting" | "connected" }> {
     this.calls.push({ kind: "connect", payload: targetId });
     return { targetId, state: "connecting" };
   }
@@ -441,12 +618,24 @@ describe("target add validation", () => {
     );
     expect(direct.ok).toBe(false);
     const serve = validateTargetDraft(
-      { ...EMPTY_TARGET_DRAFT, label: "X", mode: "serve", address: "http://host.tail.ts.net/", port: "" },
+      {
+        ...EMPTY_TARGET_DRAFT,
+        label: "X",
+        mode: "serve",
+        address: "http://host.tail.ts.net/",
+        port: "",
+      },
       new Set(),
     );
     expect(serve.ok).toBe(false);
     const good = validateTargetDraft(
-      { ...EMPTY_TARGET_DRAFT, label: "X", mode: "serve", address: "https://host.tail.ts.net/", port: "" },
+      {
+        ...EMPTY_TARGET_DRAFT,
+        label: "X",
+        mode: "serve",
+        address: "https://host.tail.ts.net/",
+        port: "",
+      },
       new Set(),
     );
     expect(good.ok).toBe(true);
@@ -475,9 +664,20 @@ describe("pair command", () => {
   });
 
   it("orders capabilities by catalog position no matter the request order", () => {
-    const shuffled = ["config.write", "audit.read", "sessions.prompt", "sessions.read", "sessions.read"];
+    const shuffled = [
+      "config.write",
+      "audit.read",
+      "sessions.prompt",
+      "sessions.read",
+      "sessions.read",
+    ];
     const pair = pairCommandForTarget(shuffled);
-    expect(pair.capabilities).toEqual(["sessions.read", "audit.read", "sessions.prompt", "config.write"]);
+    expect(pair.capabilities).toEqual([
+      "sessions.read",
+      "audit.read",
+      "sessions.prompt",
+      "config.write",
+    ]);
     expect(pair.command).toBe(pairCommandForTarget([...shuffled].reverse()).command);
   });
 
@@ -497,7 +697,13 @@ describe("pair command", () => {
   });
 
   it("never lets non-catalog input reach the command string", () => {
-    const hostile = ["sessions.read", "$(cat /etc/passwd)", "--capability evil", "100.64.0.12", "123456"];
+    const hostile = [
+      "sessions.read",
+      "$(cat /etc/passwd)",
+      "--capability evil",
+      "100.64.0.12",
+      "123456",
+    ];
     const pair = pairCommandForTarget(hostile);
     expect(pair.observeFallback).toBe(false);
     expect(pair.capabilities).toEqual(["sessions.read"]);
@@ -540,7 +746,9 @@ describe("target actions", () => {
   it("adds then connects, recording requested capabilities for the grant diff", async () => {
     const port = new FakeTargetsPort();
     const store = createTargetsStore(port, {});
-    store.getState().setDraft({ ...EMPTY_TARGET_DRAFT, label: "Work Mac", address: "100.64.0.12", port: "4400" });
+    store
+      .getState()
+      .setDraft({ ...EMPTY_TARGET_DRAFT, label: "Work Mac", address: "100.64.0.12", port: "4400" });
     await store.getState().submitAdd();
     expect(port.calls.map((call) => call.kind)).toEqual(["add", "connect"]);
     expect(store.getState().requestedCapabilities["work-mac"]).toContain("sessions.read");
@@ -590,7 +798,11 @@ describe("local service actions", () => {
 
   it("reports a failed action honestly and still re-inspects", async () => {
     const service = {
-      inspect: async () => ({ definition: "current" as const, service: "stopped" as const, diagnostics: "exit 1" }),
+      inspect: async () => ({
+        definition: "current" as const,
+        service: "stopped" as const,
+        diagnostics: "exit 1",
+      }),
       start: async () => {
         throw new Error("unit failed");
       },
@@ -599,6 +811,165 @@ describe("local service actions", () => {
     await store.getState().runServiceAction("start");
     expect(store.getState().service.error).toMatch(/unit failed/);
     expect(store.getState().service.inspection?.service).toBe("stopped");
+  });
+});
+
+// ─── Local profiles ────────────────────────────────────────────────────────
+
+function profile(profileId: string, options: Partial<LocalProfile> = {}): LocalProfile {
+  return {
+    profileId,
+    label: profileId === "default" ? "Default" : "Fable Swarm",
+    targetId: profileId === "default" ? "local" : `local:${profileId}`,
+    autoStart: profileId === "default",
+    isDefault: profileId === "default",
+    service: { definition: "current", service: "stopped", diagnostics: "" },
+    ...options,
+  };
+}
+
+class FakeProfilesPort implements ProfilesPort {
+  readonly calls: Array<{ readonly kind: string; readonly profileId: string }> = [];
+  profiles: LocalProfile[] = [profile("fable-swarm"), profile("default")];
+
+  async list(): Promise<readonly LocalProfile[]> {
+    this.calls.push({ kind: "list", profileId: "" });
+    return this.profiles;
+  }
+  async add(input: {
+    readonly profileId: string;
+    readonly label?: string;
+    readonly autoStart?: boolean;
+  }): Promise<LocalProfile> {
+    this.calls.push({ kind: "add", profileId: input.profileId });
+    const added = profile(input.profileId, {
+      label: input.label ?? input.profileId,
+      autoStart: input.autoStart ?? false,
+    });
+    this.profiles.push(added);
+    return added;
+  }
+  async update(
+    profileId: string,
+    changes: { readonly autoStart?: boolean },
+  ): Promise<LocalProfile> {
+    this.calls.push({ kind: "update", profileId });
+    const current = this.profiles.find((candidate) => candidate.profileId === profileId);
+    if (current === undefined) throw new Error("missing profile");
+    const updated = { ...current, ...changes };
+    this.profiles = this.profiles.map((candidate) =>
+      candidate.profileId === profileId ? updated : candidate,
+    );
+    return updated;
+  }
+  async remove(profileId: string): Promise<{ readonly profileId: string; readonly removed: true }> {
+    this.calls.push({ kind: "remove", profileId });
+    this.profiles = this.profiles.filter((candidate) => candidate.profileId !== profileId);
+    return { profileId, removed: true };
+  }
+  async status(profileId: string): Promise<LocalProfile> {
+    return this.act("status", profileId, "stopped");
+  }
+  async start(profileId: string): Promise<LocalProfile> {
+    return this.act("start", profileId, "running");
+  }
+  async stop(profileId: string): Promise<LocalProfile> {
+    return this.act("stop", profileId, "stopped");
+  }
+  async restart(profileId: string): Promise<LocalProfile> {
+    return this.act("restart", profileId, "running");
+  }
+  private async act(
+    kind: string,
+    profileId: string,
+    service: "running" | "stopped",
+  ): Promise<LocalProfile> {
+    this.calls.push({ kind, profileId });
+    const current = this.profiles.find((candidate) => candidate.profileId === profileId);
+    if (current === undefined) throw new Error("missing profile");
+    const updated = { ...current, service: { ...current.service, service } };
+    this.profiles = this.profiles.map((candidate) =>
+      candidate.profileId === profileId ? updated : candidate,
+    );
+    return updated;
+  }
+}
+
+describe("local profile actions", () => {
+  it("loads real profile truth, keeps default first, and serializes same-profile actions", async () => {
+    const profiles = new FakeProfilesPort();
+    const store = createTargetsStore(new FakeTargetsPort(), {}, profiles);
+    await store.getState().loadProfiles();
+    expect(store.getState().profiles.map((entry) => entry.profileId)).toEqual([
+      "default",
+      "fable-swarm",
+    ]);
+
+    const first = store.getState().runProfileAction("fable-swarm", "start");
+    const duplicate = store.getState().runProfileAction("fable-swarm", "start");
+    await Promise.all([first, duplicate]);
+    expect(profiles.calls.filter((call) => call.kind === "start")).toHaveLength(1);
+    expect(
+      store.getState().profiles.find((entry) => entry.profileId === "fable-swarm")?.service.service,
+    ).toBe("running");
+  });
+
+  it("does not let a stale list response overwrite a newer lifecycle result", async () => {
+    const profiles = new FakeProfilesPort();
+    const store = createTargetsStore(new FakeTargetsPort(), {}, profiles);
+    await store.getState().loadProfiles();
+
+    const stale = profiles.profiles.map((entry) => ({
+      ...entry,
+      service: { ...entry.service, service: "stopped" as const },
+    }));
+    const listGate = deferred<readonly LocalProfile[]>();
+    profiles.list = async () => listGate.promise;
+
+    const refresh = store.getState().loadProfiles();
+    await store.getState().runProfileAction("fable-swarm", "start");
+    listGate.resolve(stale);
+    await refresh;
+
+    expect(
+      store.getState().profiles.find((entry) => entry.profileId === "fable-swarm")?.service.service,
+    ).toBe("running");
+  });
+
+  it("validates IDs locally, registers a profile, and updates automatic startup from backend truth", async () => {
+    const profiles = new FakeProfilesPort();
+    const store = createTargetsStore(new FakeTargetsPort(), {}, profiles);
+    await store.getState().loadProfiles();
+    store.getState().setProfileDraft({ ...EMPTY_PROFILE_DRAFT, profileId: "Bad Profile" });
+    await store.getState().submitProfile();
+    expect(store.getState().profileDraftErrors.profileId).toMatch(/lowercase/);
+    expect(profiles.calls.filter((call) => call.kind === "add")).toHaveLength(0);
+
+    store.getState().setProfileDraft({
+      profileId: "opus-lab",
+      label: "Opus Lab",
+      autoStart: true,
+    });
+    await store.getState().submitProfile();
+    expect(store.getState().profiles.some((entry) => entry.profileId === "opus-lab")).toBe(true);
+    await store.getState().setProfileAutoStart("opus-lab", false);
+    expect(
+      store.getState().profiles.find((entry) => entry.profileId === "opus-lab")?.autoStart,
+    ).toBe(false);
+  });
+
+  it("removes only the T4 registration after confirmation and says profile data remains", async () => {
+    const profiles = new FakeProfilesPort();
+    const store = createTargetsStore(new FakeTargetsPort(), {}, profiles);
+    await store.getState().loadProfiles();
+    store.getState().askRemoveProfile("default");
+    expect(store.getState().removingProfile).toBeNull();
+    store.getState().askRemoveProfile("fable-swarm");
+    await store.getState().confirmRemoveProfile();
+    expect(profiles.calls.filter((call) => call.kind === "remove")).toEqual([
+      { kind: "remove", profileId: "fable-swarm" },
+    ]);
+    expect(store.getState().announcement).toMatch(/profile data was left in place/);
   });
 });
 
@@ -625,7 +996,7 @@ describe("desktop live surfaces stay fixture- and secret-free", () => {
   it("keeps the remove copy on local credential deletion, not device revocation", () => {
     const content = readFileSync(join(SRC_ROOT, "features/targets/TargetsScreen.tsx"), "utf8");
     expect(content).toContain("deletes the credential stored on this computer");
-    expect(content).toContain("still lists this device as paired until you revoke it there");
+    expect(content).toMatch(/still lists this device as paired until you revoke\s+it there/);
   });
 
   it("renders the pair command only through the model helper and keeps the grant diff", () => {

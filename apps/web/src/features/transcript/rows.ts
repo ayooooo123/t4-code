@@ -10,9 +10,16 @@
 // re-derives (or re-renders) the list. `formatElapsed` is the pure formatter
 // those labels share: first paint is a function of (fromIso, nowMs).
 import {
+  collaborationMessageFromEntry,
+  type CollaborationMessage,
+} from "./collaboration-messages.ts";
+import { transcriptImagesFromEntry, type TranscriptImageReference } from "./image-metadata.ts";
+import {
   type ApprovalRequest,
   type AskRequest,
   type DurableEntry,
+  type LiveMessage,
+  type PendingPrompt,
   plainRecord,
   type PlanProposal,
   type ToolCall,
@@ -35,6 +42,8 @@ export type TranscriptRow =
       readonly role: "user" | "assistant";
       readonly text: string;
       readonly reasoning: string;
+      readonly images: readonly TranscriptImageReference[];
+      readonly imageIssue: string | null;
       /** Live rows stream in place; settled rows come from durable entries. */
       readonly live: boolean;
       readonly startedAt: string;
@@ -42,9 +51,15 @@ export type TranscriptRow =
   | {
       readonly id: string;
       readonly kind: "tool-group";
-      readonly calls: readonly ToolCall[];
+      readonly calls: readonly TranscriptToolCall[];
       /** True while any call in the group is still running. */
       readonly running: boolean;
+    }
+  | {
+      readonly id: string;
+      readonly kind: "collaboration";
+      readonly message: CollaborationMessage;
+      readonly timestamp: string;
     }
   | {
       readonly id: string;
@@ -61,8 +76,15 @@ export type TranscriptRow =
   | {
       readonly id: string;
       readonly kind: "working";
-      readonly startedAt: string;
+      /** Null until a sequenced transcript event supplies a real start time. */
+      readonly startedAt: string | null;
+      readonly activity: "working" | "preparing-context";
     };
+
+export interface TranscriptToolCall extends ToolCall {
+  readonly images: readonly TranscriptImageReference[];
+  readonly imageIssue: string | null;
+}
 
 export interface AttentionState {
   readonly approval: ApprovalRequest | null;
@@ -92,8 +114,9 @@ function textOf(data: Record<string, unknown>, key: string): string {
 }
 
 /** Durable tool entries fold into synthetic settled ToolCalls. */
-function toolCallFromEntry(entry: DurableEntry): ToolCall {
+function toolCallFromEntry(entry: DurableEntry): TranscriptToolCall {
   const data = entry.data;
+  const transcriptImages = transcriptImagesFromEntry(entry);
   return {
     callId: entry.id,
     tool: textOf(data, "tool") || "tool",
@@ -104,12 +127,14 @@ function toolCallFromEntry(entry: DurableEntry): ToolCall {
     progress: [],
     result: data.result === undefined || data.result === null ? null : plainRecord(data.result),
     endedAt: entry.timestamp,
+    images: transcriptImages.images,
+    imageIssue: transcriptImages.issue,
   };
 }
 
 function rowsFromEntries(entries: readonly DurableEntry[]): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
-  let pendingTools: ToolCall[] = [];
+  let pendingTools: TranscriptToolCall[] = [];
   let pendingToolGroupId = "";
 
   const flushTools = () => {
@@ -128,13 +153,26 @@ function rowsFromEntries(entries: readonly DurableEntry[]): TranscriptRow[] {
     switch (entry.kind) {
       case "message": {
         flushTools();
+        const collaboration = collaborationMessageFromEntry(entry);
+        if (collaboration !== null) {
+          rows.push({
+            id: entry.id,
+            kind: "collaboration",
+            message: collaboration,
+            timestamp: entry.timestamp,
+          });
+          break;
+        }
         const role = textOf(entry.data, "role") === "user" ? "user" : "assistant";
+        const transcriptImages = transcriptImagesFromEntry(entry);
         rows.push({
           id: entry.id,
           kind: "message",
           role,
           text: textOf(entry.data, "text"),
           reasoning: textOf(entry.data, "reasoning"),
+          images: transcriptImages.images,
+          imageIssue: transcriptImages.issue,
           live: false,
           startedAt: entry.timestamp,
         });
@@ -198,11 +236,60 @@ function rowsFromEntries(entries: readonly DurableEntry[]): TranscriptRow[] {
  * the running turn's live tool group and streaming messages, then transient
  * stream notices, then the working indicator.
  */
-export function deriveTranscriptRows(projection: TranscriptProjection): TranscriptRow[] {
+export interface TranscriptRowsOptions {
+  /** Effective activity may also come from the authoritative session ref. */
+  readonly sessionActive?: boolean;
+  /** Accepted prompt fallbacks carried by SessionRef.liveState across attach. */
+  readonly pendingPrompts?: readonly PendingPrompt[];
+}
+
+function acceptedPromptText(text: string, attachmentCount: number): string {
+  if (text !== "" || attachmentCount === 0) return text;
+  return attachmentCount === 1 ? "Image attached" : `${attachmentCount} images attached`;
+}
+
+function liveMessageRow(message: LiveMessage): TranscriptRow {
+  return {
+    id: message.entryId,
+    kind: "message",
+    role: message.role,
+    text:
+      message.role === "user"
+        ? acceptedPromptText(message.text, message.attachmentCount)
+        : message.text,
+    reasoning: message.reasoning,
+    images: [],
+    imageIssue: null,
+    live: true,
+    startedAt: message.startedAt,
+  };
+}
+
+export function deriveTranscriptRows(
+  projection: TranscriptProjection,
+  options: TranscriptRowsOptions = {},
+): TranscriptRow[] {
   const rows = rowsFromEntries(projection.entries);
 
+  if (projection.historyTruncated) {
+    rows.unshift({
+      id: "notice-history-truncated",
+      kind: "notice",
+      notice: {
+        kind: "history-truncated",
+        id: "history-truncated",
+        message:
+          "Earlier transcript entries are not shown. This app retained the newest history to stay within its memory limit.",
+      },
+    });
+  }
+
   if (projection.toolCalls.size > 0) {
-    const calls = [...projection.toolCalls.values()];
+    const calls: TranscriptToolCall[] = [...projection.toolCalls.values()].map((call) => ({
+      ...call,
+      images: [],
+      imageIssue: null,
+    }));
     rows.push({
       id: "live-tools",
       kind: "tool-group",
@@ -211,30 +298,103 @@ export function deriveTranscriptRows(projection: TranscriptProjection): Transcri
     });
   }
 
-  for (const message of projection.liveMessages.values()) {
-    rows.push({
-      id: message.entryId,
-      kind: "message",
-      role: message.role,
-      text: message.text,
-      reasoning: message.reasoning,
-      live: true,
-      startedAt: message.startedAt,
+  // SessionRef owns accepted-prompt ordering across reconnects. Build that
+  // ordered block with exact live-row substitutions, then merge it into the
+  // existing live stream by sequenced timestamps. Unrelated assistant/live
+  // rows retain their order and an accepted follow-up does not jump above
+  // assistant output that was already visible before it was accepted.
+  const durableMessageIds = new Set(projection.entries.map((entry) => String(entry.id)));
+  const pendingMessageRows: {
+    readonly prompt: PendingPrompt;
+    readonly row: TranscriptRow;
+  }[] = [];
+  const pendingIndexById = new Map<string, number>();
+  for (const pendingPrompt of options.pendingPrompts ?? []) {
+    if (
+      durableMessageIds.has(pendingPrompt.entryId) ||
+      pendingIndexById.has(pendingPrompt.entryId)
+    ) {
+      continue;
+    }
+    const liveMessage = projection.liveMessages.get(pendingPrompt.entryId);
+    pendingIndexById.set(pendingPrompt.entryId, pendingMessageRows.length);
+    pendingMessageRows.push({
+      prompt: pendingPrompt,
+      row:
+        liveMessage !== undefined
+          ? liveMessageRow(liveMessage)
+          : {
+              id: pendingPrompt.entryId,
+              kind: "message",
+              role: "user",
+              text: acceptedPromptText(pendingPrompt.text, pendingPrompt.attachmentCount),
+              reasoning: "",
+              images: [],
+              imageIssue: null,
+              live: true,
+              startedAt: pendingPrompt.at,
+            },
     });
   }
 
+  let pendingCursor = 0;
+  const emitPendingThrough = (lastIndex: number) => {
+    while (pendingCursor <= lastIndex) {
+      const pending = pendingMessageRows[pendingCursor];
+      if (pending === undefined) break;
+      rows.push(pending.row);
+      pendingCursor += 1;
+    }
+  };
+  for (const message of projection.liveMessages.values()) {
+    if (durableMessageIds.has(message.entryId)) continue;
+    const matchingPendingIndex = pendingIndexById.get(message.entryId);
+    const liveStartedMs = Date.parse(message.startedAt);
+    let pendingThrough = pendingCursor - 1;
+    if (Number.isFinite(liveStartedMs)) {
+      while (pendingThrough + 1 < pendingMessageRows.length) {
+        const nextPending = pendingMessageRows[pendingThrough + 1];
+        if (nextPending === undefined || Date.parse(nextPending.prompt.at) >= liveStartedMs) {
+          break;
+        }
+        pendingThrough += 1;
+      }
+    }
+    if (matchingPendingIndex !== undefined) {
+      pendingThrough = Math.max(pendingThrough, matchingPendingIndex);
+    }
+    emitPendingThrough(pendingThrough);
+    if (matchingPendingIndex !== undefined) continue;
+    rows.push(liveMessageRow(message));
+  }
+  emitPendingThrough(pendingMessageRows.length - 1);
+
+  // Recovery health has one owner: SessionMain's top catch-up banner. A gap
+  // row here would repeat the same warning inside role=log and leave the
+  // interruption looking like durable transcript history.
   for (const notice of projection.notices) {
     // Errors surface in the attention stack above the composer, not inline;
-    // everything else reads as an inline stream notice.
-    if (notice.kind === "error") continue;
+    // gaps surface in the transient recovery banner; other notices read as
+    // inline stream provenance.
+    if (notice.kind === "error" || notice.kind === "gap") continue;
     rows.push({ id: `notice-${notice.id}`, kind: "notice", notice });
   }
 
-  if (projection.turnActive && projection.liveMessages.size === 0) {
+  const sessionActive =
+    options.sessionActive ?? (projection.turnActive || projection.contextMaintenance !== null);
+  const assistantStreaming = [...projection.liveMessages.values()].some(
+    (message) => message.role === "assistant",
+  );
+  if (sessionActive && !assistantStreaming) {
     rows.push({
       id: "working",
       kind: "working",
-      startedAt: projection.turnStartedAt ?? new Date(0).toISOString(),
+      startedAt:
+        projection.contextMaintenance?.startedAt ??
+        projection.turnStartedAt ??
+        [...projection.liveMessages.values()].at(-1)?.startedAt ??
+        null,
+      activity: projection.contextMaintenance === null ? "working" : "preparing-context",
     });
   }
 
@@ -270,7 +430,29 @@ export interface StableRowsState {
   readonly result: TranscriptRow[];
 }
 
-function toolCallsEqual(a: ToolCall, b: ToolCall): boolean {
+function imageReferencesEqual(
+  left: readonly TranscriptImageReference[],
+  right: readonly TranscriptImageReference[],
+): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index];
+    const b = right[index];
+    if (
+      a === undefined ||
+      b === undefined ||
+      a.entryId !== b.entryId ||
+      a.sha256 !== b.sha256 ||
+      a.mimeType !== b.mimeType
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function toolCallsEqual(a: TranscriptToolCall, b: TranscriptToolCall): boolean {
   if (a === b) return true;
   if (
     a.callId !== b.callId ||
@@ -281,12 +463,57 @@ function toolCallsEqual(a: ToolCall, b: ToolCall): boolean {
     a.endedAt !== b.endedAt ||
     a.args !== b.args ||
     a.result !== b.result ||
+    a.imageIssue !== b.imageIssue ||
+    !imageReferencesEqual(a.images, b.images) ||
     a.progress.length !== b.progress.length
   ) {
     return false;
   }
   for (let i = 0; i < a.progress.length; i += 1) {
     if (a.progress[i] !== b.progress[i]) return false;
+  }
+  return true;
+}
+
+function collaborationMessagesEqual(a: CollaborationMessage, b: CollaborationMessage): boolean {
+  if (
+    a === b ||
+    (a.variant === b.variant &&
+      a.customType === b.customType &&
+      a.from === b.from &&
+      a.to === b.to &&
+      a.body === b.body &&
+      a.replyTo === b.replyTo &&
+      a.status === b.status &&
+      a.jobs === b.jobs)
+  ) {
+    return true;
+  }
+  if (
+    a.variant !== b.variant ||
+    a.customType !== b.customType ||
+    a.from !== b.from ||
+    a.to !== b.to ||
+    a.body !== b.body ||
+    a.replyTo !== b.replyTo ||
+    a.status !== b.status ||
+    a.jobs.length !== b.jobs.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < a.jobs.length; index += 1) {
+    const left = a.jobs[index];
+    const right = b.jobs[index];
+    if (
+      left === undefined ||
+      right === undefined ||
+      left.id !== right.id ||
+      left.type !== right.type ||
+      left.label !== right.label ||
+      left.durationMs !== right.durationMs
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -300,6 +527,8 @@ function rowsEqual(a: TranscriptRow, b: TranscriptRow): boolean {
         a.role === b.role &&
         a.text === b.text &&
         a.reasoning === b.reasoning &&
+        a.imageIssue === b.imageIssue &&
+        imageReferencesEqual(a.images, b.images) &&
         a.live === b.live &&
         a.startedAt === b.startedAt
       );
@@ -315,6 +544,12 @@ function rowsEqual(a: TranscriptRow, b: TranscriptRow): boolean {
       }
       return true;
     }
+    case "collaboration":
+      return (
+        b.kind === "collaboration" &&
+        a.timestamp === b.timestamp &&
+        collaborationMessagesEqual(a.message, b.message)
+      );
     case "notice": {
       if (b.kind !== "notice") return false;
       if (a.notice === b.notice) return true;
@@ -324,7 +559,7 @@ function rowsEqual(a: TranscriptRow, b: TranscriptRow): boolean {
     case "unknown-entry":
       return b.kind === "unknown-entry" && a.entryKind === b.entryKind && a.data === b.data;
     case "working":
-      return b.kind === "working" && a.startedAt === b.startedAt;
+      return b.kind === "working" && a.startedAt === b.startedAt && a.activity === b.activity;
   }
 }
 

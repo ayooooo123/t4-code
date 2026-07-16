@@ -9,6 +9,7 @@ import {
   EmptyHeader,
   EmptyTitle,
 } from "@t4-code/ui";
+import type { DesktopShellPort } from "@t4-code/client";
 import {
   createHashHistory,
   createRootRoute,
@@ -26,7 +27,12 @@ import { SessionScreen } from "./components/SessionScreen.tsx";
 import { SettingsWorkspace } from "./features/settings/index.ts";
 import { LiveSettingsScreen } from "./features/settings/LiveSettingsScreen.tsx";
 import { TargetsScreen } from "./features/targets/TargetsScreen.tsx";
-import { createTargetsStore, type TargetsStoreApi } from "./features/targets/targets-store.ts";
+import { UsageScreen } from "./features/usage/index.ts";
+import {
+  createTargetsStore,
+  type ProfilesPort,
+  type TargetsStoreApi,
+} from "./features/targets/targets-store.ts";
 import {
   applySessionRoutePendingGrace,
   createSessionRoutePendingGrace,
@@ -223,6 +229,41 @@ const settingsRoute = createRoute({
 // One targets store per window; action state survives route changes.
 let targetsStoreInstance: TargetsStoreApi | null = null;
 
+function profilesPort(shell: DesktopShellPort | null): ProfilesPort | undefined {
+  if (shell === null) return undefined;
+  const {
+    listProfiles,
+    addProfile,
+    updateProfile,
+    removeProfile,
+    profileStatus,
+    profileStart,
+    profileStop,
+    profileRestart,
+  } = shell;
+  if (
+    listProfiles === undefined ||
+    addProfile === undefined ||
+    updateProfile === undefined ||
+    removeProfile === undefined ||
+    profileStatus === undefined ||
+    profileStart === undefined ||
+    profileStop === undefined ||
+    profileRestart === undefined
+  )
+    return undefined;
+  return {
+    list: async () => (await listProfiles()).profiles,
+    add: async (profile) => (await addProfile({ profile })).profile,
+    update: async (profileId, changes) => (await updateProfile({ profileId, changes })).profile,
+    remove: (profileId) => removeProfile({ profileId }),
+    status: async (profileId) => (await profileStatus({ profileId })).profile,
+    start: async (profileId) => (await profileStart({ profileId })).profile,
+    stop: async (profileId) => (await profileStop({ profileId })).profile,
+    restart: async (profileId) => (await profileRestart({ profileId })).profile,
+  };
+}
+
 function HostsRoute() {
   const navigate = useNavigate();
   const controller = desktopRuntime();
@@ -242,20 +283,26 @@ function HostsRoute() {
     );
   }
   const shell = rendererPlatform.shell;
+  const localProfiles = profilesPort(shell);
   if (targetsStoreInstance === null) {
-    targetsStoreInstance = createTargetsStore(controller, {
-      ...(shell?.serviceInspect === undefined ? {} : { inspect: shell.serviceInspect }),
-      ...(shell?.serviceInstall === undefined ? {} : { install: shell.serviceInstall }),
-      ...(shell?.serviceStart === undefined ? {} : { start: shell.serviceStart }),
-      ...(shell?.serviceStop === undefined ? {} : { stop: shell.serviceStop }),
-      ...(shell?.serviceRestart === undefined ? {} : { restart: shell.serviceRestart }),
-    });
+    targetsStoreInstance = createTargetsStore(
+      controller,
+      {
+        ...(shell?.serviceInspect === undefined ? {} : { inspect: shell.serviceInspect }),
+        ...(shell?.serviceInstall === undefined ? {} : { install: shell.serviceInstall }),
+        ...(shell?.serviceStart === undefined ? {} : { start: shell.serviceStart }),
+        ...(shell?.serviceStop === undefined ? {} : { stop: shell.serviceStop }),
+        ...(shell?.serviceRestart === undefined ? {} : { restart: shell.serviceRestart }),
+      },
+      localProfiles,
+    );
   }
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TargetsScreen
         api={targetsStoreInstance}
         onBack={() => void navigate({ to: "/settings" })}
+        profilesAvailable={localProfiles !== undefined}
         serviceAvailable={shell?.serviceInspect !== undefined}
         snapshot={snapshot}
       />
@@ -269,7 +316,30 @@ const hostsRoute = createRoute({
   component: HostsRoute,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, sessionRoute, settingsRoute, hostsRoute]);
+function UsageRoute() {
+  const navigate = useNavigate();
+  return (
+    <UsageScreen
+      controller={desktopRuntime()}
+      onBack={() => void navigate({ to: "/" })}
+      onOpenHosts={() => void navigate({ to: "/hosts" })}
+    />
+  );
+}
+
+const usageRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/usage",
+  component: UsageRoute,
+});
+
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  sessionRoute,
+  settingsRoute,
+  hostsRoute,
+  usageRoute,
+]);
 
 export const router = createRouter({
   routeTree,

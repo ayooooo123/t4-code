@@ -6,6 +6,8 @@
 import {
   initialProjection,
   reduceTranscript,
+  transcriptIsActive,
+  type PendingPrompt,
   type TranscriptFrame,
   type TranscriptProjection,
 } from "../transcript/projection.ts";
@@ -25,6 +27,11 @@ import {
   type ThinkingLevel,
 } from "./intents.ts";
 import type { ComposerControlsSnapshot } from "./session-controls.ts";
+import {
+  createTranscriptImageSource,
+  TRANSCRIPT_IMAGE_FIXTURE_REASON,
+  type TranscriptImageSource,
+} from "./transcript-images.ts";
 
 /** How current this session's connection is; mirrors shell freshness. */
 export type SessionLink = "live" | "cached" | "offline";
@@ -32,6 +39,10 @@ export type SessionLink = "live" | "cached" | "offline";
 export interface SessionRuntimeSnapshot {
   readonly projection: TranscriptProjection;
   readonly link: SessionLink;
+  /** One activity truth for rendering and all composer behavior. */
+  readonly sessionActive: boolean;
+  /** Accepted user prompts recovered from authoritative session-ref state. */
+  readonly pendingPrompts: readonly PendingPrompt[];
   /** Commands this connection may send; gates composer affordances. */
   readonly canPrompt: boolean;
   readonly canCancel: boolean;
@@ -63,6 +74,8 @@ export type PromptOutcome =
   | { readonly kind: "unknown"; readonly reason: string };
 
 export interface SessionRuntime {
+  /** Bounded, metadata-authorized reads for durable transcript images. */
+  readonly transcriptImages: TranscriptImageSource;
   getSnapshot(): SessionRuntimeSnapshot;
   subscribe(listener: () => void): () => void;
   dispatch(intent: SessionIntent): void;
@@ -109,6 +122,10 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
   const pendingTicks: TranscriptFrame[][] = [];
   let timer: ReturnType<typeof setInterval> | null = null;
   let paused = false;
+  const transcriptImages = createTranscriptImageSource({
+    availability: { available: false, reason: TRANSCRIPT_IMAGE_FIXTURE_REASON },
+    readChunk: async () => ({ accepted: false }),
+  });
 
   const notify = () => {
     snapshot = null;
@@ -125,7 +142,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
   };
 
   const drainQueuedFollowUps = () => {
-    if (projection.turnActive || queuedFollowUps.length === 0) return;
+    if (transcriptIsActive(projection) || queuedFollowUps.length === 0) return;
     const [head, ...rest] = queuedFollowUps;
     queuedFollowUps = rest;
     if (head !== undefined) {
@@ -141,7 +158,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
     timer = setInterval(() => {
       const batch = pendingTicks.shift();
       if (batch !== undefined) applyFrames(batch);
-      if (!projection.turnActive) drainQueuedFollowUps();
+      if (!transcriptIsActive(projection)) drainQueuedFollowUps();
       if (pendingTicks.length === 0 && timer !== null) {
         clearInterval(timer);
         timer = null;
@@ -156,8 +173,10 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
   ensureTimer();
 
   return {
+    transcriptImages,
     getSnapshot() {
       if (snapshot === null) {
+        const sessionActive = transcriptIsActive(projection);
         const controls: ComposerControlsSnapshot = {
           modelSupported: link === "live",
           modelUnsupportedReason: link === "live" ? null : "This session is read-only right now.",
@@ -165,12 +184,19 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
           modelSelectedId: model?.id ?? null,
           modelChoices: script.modelChoices,
           thinkingSupported: link === "live",
-          thinkingUnsupportedReason: link === "live" ? null : "This session is read-only right now.",
+          thinkingUnsupportedReason:
+            link === "live" ? null : "This session is read-only right now.",
           thinking,
+          thinkingEffective:
+            thinking === "auto" ? "medium" : thinking === "off" ? "minimal" : thinking,
+          thinkingResolved: thinking === "auto" ? "medium" : null,
+          thinkingOffFloored: thinking === "off",
           thinkingLevels: THINKING_LEVELS,
           fastSupported: link === "live",
           fastUnsupportedReason: link === "live" ? null : "This session is read-only right now.",
           fast,
+          fastAvailable: true,
+          fastActive: fast,
           modeSupported: link === "live",
           mode,
           attachmentsSupported: true,
@@ -180,8 +206,10 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
         snapshot = {
           projection,
           link,
+          sessionActive,
+          pendingPrompts: [],
           canPrompt: link === "live",
-          canCancel: link === "live" && projection.turnActive,
+          canCancel: link === "live" && sessionActive,
           cancelDisabledReason: null,
           slashCommands: null,
           contextUsedTokens: script.contextUsedTokens,
@@ -225,7 +253,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
         return;
       }
       if (intent.kind === "followUp") {
-        if (projection.turnActive) {
+        if (transcriptIsActive(projection)) {
           queuedFollowUps = [...queuedFollowUps, intent.text];
           notify();
           return;
@@ -251,6 +279,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
     },
     pause() {
       paused = true;
+      transcriptImages.pause();
       if (timer !== null) {
         clearInterval(timer);
         timer = null;
@@ -258,6 +287,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
     },
     resume() {
       paused = false;
+      transcriptImages.resume();
       ensureTimer();
     },
     dispose() {
@@ -266,6 +296,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
         clearInterval(timer);
         timer = null;
       }
+      transcriptImages.dispose();
       listeners.clear();
     },
   };

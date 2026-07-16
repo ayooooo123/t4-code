@@ -24,12 +24,12 @@ const FEATURES: readonly Feature[] = [
     body: "Up to 8 recent sessions stay warm in the background. Live output keeps applying while you are elsewhere, so switching back is instant, with drafts, scroll, and panels intact.",
   },
   {
-    title: "Agents stay legible",
-    body: "When a session fans work out to agents, the agents pane shows each one as it runs. Cancel one when you need to; the host confirms every action.",
+    title: "One machine, many profiles",
+    body: "T4 Code finds the named OMP profiles on your machine and runs a separate app server for each. Start, stop, or restart a profile from the app; each keeps its own sessions and logs.",
   },
   {
-    title: "Terminals, files, review",
-    body: "Attach to real terminals on the host, browse project files, and apply reviewed diffs. No terminal scraping; everything goes through the host's protocol.",
+    title: "Agents, terminals, review",
+    body: "Watch the agents a session spawns and cancel one when you need to. Attach to real terminals, browse project files, and apply reviewed diffs. No terminal scraping; everything goes through the host's protocol.",
   },
   {
     title: "Remote hosts, paired once",
@@ -37,11 +37,11 @@ const FEATURES: readonly Feature[] = [
   },
   {
     title: "Model, thinking, fast",
-    body: "Change a running session's model, thinking effort, or fast mode from the composer. If the host declines, the session keeps its value and the app says so.",
+    body: "Change a running session's model, thinking effort, or fast mode from the composer. The thinking menu lists only the levels the current model supports, as the host reports them; if the host declines a change, the session keeps its value.",
   },
   {
     title: "OMP owns the truth",
-    body: "Oh My Pi is the runtime and settings authority. T4 Code renders what the host reports and marks unconfirmed state as unconfirmed. It never guesses.",
+    body: "Oh My Pi is the runtime and settings authority. Settings, account usage, and broker status are read per host and shown redacted. T4 Code renders what the host reports; it never guesses.",
   },
 ];
 

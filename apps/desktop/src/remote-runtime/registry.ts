@@ -54,7 +54,15 @@ function hasControlCharacter(value: string): boolean {
 function record(value: unknown): UnknownRecord { if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid persisted remote state"); return value as UnknownRecord; }
 function exactKeys(value: UnknownRecord, keys: readonly string[]): void { const allowed = new Set(keys); if (Object.keys(value).some((key) => !allowed.has(key))) throw new Error("invalid persisted remote state"); }
 function requiredText(value: unknown, name: string, max = 256): string { if (typeof value !== "string" || value.length === 0 || value.length > max || hasControlCharacter(value)) throw new Error(`invalid ${name}`); return value; }
-function targetId(value: unknown): string { if (typeof value !== "string" || !OPAQUE_ID.test(value)) throw new Error("invalid remote target id"); return value; }
+function targetId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    !OPAQUE_ID.test(value) ||
+    value === "local" ||
+    value.startsWith("local:")
+  ) throw new Error("invalid remote target id");
+  return value;
+}
 function label(value: unknown): string { if (typeof value !== "string" || !value.trim() || value.trim().length > 128 || hasControlCharacter(value.trim())) throw new Error("invalid remote target label"); return value.trim(); }
 function port(value: unknown): number { if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) throw new Error("invalid remote port"); return value; }
 function capabilities(value: unknown): readonly DeviceCapability[] { if (!Array.isArray(value)) throw new Error("invalid capabilities"); return value.map((item) => { if (typeof item !== "string" || !isCapability(item) || !DEVICE_CAPABILITIES.includes(item)) throw new Error("invalid capability"); return item; }); }

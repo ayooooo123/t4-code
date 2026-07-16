@@ -7,6 +7,12 @@ import type { CredentialEntry, CredentialVault, PairedHostRecord, TargetRegistry
 import type { CredentialCiphertextStore, RemoteTargetRecord, RemoteTargetStore, SafeStorageAdapter } from "./remote-runtime/index.ts";
 import type { PeerPairingMaterial, PeerPairingStore } from "./peer-share.ts";
 import type { WorkspaceRootsRecord, WorkspaceRootsStore } from "./workspace-roots.ts";
+import {
+  DEFAULT_LOCAL_PROFILE,
+  decodeLocalProfileState,
+  type LocalProfileRegistryState,
+  type LocalProfileStore,
+} from "./local-profiles.ts";
 
 export interface DeviceIdentity {
   readonly deviceId: string;
@@ -203,7 +209,31 @@ export class ElectronWorkspaceRootsStore implements WorkspaceRootsStore {
   async load(): Promise<unknown> { return this.store.get("record") ?? null; }
   async save(value: WorkspaceRootsRecord): Promise<void> { this.store.set("record", value); }
 }
-
+export class ElectronLocalProfileStore implements LocalProfileStore {
+  private readonly store: ElectronStore<LocalProfileRegistryState>;
+  private readonly writeQueue = { tail: Promise.resolve() };
+  constructor(
+    store = new ElectronStore<LocalProfileRegistryState>({
+      name: "local-profile-registry",
+      defaults: {
+        version: 1,
+        records: [DEFAULT_LOCAL_PROFILE],
+        ignoredProfileIds: [],
+      },
+    }),
+  ) {
+    this.store = store;
+  }
+  read(): unknown { return this.store.store; }
+  write(value: LocalProfileRegistryState): Promise<void> {
+    return enqueueWrite(this.writeQueue, () => {
+      const state = decodeLocalProfileState(value);
+      this.store.set("version", state.version);
+      this.store.set("records", state.records);
+      this.store.set("ignoredProfileIds", state.ignoredProfileIds);
+    });
+  }
+}
 export const electronSafeStorage: SafeStorageAdapter = {
   isEncryptionAvailable: () => {
     try {

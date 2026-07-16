@@ -4,6 +4,7 @@ import { Brain, Hammer, Zap } from "lucide-react";
 import { isSessionMode, isThinkingLevel, type SessionIntent } from "../session-runtime/intents.ts";
 import {
   thinkingLabel,
+  thinkingValueLabel,
   type ComposerControlsSnapshot,
 } from "../session-runtime/session-controls.ts";
 import { ControlMenu } from "./ComposerControls.tsx";
@@ -21,10 +22,60 @@ const MODE_DETAIL: Record<string, string | null> = {
 };
 const SESSION_MODES = ["build", "plan", "readOnly"] as const;
 
-export function fastModeTooltip(enabled: boolean): string {
-  return enabled
-    ? "Fast mode requests provider priority processing; reasoning effort is unchanged"
-    : "Request provider priority processing when supported; reasoning effort is unchanged";
+export interface FastModeDisplayState {
+  readonly available: boolean;
+  readonly enabled: boolean;
+  readonly active: boolean;
+}
+
+export function fastModeTooltip(state: FastModeDisplayState): string {
+  if (state.active && !state.enabled) {
+    return "Provider priority is active through this model's provider settings; reasoning effort is unchanged";
+  }
+  if (state.enabled && state.active) {
+    return "Provider priority is active for this model; reasoning effort is unchanged";
+  }
+  if (state.enabled) {
+    return "Fast mode is enabled, but this route is not applying provider priority; reasoning effort is unchanged";
+  }
+  if (state.available) {
+    return "Enable provider priority processing for this model; reasoning effort is unchanged";
+  }
+  return "Provider priority is unavailable for this model; reasoning effort is unchanged";
+}
+
+function fastModeAriaLabel(state: FastModeDisplayState): string {
+  if (state.active && !state.enabled) {
+    return "Provider priority active through provider settings";
+  }
+  if (state.enabled && state.active) return "Fast mode on; provider priority active";
+  if (state.enabled) return "Fast mode on; provider priority inactive on this route";
+  return "Fast mode off";
+}
+
+function thinkingChoiceDetail(
+  level: string,
+  controls: ComposerControlsSnapshot,
+): string | null {
+  if (level === "auto") {
+    if (controls.thinking !== "auto") return "Chooses a level for each prompt";
+    return controls.thinkingResolved === null
+      ? "Chooses per prompt; this turn is not classified yet"
+      : `This turn: ${thinkingLabel(controls.thinkingResolved)}`;
+  }
+  if (level === "off") {
+    return controls.thinkingOffFloored
+      ? "Uses this provider's minimum reasoning level"
+      : "Disables reasoning when the provider supports it";
+  }
+  if (
+    level === controls.thinking &&
+    controls.thinkingEffective !== null &&
+    controls.thinkingEffective !== level
+  ) {
+    return `Effective: ${thinkingLabel(controls.thinkingEffective)}`;
+  }
+  return null;
 }
 
 export function RuntimeOptions({
@@ -70,7 +121,7 @@ export function RuntimeOptions({
         choices={controls.thinkingLevels.map((level) => ({
           id: level,
           label: thinkingLabel(level),
-          detail: null,
+          detail: thinkingChoiceDetail(level, controls),
           disabledReason: controls.thinkingSupported ? null : controls.thinkingUnsupportedReason,
         }))}
         className={controlClassName}
@@ -82,7 +133,7 @@ export function RuntimeOptions({
           if (isThinkingLevel(id)) onIntent({ kind: "setThinking", level: id });
         }}
         value={controls.thinking ?? ""}
-        valueLabel={thinkingLabel(controls.thinking)}
+        valueLabel={thinkingValueLabel(controls)}
       />
       <Tooltip>
         <TooltipTrigger
@@ -90,11 +141,18 @@ export function RuntimeOptions({
             <button
               aria-busy={controls.pendingControl === "fast" || undefined}
               aria-disabled={!controls.fastSupported || undefined}
-              aria-label={controls.fast ? "Fast mode on" : "Fast mode off"}
+              aria-label={fastModeAriaLabel({
+                available: controls.fastAvailable,
+                enabled: controls.fast,
+                active: controls.fastActive,
+              })}
               aria-pressed={controls.fast}
               className={cn(
                 "flex h-7 cursor-pointer items-center gap-1 rounded-md px-1.5 text-muted-foreground text-xs outline-none transition-colors duration-(--motion-duration-fast) hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-64",
-                controls.fast && "text-accent-text hover:text-accent-text",
+                controls.fast &&
+                  !controls.fastActive &&
+                  "text-warning-foreground hover:text-warning-foreground",
+                controls.fastActive && "text-accent-text hover:text-accent-text",
                 !controls.fastSupported &&
                   "cursor-default opacity-64 hover:bg-transparent hover:text-muted-foreground",
                 controls.pendingControl === "fast" && "animate-pulse motion-reduce:animate-none",
@@ -116,7 +174,11 @@ export function RuntimeOptions({
         <TooltipPopup side="top">
           {!controls.fastSupported
             ? (controls.fastUnsupportedReason ?? "Not offered by this host")
-            : fastModeTooltip(controls.fast)}
+            : fastModeTooltip({
+                available: controls.fastAvailable,
+                enabled: controls.fast,
+                active: controls.fastActive,
+              })}
         </TooltipPopup>
       </Tooltip>
       {controls.modeSupported && controls.mode !== null && (

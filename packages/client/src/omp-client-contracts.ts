@@ -63,11 +63,16 @@ export interface OmpClientOptions {
   transport: OmpTransportFactory;
   hostId?: string; expectedHostId?: string;
   client?: { name: string; version: string; build: string; platform: string };
-  requestedFeatures?: readonly string[]; requiredFeatures?: readonly string[]; capabilities?: readonly string[];
+  requestedFeatures?: readonly string[];
+  /** One-shot fallback for hosts that reject a hello containing newer additive features. */
+  compatibilityRequestedFeatures?: readonly string[];
+  requiredFeatures?: readonly string[]; capabilities?: readonly string[];
   authentication?: () => { deviceId: string; deviceToken: string } | undefined;
   cursorStore?: CursorStore; projection?: ProjectionStore; clock?: Clock; timers?: TimerScheduler; ids?: IdFactory;
   random?: () => number; reconnect?: { baseMs?: number; maxMs?: number; attemptCap?: number };
   heartbeat?: { intervalMs?: number; timeoutMs?: number }; handshakeTimeoutMs?: number; commandTimeoutMs?: number;
+  /** Maximum inbound-idle time before a foreground wake replaces a possibly stale socket. */
+  wakeStaleAfterMs?: number;
   maxPending?: number; privilegedPairResult?: (result: PairOkFrame) => void | Promise<void>;
 }
 export interface OmpStateSnapshot {

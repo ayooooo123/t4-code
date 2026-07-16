@@ -86,6 +86,16 @@ export function normalizeNativeAllowedOrigins(value = CAPACITOR_NATIVE_ORIGINS) 
   return [...CAPACITOR_NATIVE_ORIGINS];
 }
 
+export function normalizeDeploymentIdentity(value) {
+  const identity = requiredText(value, "T4_DEPLOYMENT_IDENTITY", 80);
+  if (!/^sha256:[0-9a-f]{64}$/u.test(identity)) {
+    throw new Error(
+      "T4_DEPLOYMENT_IDENTITY must be sha256 followed by exactly 64 lowercase hexadecimal characters",
+    );
+  }
+  return identity;
+}
+
 export function websocketUrlForOrigin(origin) {
   const url = new URL("/v1/ws", normalizeAllowedOrigin(origin));
   url.protocol = "wss:";
@@ -141,7 +151,7 @@ function gatewayCsp(allowedOrigin) {
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
     "font-src 'self' data:",
-    "img-src 'self' data:",
+    "img-src 'self' data: blob:",
     `connect-src 'self' ${websocketOrigin}`,
     "object-src 'none'",
     "base-uri 'none'",
@@ -258,9 +268,17 @@ async function sendStatic(request, response, webRoot, path) {
   }
 }
 
+function guardSocketErrors(socket) {
+  // Upgrade sockets can reset before ws installs its listeners or outlive
+  // those listeners during close races. Keep one terminal listener attached
+  // for the full connection lifetime.
+  socket.on("error", () => socket.destroy());
+  return socket;
+}
+
 function rejectUpgrade(socket, status, message) {
   const body = `${message}\n`;
-  socket.end(
+  guardSocketErrors(socket).end(
     `HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
   );
 }
@@ -279,7 +297,7 @@ function bridgeBrowser(browser, options, activeBrowsers) {
   const upstream = new WebSocket("ws://omp.local/ws", {
     perMessageDeflate: false,
     maxPayload: MAX_FRAME_BYTES,
-    createConnection: () => connectSocket({ path: options.resolvedAppSocket }),
+    createConnection: () => guardSocketErrors(connectSocket({ path: options.resolvedAppSocket })),
   });
 
   const finish = (code = 1011, reason = "gateway connection closed") => {
@@ -331,6 +349,8 @@ function bridgeBrowser(browser, options, activeBrowsers) {
 }
 
 export async function startTailnetGateway(input) {
+  const resolveSocket = input.resolveAppSocket ?? resolveAppSocket;
+  if (typeof resolveSocket !== "function") throw new Error("appserver socket resolver is invalid");
   const options = {
     webRoot: resolve(requiredText(input.webRoot, "web root", 4_096)),
     appSocket: resolve(requiredText(input.appSocket, "appserver socket", 4_096)),
@@ -339,7 +359,9 @@ export async function startTailnetGateway(input) {
     allowedOrigin: normalizeAllowedOrigin(input.allowedOrigin),
     nativeAllowedOrigins: normalizeNativeAllowedOrigins(input.nativeAllowedOrigins),
     label: input.label ?? "OMP on this Tailnet host",
+    deploymentIdentity: normalizeDeploymentIdentity(input.deploymentIdentity),
     heartbeatIntervalMs: input.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+    resolveAppSocket: resolveSocket,
   };
   if (!LOOPBACK_HOSTS.has(options.listenHost)) throw new Error("Tailnet gateway must listen on loopback");
   if (!Number.isSafeInteger(options.listenPort) || options.listenPort < 0 || options.listenPort > 65_535) {
@@ -364,7 +386,7 @@ export async function startTailnetGateway(input) {
       if (pathname === "/healthz") {
         const [web, resolvedAppSocket] = await Promise.all([
           webRootReady(options.webRoot),
-          resolveAppSocket(options.appSocket),
+          options.resolveAppSocket(options.appSocket),
         ]);
         const upstream = resolvedAppSocket !== undefined;
         const healthy = web && upstream;
@@ -374,6 +396,7 @@ export async function startTailnetGateway(input) {
           upstream,
           activeSessions: activeBrowsers.size,
           transport: "local-unix",
+          deploymentIdentity: options.deploymentIdentity,
         });
         response.setHeader("Cache-Control", "no-store");
         replyText(response, healthy ? 200 : 503, "application/json; charset=utf-8", body, request.method === "HEAD");
@@ -399,6 +422,7 @@ export async function startTailnetGateway(input) {
   });
 
   server.on("upgrade", (request, socket, head) => {
+    guardSocketErrors(socket);
     if (requestPath(request.url) !== "/v1/ws") {
       rejectUpgrade(socket, "404 Not Found", "Not found");
       return;
@@ -407,7 +431,7 @@ export async function startTailnetGateway(input) {
       rejectUpgrade(socket, "403 Forbidden", "Origin not allowed");
       return;
     }
-    void resolveAppSocket(options.appSocket).then((resolvedAppSocket) => {
+    void options.resolveAppSocket(options.appSocket).then((resolvedAppSocket) => {
       if (resolvedAppSocket === undefined) {
         rejectUpgrade(socket, "503 Service Unavailable", "Local appserver unavailable");
         return;
@@ -476,6 +500,7 @@ export function optionsFromEnvironment(environment = process.env) {
         ? undefined
         : environment.T4_NATIVE_ALLOWED_ORIGINS.split(","),
     label: environment.T4_HOST_LABEL ?? "OMP on this Tailnet host",
+    deploymentIdentity: environment.T4_DEPLOYMENT_IDENTITY,
   };
 }
 

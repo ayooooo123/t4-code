@@ -13,6 +13,7 @@ import {
   type ServiceRunnerResult,
   type ServiceSpec,
 } from "@t4-code/service-manager";
+import { decodeLocalProfileId } from "@t4-code/protocol/desktop-ipc";
 export { NodeServiceFileSystem };
 
 export const SERVICE_ENVIRONMENT_KEYS = [
@@ -60,6 +61,11 @@ export interface OmpExecutableDiscoveryOptions {
   readonly maxOutputBytes?: number;
 }
 
+export interface OmpAppserverProbeOptions
+  extends Omit<OmpExecutableDiscoveryOptions, "homeDirectory"> {
+  readonly profileId?: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -85,13 +91,17 @@ async function probesAppserverStatus(
   runner: ProcessRunner,
   timeoutMs: number,
   maxOutputBytes: number,
+  profileId = "default",
 ): Promise<AppserverProbeState> {
   try {
     const result = await runProcess({
       runner,
       command: executable,
       args: ["appserver", "status", "--json"],
-      env: createSafeServiceEnvironment(environment),
+      env: {
+        ...createSafeServiceEnvironment(environment),
+        ...(decodeLocalProfileId(profileId) === "default" ? {} : { OMP_PROFILE: profileId }),
+      },
       timeoutMs,
     });
     const stdoutBytes = Buffer.byteLength(result.stdout, "utf8");
@@ -180,7 +190,7 @@ export async function discoverOmpExecutable(
 
 export async function probeOmpAppserver(
   executable: string,
-  options: Omit<OmpExecutableDiscoveryOptions, "homeDirectory"> = {},
+  options: OmpAppserverProbeOptions = {},
 ): Promise<boolean> {
   const environment = options.environment ?? process.env;
   const runner = options.runner ?? new NodeProcessRunner();
@@ -192,7 +202,16 @@ export async function probeOmpAppserver(
   } catch {
     return false;
   }
-  return (await probesAppserverStatus(executable, environment, runner, timeoutMs, maxOutputBytes)) === "running";
+  return (
+    await probesAppserverStatus(
+      executable,
+      environment,
+      runner,
+      timeoutMs,
+      maxOutputBytes,
+      options.profileId,
+    )
+  ) === "running";
 }
 export interface NodeServiceRunnerOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -219,6 +238,7 @@ export class NodeServiceRunner implements ServiceRunner {
 }
 
 export function createAppserverServiceManager(options: {
+  readonly profileId?: string;
   readonly homeDirectory: string;
   readonly logsDirectory: string;
   readonly executable: string;
@@ -226,11 +246,17 @@ export function createAppserverServiceManager(options: {
   readonly fs: ServiceFileSystem;
   readonly runner?: ServiceRunner;
 }): ServiceManager {
+  const profileId = decodeLocalProfileId(options.profileId ?? "default");
   const spec: ServiceSpec = {
-    profileId: "default",
+    profileId,
     executable: options.executable,
     argv: options.argv,
     logsDirectory: options.logsDirectory,
+    // Pin both default and named services explicitly. A graphical/login service
+    // manager can retain an imported OMP_PROFILE from an unrelated shell; an
+    // omitted value would let that ambient profile silently hijack T4's
+    // default appserver.
+    environment: { OMP_PROFILE: profileId },
   };
   const runner = options.runner ?? new NodeServiceRunner();
   if (process.platform === "darwin") {

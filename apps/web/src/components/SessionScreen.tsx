@@ -26,19 +26,27 @@ import { FreshnessBadge, SessionMain } from "../features/transcript/SessionMain.
 import { RIGHT_PANE_DOCK_QUERY, useMediaQuery } from "../hooks/useMediaQuery.ts";
 import { useWorkspace, workspaceStore } from "../state/store-instance.ts";
 import {
+  type PaneFamily,
   RIGHT_PANE_WIDTH,
   selectSessionView,
-  type SessionViewState,
 } from "../state/workspace-store.ts";
 import { PANE_FAMILY_META } from "./pane-families.tsx";
 import { ResizeHandle } from "./ResizeHandle.tsx";
 
-function FamilyToggles({ sessionId, view }: { sessionId: string; view: SessionViewState }) {
+function FamilyToggles({
+  sessionId,
+  paneOpen,
+  paneFamily,
+}: {
+  sessionId: string;
+  paneOpen: boolean;
+  paneFamily: PaneFamily;
+}) {
   return (
     <>
       <div aria-label="Session panels" className="hidden items-center gap-0.5 sm:flex" role="group">
         {PANE_FAMILY_META.map((meta) => {
-          const active = view.paneOpen && view.paneFamily === meta.id;
+          const active = paneOpen && paneFamily === meta.id;
           const Icon = meta.icon;
           return (
             <Tooltip key={meta.id}>
@@ -60,22 +68,30 @@ function FamilyToggles({ sessionId, view }: { sessionId: string; view: SessionVi
           );
         })}
       </div>
-      <MobileFamilyMenu sessionId={sessionId} view={view} />
+      <MobileFamilyMenu paneFamily={paneFamily} paneOpen={paneOpen} sessionId={sessionId} />
     </>
   );
 }
 
-function MobileFamilyMenu({ sessionId, view }: { sessionId: string; view: SessionViewState }) {
+function MobileFamilyMenu({
+  sessionId,
+  paneOpen,
+  paneFamily,
+}: {
+  sessionId: string;
+  paneOpen: boolean;
+  paneFamily: PaneFamily;
+}) {
   const [open, setOpen] = useState(false);
-  const activeMeta = PANE_FAMILY_META.find((entry) => entry.id === view.paneFamily);
-  const TriggerIcon = view.paneOpen && activeMeta !== undefined ? activeMeta.icon : PanelRight;
+  const activeMeta = PANE_FAMILY_META.find((entry) => entry.id === paneFamily);
+  const TriggerIcon = paneOpen && activeMeta !== undefined ? activeMeta.icon : PanelRight;
   return (
     <Popover.Root onOpenChange={setOpen} open={open}>
       <Popover.Trigger
         aria-label="Session panels"
         className={cn(
           "flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-transparent text-foreground outline-none transition-colors duration-(--motion-duration-fast) hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring sm:hidden",
-          view.paneOpen && "bg-secondary",
+          paneOpen && "bg-secondary",
         )}
       >
         <TriggerIcon aria-hidden="true" className="size-5 text-muted-foreground" />
@@ -88,7 +104,7 @@ function MobileFamilyMenu({ sessionId, view }: { sessionId: string; view: Sessio
             </Popover.Title>
             <ul>
               {PANE_FAMILY_META.map((meta) => {
-                const active = view.paneOpen && view.paneFamily === meta.id;
+                const active = paneOpen && paneFamily === meta.id;
                 const Icon = meta.icon;
                 return (
                   <li key={meta.id}>
@@ -130,7 +146,16 @@ export function SessionScreen({
   nowMs: number;
 }) {
   const archived = session.archivedAt !== undefined;
-  const view = useWorkspace((state) => selectSessionView(state, session.id));
+  // Subscribe to the pane/drawer primitives only, never the whole view
+  // object: its identity changes on every scroll-anchor write (each scroll
+  // event while reading history) and every composer keystroke (draft), and
+  // a whole-view subscription re-renders this entire surface per frame.
+  const viewPaneFamily = useWorkspace((state) => selectSessionView(state, session.id).paneFamily);
+  const viewPaneOpen = useWorkspace((state) => selectSessionView(state, session.id).paneOpen);
+  const viewPaneWidth = useWorkspace((state) => selectSessionView(state, session.id).paneWidth);
+  const terminalDrawerOpen = useWorkspace(
+    (state) => selectSessionView(state, session.id).terminalDrawerOpen,
+  );
   const paneDocks = useMediaQuery(RIGHT_PANE_DOCK_QUERY);
   const [panePreviewWidth, setPanePreviewWidth] = useState<number | null>(null);
 
@@ -138,15 +163,15 @@ export function SessionScreen({
   // scroller: number = reading anchor, null = following the tail). This
   // wrapper never scrolls and never writes the session scroll key.
 
-  const activeMeta = PANE_FAMILY_META.find((entry) => entry.id === view.paneFamily);
-  const paneWidth = panePreviewWidth ?? view.paneWidth;
+  const activeMeta = PANE_FAMILY_META.find((entry) => entry.id === viewPaneFamily);
+  const paneWidth = panePreviewWidth ?? viewPaneWidth;
 
   // Docked pane enter/exit: the wrapper's measured width tweens between 0
   // and the persisted pane width; the pane stays mounted while closing and
   // unmounts on transition end. Reduced motion unmounts immediately (a 0ms
   // transition never fires transitionend).
   const reducedMotion = useReducedMotion();
-  const paneOpen = paneDocks && view.paneOpen && activeMeta !== undefined;
+  const paneOpen = paneDocks && viewPaneOpen && activeMeta !== undefined;
   const [paneRendered, setPaneRendered] = useState(paneOpen);
   useEffect(() => {
     if (paneOpen) setPaneRendered(true);
@@ -181,30 +206,32 @@ export function SessionScreen({
           <FreshnessBadge session={session} />
         </span>
         <span className="min-w-0 flex-1" />
-        {!archived && <FamilyToggles sessionId={session.id} view={view} />}
+        {!archived && (
+          <FamilyToggles paneFamily={viewPaneFamily} paneOpen={viewPaneOpen} sessionId={session.id} />
+        )}
         {!archived && <span aria-hidden="true" className="mx-1 hidden h-4 w-px bg-border sm:block" />}
         {!archived && <Tooltip>
           <TooltipTrigger
             render={
               <IconButton
                 aria-label={
-                  view.terminalDrawerOpen ? "Close terminal drawer" : "Open terminal drawer"
+                  terminalDrawerOpen ? "Close terminal drawer" : "Open terminal drawer"
                 }
-                aria-pressed={view.terminalDrawerOpen}
+                aria-pressed={terminalDrawerOpen}
                 className="size-11 sm:size-7"
                 onClick={() =>
                   workspaceStore
                     .getState()
-                    .setTerminalDrawerOpen(session.id, !view.terminalDrawerOpen)
+                    .setTerminalDrawerOpen(session.id, !terminalDrawerOpen)
                 }
                 size="icon-sm"
               >
-                {view.terminalDrawerOpen ? <PanelBottomClose /> : <PanelBottomOpen />}
+                {terminalDrawerOpen ? <PanelBottomClose /> : <PanelBottomOpen />}
               </IconButton>
             }
           />
           <TooltipPopup side="bottom">
-            {view.terminalDrawerOpen ? "Close terminal drawer" : "Open terminal drawer"}
+            {terminalDrawerOpen ? "Close terminal drawer" : "Open terminal drawer"}
           </TooltipPopup>
         </Tooltip>}
       </div>
@@ -212,9 +239,9 @@ export function SessionScreen({
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-hidden">
-            <SessionMain nowMs={nowMs} project={project} session={session} />
+            <SessionMain key={session.id} nowMs={nowMs} project={project} session={session} />
           </div>
-          {!archived && <TerminalDrawer open={view.terminalDrawerOpen} sessionId={session.id} />}
+          {!archived && <TerminalDrawer open={terminalDrawerOpen} sessionId={session.id} />}
         </div>
 
         {!archived && paneDocks && paneRendered && activeMeta !== undefined && (
@@ -257,8 +284,8 @@ export function SessionScreen({
                 </IconButton>
               </div>
               <ScrollArea className="min-h-0 flex-1">
-                <div className="pane-content-enter" key={view.paneFamily}>
-                  <PaneContent family={view.paneFamily} />
+                <div className="pane-content-enter" key={viewPaneFamily}>
+                  <PaneContent family={viewPaneFamily} />
                 </div>
               </ScrollArea>
               <p className="border-border border-t px-3 py-2 text-muted-foreground text-xs">
@@ -272,13 +299,13 @@ export function SessionScreen({
       {!archived && !paneDocks && activeMeta !== undefined && (
         <Sheet
           onOpenChange={(open) => workspaceStore.getState().setPaneOpen(session.id, open)}
-          open={view.paneOpen}
+          open={viewPaneOpen}
         >
           <SheetPopup aria-label={activeMeta.label} side="right">
             <div className="surface-subheader gap-2 px-3">
               <span className="font-medium text-xs">{activeMeta.label}</span>
             </div>
-            <PaneContent family={view.paneFamily} />
+            <PaneContent family={viewPaneFamily} />
           </SheetPopup>
         </Sheet>
       )}

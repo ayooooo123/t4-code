@@ -61,6 +61,10 @@ import type { DesktopShellPort } from "@t4-code/client";
 import { BrowserWebSocketTransport } from "./browser-transport.ts";
 import { CapacitorPeerTransport } from "./peer-transport.ts";
 import {
+  bindBrowserConnectionWake,
+  type BrowserConnectionLifecycleOptions,
+} from "./browser-connection-lifecycle.ts";
+import {
   currentNativeMobileBackend,
   currentNativeMobilePeerInvite,
   nativeMobilePlatform,
@@ -68,6 +72,11 @@ import {
 } from "./native-mobile.ts";
 
 const TARGET_ID = "remote";
+const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
+  ADDITIVE_FEATURES.filter(
+    (feature) => feature !== "prompt.images" && feature !== "transcript.images",
+  ),
+);
 
 const MAX_URL_LENGTH = 2048;
 const MAX_LABEL_LENGTH = 128;
@@ -196,6 +205,7 @@ interface PairLinkListener {
 
 export interface BrowserShellPortOptions {
   readonly clientFactory?: (options: OmpClientOptions) => OmpClient;
+  readonly lifecycle?: BrowserConnectionLifecycleOptions;
 }
 
 export function createBrowserShellPort(
@@ -218,6 +228,7 @@ export function createBrowserShellPort(
   let client: OmpClient | undefined;
   let activePeerTransport: CapacitorPeerTransport | undefined;
   let welcome: WelcomeFrame | undefined;
+  let stopLifecycle: Unsubscribe | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
     backendConfig.deviceId === undefined || backendConfig.deviceToken === undefined
@@ -280,6 +291,7 @@ export function createBrowserShellPort(
       transport: transportFactory,
       capabilities: DEVICE_CAPABILITIES,
       requestedFeatures: ADDITIVE_FEATURES,
+      compatibilityRequestedFeatures: COMPATIBILITY_FEATURES,
       authentication: () => authentication,
       privilegedPairResult: async (result) => {
         await persistNativeMobileCredentials(result);
@@ -287,7 +299,7 @@ export function createBrowserShellPort(
       },
       client: {
         name: "T4 Code",
-        version: "0.1.11",
+        version: "0.1.21",
         build: mobilePlatform ?? "browser",
         platform: mobilePlatform ?? (platform === "darwin" ? "darwin" : "linux"),
       },
@@ -323,6 +335,10 @@ export function createBrowserShellPort(
     return c;
   }
 
+  function ensureLifecycle(): void {
+    stopLifecycle ??= bindBrowserConnectionWake(() => client?.wake(), options.lifecycle);
+  }
+
   // ------------------------------------------------------------------ shell port
 
   const shell: DesktopShellPort = {
@@ -337,6 +353,7 @@ export function createBrowserShellPort(
       if (client === undefined) {
         client = buildClient();
       }
+      ensureLifecycle();
       return {
         platform,
         version: PROTOCOL_VERSION,
@@ -348,6 +365,7 @@ export function createBrowserShellPort(
       if (client === undefined) {
         client = buildClient();
       }
+      ensureLifecycle();
       // connect() is idempotent — it calls connection.begin() if idle
       void client.connect().catch(() => {
         /* state callback handles errors */
@@ -361,6 +379,8 @@ export function createBrowserShellPort(
         client = undefined;
         welcome = undefined;
       }
+      stopLifecycle?.();
+      stopLifecycle = undefined;
       emitState(TARGET_ID, "disconnected");
       return { targetId: TARGET_ID, state: "disconnected" };
     },

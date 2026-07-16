@@ -24,11 +24,18 @@ export function AnimatedHeight({ children }: { readonly children: ReactNode }) {
 	useLayoutEffect(() => {
 		const element = contentRef.current;
 		if (!element) return;
-		let firstFrameId: number | null = null;
-		let secondFrameId: number | null = null;
-
-		const updateHeight = () => {
-			const nextHeight = Math.ceil(element.scrollHeight || element.getBoundingClientRect().height);
+		// The observer's entry already carries the laid-out size, and observe()
+		// delivers an initial entry before the next paint, so no explicit
+		// measurement is needed anywhere. The previous mount-measure plus
+		// double-rAF re-measure cascade forced a synchronous layout per call
+		// (scrollHeight reads), which profiled as the single largest app cost
+		// while scrolling a long transcript (every freshly mounted row runs
+		// this effect).
+		const resizeObserver = new ResizeObserver((entries) => {
+			const entry = entries[entries.length - 1];
+			if (entry === undefined) return;
+			const measured = entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height;
+			const nextHeight = Math.ceil(measured);
 			setHeightState((currentState) => {
 				if (currentState.height === nextHeight) return currentState;
 				return {
@@ -36,36 +43,10 @@ export function AnimatedHeight({ children }: { readonly children: ReactNode }) {
 					isClipping: currentState.height !== null,
 				};
 			});
-		};
-		const cancelPendingFrames = () => {
-			if (firstFrameId !== null) {
-				window.cancelAnimationFrame(firstFrameId);
-				firstFrameId = null;
-			}
-			if (secondFrameId !== null) {
-				window.cancelAnimationFrame(secondFrameId);
-				secondFrameId = null;
-			}
-		};
-		const updateHeightAfterPaint = () => {
-			cancelPendingFrames();
-			updateHeight();
-			firstFrameId = window.requestAnimationFrame(() => {
-				firstFrameId = null;
-				updateHeight();
-				secondFrameId = window.requestAnimationFrame(() => {
-					secondFrameId = null;
-					updateHeight();
-				});
-			});
-		};
-
-		updateHeightAfterPaint();
-		const resizeObserver = new ResizeObserver(updateHeightAfterPaint);
+		});
 		resizeObserver.observe(element);
 		return () => {
 			resizeObserver.disconnect();
-			cancelPendingFrames();
 		};
 	}, []);
 

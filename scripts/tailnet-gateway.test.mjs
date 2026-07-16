@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { connect as connectSocket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -12,6 +13,7 @@ import {
   cacheControlForStaticPath,
   injectBackendConfig,
   normalizeAllowedOrigin,
+  normalizeDeploymentIdentity,
   normalizeNativeAllowedOrigins,
   optionsFromEnvironment,
   resolveAppSocket,
@@ -20,6 +22,7 @@ import {
 } from "./tailnet-gateway.mjs";
 
 const ALLOWED_ORIGIN = "https://host.example-tailnet.ts.net:8445";
+const DEPLOYMENT_IDENTITY = `sha256:${"b".repeat(64)}`;
 
 function websocketMessage(socket) {
   return new Promise((resolvePromise, reject) => {
@@ -69,6 +72,7 @@ async function fixture(socketTopology = "symlink", gatewayOptions = {}) {
     allowedOrigin: ALLOWED_ORIGIN,
     listenPort: 0,
     label: "Test host </script>",
+    deploymentIdentity: DEPLOYMENT_IDENTITY,
     ...gatewayOptions,
   });
   return {
@@ -112,16 +116,25 @@ test("native origin validation is pinned to Capacitor's Android and iOS defaults
   }
 });
 
+test("deployment identity accepts only an exact immutable SHA-256 token", () => {
+  assert.equal(normalizeDeploymentIdentity(DEPLOYMENT_IDENTITY), DEPLOYMENT_IDENTITY);
+  for (const value of ["latest", `sha256:${"B".repeat(64)}`, `sha256:${"b".repeat(63)}`]) {
+    assert.throws(() => normalizeDeploymentIdentity(value), /exactly 64 lowercase hexadecimal/u);
+  }
+});
+
 test("gateway environment parses the explicit comma-separated native origin set", () => {
   const options = optionsFromEnvironment({
     T4_ALLOWED_ORIGIN: ALLOWED_ORIGIN,
     T4_NATIVE_ALLOWED_ORIGINS: "https://localhost,capacitor://localhost",
+    T4_DEPLOYMENT_IDENTITY: DEPLOYMENT_IDENTITY,
     XDG_RUNTIME_DIR: "/run/user/1000",
   });
   assert.deepEqual(normalizeNativeAllowedOrigins(options.nativeAllowedOrigins), [
     "https://localhost",
     "capacitor://localhost",
   ]);
+  assert.equal(options.deploymentIdentity, DEPLOYMENT_IDENTITY);
 });
 
 test("backend injection is explicit, credential-free, and script-safe", () => {
@@ -174,6 +187,7 @@ test("gateway serves configured app and reports real upstream health", async () 
       contentSecurityPolicy ?? "",
       /connect-src 'self' wss:\/\/host\.example-tailnet\.ts\.net:8445/u,
     );
+    assert.match(contentSecurityPolicy ?? "", /img-src 'self' data: blob:/u);
     assert.doesNotMatch(contentSecurityPolicy ?? "", /\*/u);
 
     const assetResponse = await fetch(`${running.url}/app.js`);
@@ -205,6 +219,7 @@ test("gateway serves configured app and reports real upstream health", async () 
       upstream: true,
       activeSessions: 0,
       transport: "local-unix",
+      deploymentIdentity: DEPLOYMENT_IDENTITY,
     });
   } finally {
     await running.close();
@@ -238,6 +253,103 @@ test("gateway rejects cross-origin sockets and bridges only the web and native a
       allowed.close();
     }
   } finally {
+    await running.close();
+  }
+});
+
+test("gateway survives peer resets while rejecting websocket upgrades", async () => {
+  const running = await fixture();
+  try {
+    const request = [
+      "GET /v1/ws HTTP/1.1",
+      `Host: ${running.gateway.host}:${running.gateway.port}`,
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+      "Sec-WebSocket-Version: 13",
+      "Origin: https://attacker.example-tailnet.ts.net",
+      "",
+      "",
+    ].join("\r\n");
+    await Promise.all(
+      Array.from({ length: 32 }, () =>
+        new Promise((resolvePromise, reject) => {
+          const socket = connectSocket({
+            host: running.gateway.host,
+            port: running.gateway.port,
+          });
+          socket.once("error", reject);
+          socket.once("connect", () => {
+            socket.write(request, () => {
+              socket.off("error", reject);
+              socket.on("error", () => {});
+              socket.resetAndDestroy();
+              resolvePromise();
+            });
+          });
+        }),
+      ),
+    );
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    const healthResponse = await fetch(`${running.url}/healthz`);
+    assert.equal(healthResponse.status, 200);
+    assert.equal((await healthResponse.json()).ok, true);
+  } finally {
+    await running.close();
+  }
+});
+
+test("gateway survives an allowed browser reset while appserver socket resolution is pending", async () => {
+  let releaseResolution;
+  let markResolutionStarted;
+  const resolutionStarted = new Promise((resolvePromise) => {
+    markResolutionStarted = resolvePromise;
+  });
+  const resolutionReleased = new Promise((resolvePromise) => {
+    releaseResolution = resolvePromise;
+  });
+  const running = await fixture("symlink", {
+    resolveAppSocket: async (path) => {
+      markResolutionStarted();
+      await resolutionReleased;
+      return resolveAppSocket(path);
+    },
+  });
+  try {
+    const request = [
+      "GET /v1/ws HTTP/1.1",
+      `Host: ${running.gateway.host}:${running.gateway.port}`,
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+      "Sec-WebSocket-Version: 13",
+      `Origin: ${ALLOWED_ORIGIN}`,
+      "",
+      "",
+    ].join("\r\n");
+    const socket = connectSocket({
+      host: running.gateway.host,
+      port: running.gateway.port,
+    });
+    socket.on("error", () => {});
+    await new Promise((resolvePromise, reject) => {
+      socket.once("connect", resolvePromise);
+      socket.once("error", reject);
+    });
+    await new Promise((resolvePromise, reject) => {
+      socket.write(request, (error) => (error ? reject(error) : resolvePromise()));
+    });
+    await resolutionStarted;
+    socket.resetAndDestroy();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    releaseResolution();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+
+    const healthResponse = await fetch(`${running.url}/healthz`);
+    assert.equal(healthResponse.status, 200);
+    assert.equal((await healthResponse.json()).ok, true);
+  } finally {
+    releaseResolution();
     await running.close();
   }
 });

@@ -25,6 +25,14 @@ export const DESKTOP_IPC_CHANNELS = [
   "omp:targets:list",
   "omp:targets:add",
   "omp:targets:remove",
+  "omp:profiles:list",
+  "omp:profiles:add",
+  "omp:profiles:update",
+  "omp:profiles:remove",
+  "omp:profiles:status",
+  "omp:profiles:start",
+  "omp:profiles:stop",
+  "omp:profiles:restart",
   "omp:command",
   "omp:confirm",
   "omp:terminal:input",
@@ -49,6 +57,11 @@ export const DESKTOP_IPC_CHANNELS = [
   "omp:workspace:root:select",
   "omp:workspace:root:choose",
   "omp:workspace:project:create",
+  "app:update:get-state",
+  "app:update:check",
+  "app:update:download",
+  "app:update:restart",
+  "app:update:renderer-ready",
 ] as const;
 export type DesktopInvokeChannel = (typeof DESKTOP_IPC_CHANNELS)[number];
 export const DESKTOP_IPC_EVENTS = [
@@ -56,6 +69,8 @@ export const DESKTOP_IPC_EVENTS = [
   "omp:connection-state",
   "omp:runtime-error",
   "omp:pair-link",
+  "app:update:state",
+  "app:update:open",
 ] as const;
 export type DesktopEventChannel = (typeof DESKTOP_IPC_EVENTS)[number];
 export type DesktopPlatform = "linux" | "darwin";
@@ -100,6 +115,42 @@ export interface WorkspaceRootChooseRequest {}
 export interface WorkspaceRootChooseResult { readonly root: WorkspaceRoot | null; }
 export interface WorkspaceProjectCreateRequest { readonly name: string; }
 export interface WorkspaceProjectCreateResult { readonly project: WorkspaceProject; }
+export interface LocalProfile {
+  readonly profileId: string;
+  readonly label: string;
+  readonly targetId: string;
+  readonly autoStart: boolean;
+  readonly isDefault: boolean;
+  readonly service: ServiceInspection;
+}
+export interface LocalProfileListRequest {}
+export interface LocalProfileListResult {
+  readonly profiles: readonly LocalProfile[];
+}
+export interface LocalProfileAddRequest {
+  readonly profile: {
+    readonly profileId: string;
+    readonly label?: string;
+    readonly autoStart?: boolean;
+  };
+}
+export interface LocalProfileUpdateRequest {
+  readonly profileId: string;
+  readonly changes: {
+    readonly label?: string;
+    readonly autoStart?: boolean;
+  };
+}
+export interface LocalProfileRequest {
+  readonly profileId: string;
+}
+export interface LocalProfileResult {
+  readonly profile: LocalProfile;
+}
+export interface LocalProfileRemoveResult {
+  readonly profileId: string;
+  readonly removed: true;
+}
 export interface BootstrapResult {
   platform: DesktopPlatform;
   version: typeof PROTOCOL_VERSION;
@@ -234,6 +285,35 @@ export interface TerminalCloseRequest {
 export interface TerminalResult {
   targetId: string;
   accepted: boolean;
+}
+
+export type DesktopUpdatePhase =
+  | "idle"
+  | "checking"
+  | "current"
+  | "available"
+  | "manual"
+  | "downloading"
+  | "ready"
+  | "error";
+
+/** Renderer-safe update metadata. Download URLs and filesystem paths stay in Electron main. */
+export interface DesktopUpdateState {
+  readonly version: 1;
+  readonly currentVersion: string;
+  readonly phase: DesktopUpdatePhase;
+  readonly checkedAt?: number;
+  readonly availableVersion?: string;
+  readonly progressPercent?: number;
+  readonly message?: string;
+}
+
+export interface DesktopUpdateRequest {}
+export interface DesktopUpdateRendererReadyResult {
+  readonly openSettings: boolean;
+}
+export interface DesktopUpdateOpenEvent {
+  readonly source: "menu";
 }
 
 const MAX_COMMAND_ERROR_CODE_BYTES = 128;
@@ -374,6 +454,14 @@ export interface DesktopInvokeRequestMap {
   "omp:targets:list": TargetListRequest;
   "omp:targets:add": TargetAddRequest;
   "omp:targets:remove": TargetRequest;
+  "omp:profiles:list": LocalProfileListRequest;
+  "omp:profiles:add": LocalProfileAddRequest;
+  "omp:profiles:update": LocalProfileUpdateRequest;
+  "omp:profiles:remove": LocalProfileRequest;
+  "omp:profiles:status": LocalProfileRequest;
+  "omp:profiles:start": LocalProfileRequest;
+  "omp:profiles:stop": LocalProfileRequest;
+  "omp:profiles:restart": LocalProfileRequest;
   "omp:command": CommandRequest;
   "omp:confirm": ConfirmRequest;
   "omp:terminal:input": TerminalInputRequest;
@@ -398,11 +486,24 @@ export interface DesktopInvokeRequestMap {
   "omp:workspace:root:select": WorkspaceRootSelectRequest;
   "omp:workspace:root:choose": WorkspaceRootChooseRequest;
   "omp:workspace:project:create": WorkspaceProjectCreateRequest;
+  "app:update:get-state": DesktopUpdateRequest;
+  "app:update:check": DesktopUpdateRequest;
+  "app:update:download": DesktopUpdateRequest;
+  "app:update:restart": DesktopUpdateRequest;
+  "app:update:renderer-ready": DesktopUpdateRequest;
 }
 export interface DesktopInvokeResponseMap {
   "omp:targets:list": TargetListResult;
   "omp:targets:add": TargetAddResult;
   "omp:targets:remove": TargetRemoveResult;
+  "omp:profiles:list": LocalProfileListResult;
+  "omp:profiles:add": LocalProfileResult;
+  "omp:profiles:update": LocalProfileResult;
+  "omp:profiles:remove": LocalProfileRemoveResult;
+  "omp:profiles:status": LocalProfileResult;
+  "omp:profiles:start": LocalProfileResult;
+  "omp:profiles:stop": LocalProfileResult;
+  "omp:profiles:restart": LocalProfileResult;
   "omp:command": CommandResult;
   "omp:confirm": ConfirmResult;
   "omp:terminal:input": TerminalResult;
@@ -427,6 +528,11 @@ export interface DesktopInvokeResponseMap {
   "omp:workspace:root:select": void;
   "omp:workspace:root:choose": WorkspaceRootChooseResult;
   "omp:workspace:project:create": WorkspaceProjectCreateResult;
+  "app:update:get-state": DesktopUpdateState;
+  "app:update:check": DesktopUpdateState;
+  "app:update:download": DesktopUpdateState;
+  "app:update:restart": DesktopUpdateState;
+  "app:update:renderer-ready": DesktopUpdateRendererReadyResult;
 }
 export interface RendererServerFrameEvent {
   targetId: string;
@@ -437,6 +543,8 @@ export interface DesktopEventPayloadMap {
   "omp:connection-state": ConnectionStateEvent;
   "omp:runtime-error": RuntimeErrorEvent;
   "omp:pair-link": PairLinkEvent;
+  "app:update:state": DesktopUpdateState;
+  "app:update:open": DesktopUpdateOpenEvent;
 }
 export type DesktopInvokeRequest<C extends DesktopInvokeChannel = DesktopInvokeChannel> = {
   channel: C;
@@ -454,8 +562,66 @@ function exact(value: Record<string, unknown>, keys: readonly string[]): void {
 }
 function target(value: unknown): string {
   const s = controlFree(value, "targetId", 128);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(s)) throw new Error("invalid targetId");
-  return s;
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(s)) return s;
+  if (s.startsWith("local:") && s !== "local:default") {
+    profileId(s.slice("local:".length));
+    return s;
+  }
+  throw new Error("invalid targetId");
+}
+function remoteTarget(value: unknown): string {
+  const id = target(value);
+  if (id === "local" || id.startsWith("local:")) throw new Error("reserved targetId");
+  return id;
+}
+const PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const WINDOWS_RESERVED_PROFILE = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$/iu;
+export function decodeLocalProfileId(value: unknown): string {
+  const id = controlFree(value, "profileId", 64);
+  if (
+    id === "." ||
+    id === ".." ||
+    id.endsWith(".") ||
+    !PROFILE_NAME.test(id) ||
+    WINDOWS_RESERVED_PROFILE.test(id)
+  )
+    throw new Error("invalid profileId");
+  return id;
+}
+function profileId(value: unknown): string {
+  return decodeLocalProfileId(value);
+}
+function profileLabel(value: unknown): string {
+  const label = controlFree(value, "profile label", 128).trim();
+  if (label.length === 0) throw new Error("invalid profile label");
+  return label;
+}
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`invalid ${name}`);
+  return value;
+}
+function localProfileInput(value: unknown): LocalProfileAddRequest["profile"] {
+  const item = object(value, "profile");
+  exact(item, ["profileId", "label", "autoStart"]);
+  const label = item.label === undefined ? undefined : profileLabel(item.label);
+  const autoStart = optionalBoolean(item.autoStart, "autoStart");
+  return {
+    profileId: profileId(item.profileId),
+    ...(label === undefined ? {} : { label }),
+    ...(autoStart === undefined ? {} : { autoStart }),
+  };
+}
+function localProfileChanges(value: unknown): LocalProfileUpdateRequest["changes"] {
+  const item = object(value, "profile changes");
+  exact(item, ["label", "autoStart"]);
+  const label = item.label === undefined ? undefined : profileLabel(item.label);
+  const autoStart = optionalBoolean(item.autoStart, "autoStart");
+  if (label === undefined && autoStart === undefined) throw new Error("profile changes are empty");
+  return {
+    ...(label === undefined ? {} : { label }),
+    ...(autoStart === undefined ? {} : { autoStart }),
+  };
 }
 function state(value: unknown): ConnectionState {
   if (
@@ -465,6 +631,81 @@ function state(value: unknown): ConnectionState {
   )
     throw new Error("invalid state");
   return value as ConnectionState;
+}
+
+const DESKTOP_VERSION_PATTERN =
+  /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z](?:[0-9A-Za-z.-]{0,62}[0-9A-Za-z])?)?$/u;
+
+function desktopVersion(value: unknown, name: string): string {
+  const decoded = controlFree(value, name, 96);
+  if (!DESKTOP_VERSION_PATTERN.test(decoded)) throw new Error(`invalid ${name}`);
+  return decoded;
+}
+
+/** Strictly decode and freeze update state before it crosses either IPC boundary. */
+export function decodeDesktopUpdateState(value: unknown): DesktopUpdateState {
+  const item = object(value, "desktop update state");
+  exact(item, [
+    "version",
+    "currentVersion",
+    "phase",
+    "checkedAt",
+    "availableVersion",
+    "progressPercent",
+    "message",
+  ]);
+  if (item.version !== 1) throw new Error("unsupported desktop update state");
+  if (
+    ![
+      "idle",
+      "checking",
+      "current",
+      "available",
+      "manual",
+      "downloading",
+      "ready",
+      "error",
+    ].includes(item.phase as string)
+  )
+    throw new Error("invalid desktop update phase");
+  if (
+    item.checkedAt !== undefined &&
+    (typeof item.checkedAt !== "number" ||
+      !Number.isSafeInteger(item.checkedAt) ||
+      item.checkedAt < 0)
+  )
+    throw new Error("invalid desktop update checkedAt");
+  if (
+    item.progressPercent !== undefined &&
+    (typeof item.progressPercent !== "number" ||
+      !Number.isFinite(item.progressPercent) ||
+      item.progressPercent < 0 ||
+      item.progressPercent > 100)
+  )
+    throw new Error("invalid desktop update progress");
+  const decoded: DesktopUpdateState = {
+    version: 1,
+    currentVersion: desktopVersion(item.currentVersion, "currentVersion"),
+    phase: item.phase as DesktopUpdatePhase,
+    ...(item.checkedAt === undefined ? {} : { checkedAt: item.checkedAt }),
+    ...(item.availableVersion === undefined
+      ? {}
+      : { availableVersion: desktopVersion(item.availableVersion, "availableVersion") }),
+    ...(item.progressPercent === undefined ? {} : { progressPercent: item.progressPercent }),
+    ...(item.message === undefined ? {} : { message: controlFree(item.message, "message", 512) }),
+  };
+  return Object.freeze(decoded);
+}
+
+export function decodeDesktopUpdateRendererReadyResult(
+  value: unknown,
+): DesktopUpdateRendererReadyResult {
+  const item = object(value, "desktop update renderer-ready result");
+  exact(item, ["openSettings"]);
+  if (typeof item.openSettings !== "boolean") {
+    throw new Error("invalid desktop update renderer-ready result");
+  }
+  return Object.freeze({ openSettings: item.openSettings });
 }
 function targetRecord(value: unknown): TargetAddRequest["target"] {
   const item = object(value, "target");
@@ -513,7 +754,7 @@ function targetRecord(value: unknown): TargetAddRequest["target"] {
   if (item.autoConnect !== undefined && typeof item.autoConnect !== "boolean")
     throw new Error("invalid autoConnect");
   return {
-    targetId: target(item.targetId),
+    targetId: remoteTarget(item.targetId),
     label,
     mode,
     address,
@@ -611,6 +852,7 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
   const payload = object(frame.payload, "payload");
   switch (channel) {
     case "omp:targets:list":
+    case "omp:profiles:list":
       exact(payload, []);
       return { channel, payload: {} };
     case "omp:targets:add":
@@ -621,6 +863,25 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:disconnect":
       exact(payload, ["targetId"]);
       return { channel, payload: { targetId: target(payload.targetId) } };
+    case "omp:profiles:add":
+      exact(payload, ["profile"]);
+      return { channel, payload: { profile: localProfileInput(payload.profile) } };
+    case "omp:profiles:update":
+      exact(payload, ["profileId", "changes"]);
+      return {
+        channel,
+        payload: {
+          profileId: profileId(payload.profileId),
+          changes: localProfileChanges(payload.changes),
+        },
+      };
+    case "omp:profiles:remove":
+    case "omp:profiles:status":
+    case "omp:profiles:start":
+    case "omp:profiles:stop":
+    case "omp:profiles:restart":
+      exact(payload, ["profileId"]);
+      return { channel, payload: { profileId: profileId(payload.profileId) } };
     case "omp:pair":
       exact(payload, ["targetId", "code"]);
       {
@@ -642,6 +903,11 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:peer-share:regenerate":
     case "omp:workspace:roots:list":
     case "omp:workspace:root:choose":
+    case "app:update:get-state":
+    case "app:update:check":
+    case "app:update:download":
+    case "app:update:restart":
+    case "app:update:renderer-ready":
       exact(payload, []);
       return { channel, payload: {} };
     case "omp:workspace:root:select":
@@ -718,6 +984,14 @@ export function decodeDesktopEvent(input: unknown): DesktopEvent {
     };
   }
   if (channel === "omp:pair-link") return { channel, payload: pairLink(payload) };
+  if (channel === "app:update:state") {
+    return { channel, payload: decodeDesktopUpdateState(payload) };
+  }
+  if (channel === "app:update:open") {
+    exact(payload, ["source"]);
+    if (payload.source !== "menu") throw new Error("invalid desktop update open source");
+    return { channel, payload: Object.freeze({ source: "menu" as const }) };
+  }
   exact(payload, ["targetId", "code", "message"]);
   if (!["transport", "protocol", "internal"].includes(payload.code as string))
     throw new Error("invalid error code");

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { DESKTOP_IPC_CHANNELS, decodeDesktopInvokeRequest } from "@t4-code/protocol/desktop-ipc";
-import type { CursorStore, OmpTransport, PublicServerFrame } from "@t4-code/client";
+import type { CursorRecord, CursorStore, OmpTransport, PublicServerFrame } from "@t4-code/client";
 import {
   commandId,
   confirmationId,
   DEVICE_CAPABILITIES,
   hostId,
+  revision,
   sessionId,
   type WelcomeFrame,
 } from "@t4-code/protocol";
@@ -42,8 +43,13 @@ function pairingWelcome(host = "host-fixture"): WelcomeFrame {
 }
 class Transport implements OmpTransport {
   private readonly helloFrame: WelcomeFrame;
-  constructor(helloFrame: WelcomeFrame = welcome()) {
+  private readonly helloRejection: { readonly code: number; readonly reason: string } | undefined;
+  constructor(
+    helloFrame: WelcomeFrame = welcome(),
+    helloRejection?: { readonly code: number; readonly reason: string },
+  ) {
     this.helloFrame = helloFrame;
+    this.helloRejection = helloRejection;
   }
   readonly sent: string[] = [];
   closed = false;
@@ -55,8 +61,15 @@ class Transport implements OmpTransport {
   send(data: string): void {
     this.sent.push(data);
     for (const listener of this.sentListeners) listener();
-    if (JSON.parse(data).type === "hello")
-      for (const listener of this.messages) listener(JSON.stringify(this.helloFrame));
+    if (JSON.parse(data).type === "hello") {
+      if (this.helloRejection !== undefined) {
+        for (const listener of this.closes) {
+          listener(this.helloRejection.code, this.helloRejection.reason);
+        }
+      } else {
+        for (const listener of this.messages) listener(JSON.stringify(this.helloFrame));
+      }
+    }
   }
   waitForSent(index: number): Promise<Record<string, unknown>> {
     const existing = this.sent[index];
@@ -103,6 +116,22 @@ class Store implements CursorStore {
     return [];
   }
   save(): void {}
+}
+class RecordingStore implements CursorStore {
+  readonly saved: CursorRecord[] = [];
+  load(): readonly CursorRecord[] {
+    return [];
+  }
+  save(record: CursorRecord): void {
+    this.saved.push(record);
+  }
+}
+class LateResponseTransport extends Transport {
+  lateFrame: Record<string, unknown> | undefined;
+  override close(): void {
+    if (!this.closed && this.lateFrame !== undefined) this.receive(this.lateFrame);
+    super.close();
+  }
 }
 class Registry implements RemoteTargetRegistry {
   private readonly values = new Map<string, RemoteTargetRecord>();
@@ -153,6 +182,251 @@ function manager(
 }
 
 describe("desktop target manager boundaries", () => {
+  it("lists and connects named local profiles through profile-scoped transports", async () => {
+    const transports: Transport[] = [];
+    const requestedProfiles: string[] = [];
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      localProfiles: async () => [
+        { profileId: "default", label: "Default", autoStart: true },
+        { profileId: "fable-swarm", label: "Fable Swarm", autoStart: false },
+      ],
+      localTransportFactory: (profileId) => {
+        requestedProfiles.push(profileId);
+        const next = new Transport(welcome(`host-${profileId}`));
+        transports.push(next);
+        return next as never;
+      },
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+
+    expect(await runtime.listTargets()).toEqual([
+      {
+        targetId: "local",
+        label: "Local OMP",
+        kind: "local",
+        state: "disconnected",
+        paired: true,
+      },
+      {
+        targetId: "local:fable-swarm",
+        label: "Fable Swarm",
+        kind: "local",
+        state: "disconnected",
+        paired: true,
+      },
+    ]);
+    expect(await runtime.connect("local:fable-swarm")).toBe("connected");
+    expect(requestedProfiles).toEqual(["fable-swarm"]);
+    expect(runtime.isConnected("local:fable-swarm")).toBe(true);
+    expect(runtime.isPaired("local:fable-swarm")).toBe(true);
+    await runtime.close();
+  });
+  it("routes simultaneous profile commands and keeps host-scoped cursor journals independent", async () => {
+    const transports = new Map<string, Transport>();
+    const stores = new Map<string, RecordingStore>();
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      cursorStoreFactory: (targetId) => {
+        const store = new RecordingStore();
+        stores.set(targetId, store);
+        return store;
+      },
+      localProfiles: async () => [
+        { profileId: "default", label: "Default", autoStart: true },
+        { profileId: "fable-swarm", label: "Fable Swarm", autoStart: false },
+      ],
+      localTransportFactory: (profileId) => {
+        const transport = new Transport(welcome(`host-${profileId}`));
+        transports.set(profileId, transport);
+        return transport as never;
+      },
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+
+    await Promise.all([runtime.connect("local"), runtime.connect("local:fable-swarm")]);
+    const defaultTransport = transports.get("default");
+    const fableTransport = transports.get("fable-swarm");
+    if (defaultTransport === undefined || fableTransport === undefined) throw new Error("profile transports were not created");
+
+    const defaultCommand = runtime.command("local", { hostId: "host-default", command: "host.list", args: {} });
+    const fableCommand = runtime.command("local:fable-swarm", { hostId: "host-fable-swarm", command: "host.list", args: {} });
+    const defaultFrame = JSON.parse(defaultTransport.sent.at(-1) ?? "{}") as { requestId?: string; commandId?: string; hostId?: string; command?: string };
+    const fableFrame = JSON.parse(fableTransport.sent.at(-1) ?? "{}") as { requestId?: string; commandId?: string; hostId?: string; command?: string };
+    if (defaultFrame.requestId === undefined || defaultFrame.commandId === undefined || defaultFrame.hostId === undefined || defaultFrame.command === undefined)
+      throw new Error("default command was not sent");
+    if (fableFrame.requestId === undefined || fableFrame.commandId === undefined || fableFrame.hostId === undefined || fableFrame.command === undefined)
+      throw new Error("fable command was not sent");
+
+    fableTransport.receive({
+      v: V,
+      type: "response",
+      requestId: fableFrame.requestId,
+      commandId: fableFrame.commandId,
+      hostId: fableFrame.hostId,
+      command: fableFrame.command,
+      ok: true,
+      result: { cursor: { epoch: "epoch-a", seq: 0 }, sessions: [], totalCount: 0, truncated: false },
+    });
+    defaultTransport.receive({
+      v: V,
+      type: "response",
+      requestId: defaultFrame.requestId,
+      commandId: defaultFrame.commandId,
+      hostId: defaultFrame.hostId,
+      command: defaultFrame.command,
+      ok: true,
+      result: { cursor: { epoch: "epoch-a", seq: 0 }, sessions: [], totalCount: 0, truncated: false },
+    });
+    expect(await defaultCommand).toMatchObject({ targetId: "local", accepted: true });
+    expect(await fableCommand).toMatchObject({
+      targetId: "local:fable-swarm",
+      accepted: true,
+    });
+
+    defaultTransport.receive({
+      v: V,
+      type: "snapshot",
+      cursor: { epoch: "epoch-a", seq: 4 },
+      revision: revision("rev-default"),
+      hostId: hostId("host-default"),
+      sessionId: sessionId("session-default"),
+      entries: [],
+    });
+    fableTransport.receive({
+      v: V,
+      type: "snapshot",
+      cursor: { epoch: "epoch-a", seq: 7 },
+      revision: revision("rev-fable"),
+      hostId: hostId("host-fable-swarm"),
+      sessionId: sessionId("session-fable"),
+      entries: [],
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stores.get("local")?.saved).toEqual([
+      { hostId: "host-default", sessionId: "session-default", cursor: { epoch: "epoch-a", seq: 4 } },
+    ]);
+    expect(stores.get("local:fable-swarm")?.saved).toEqual([
+      { hostId: "host-fable-swarm", sessionId: "session-fable", cursor: { epoch: "epoch-a", seq: 7 } },
+    ]);
+
+    await runtime.disconnect("local");
+    expect(defaultTransport.closed).toBe(true);
+    expect(fableTransport.closed).toBe(false);
+    expect(runtime.isConnected("local:fable-swarm")).toBe(true);
+    fableTransport.receive({
+      v: V,
+      type: "snapshot",
+      cursor: { epoch: "epoch-a", seq: 8 },
+      revision: revision("rev-fable"),
+      hostId: hostId("host-fable-swarm"),
+      sessionId: sessionId("session-fable"),
+      entries: [],
+    });
+    await Promise.resolve();
+    await runtime.close();
+    expect(stores.get("local:fable-swarm")?.saved.at(-1)).toEqual({
+      hostId: "host-fable-swarm",
+      sessionId: "session-fable",
+      cursor: { epoch: "epoch-a", seq: 8 },
+    });
+  });
+
+
+  it("drops a reply racing a target host switch and routes the replacement reply", async () => {
+    const first = new LateResponseTransport(welcome("host-old"));
+    const second = new Transport(welcome("host-new"));
+    const transports = [first, second];
+    const registry = new Registry();
+    await registry.put(target("switch"));
+    const frames: PublicServerFrame[] = [];
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      registry,
+      remoteTransportFactory: () => transports.shift() as never,
+      events: { onFrame: (_targetId, frame) => frames.push(frame), onState: () => {}, onError: () => {} },
+    });
+
+    await runtime.connect("switch");
+    const staleCommand = runtime.command("switch", { hostId: "host-old", command: "host.list", args: {} });
+    const staleFrame = JSON.parse(first.sent.at(-1) ?? "{}") as { requestId?: string; commandId?: string; hostId?: string; command?: string };
+    if (staleFrame.requestId === undefined || staleFrame.commandId === undefined || staleFrame.hostId === undefined || staleFrame.command === undefined)
+      throw new Error("stale command was not sent");
+    first.lateFrame = {
+      v: V,
+      type: "response",
+      requestId: staleFrame.requestId,
+      commandId: staleFrame.commandId,
+      hostId: staleFrame.hostId,
+      command: staleFrame.command,
+      ok: true,
+      result: { cursor: { epoch: "epoch-a", seq: 0 }, sessions: [], totalCount: 0, truncated: false },
+    };
+
+    await runtime.disconnect("switch");
+    let staleError: unknown;
+    try {
+      await staleCommand;
+    } catch (error) {
+      staleError = error;
+    }
+    expect(staleError).toMatchObject({ code: "outcome_unknown" });
+    await runtime.connect("switch");
+    const currentCommand = runtime.command("switch", { hostId: "host-new", command: "host.list", args: {} });
+    const currentFrame = await second.waitForSent(1);
+    if (typeof currentFrame.requestId !== "string" || typeof currentFrame.commandId !== "string" || typeof currentFrame.hostId !== "string" || typeof currentFrame.command !== "string")
+      throw new Error("replacement command was not sent");
+    second.receive({
+      v: V,
+      type: "response",
+      requestId: currentFrame.requestId,
+      commandId: currentFrame.commandId,
+      hostId: currentFrame.hostId,
+      command: currentFrame.command,
+      ok: true,
+      result: { cursor: { epoch: "epoch-a", seq: 0 }, sessions: [], totalCount: 0, truncated: false },
+    });
+    expect(await currentCommand).toMatchObject({
+      targetId: "switch",
+      accepted: true,
+      result: { sessions: [] },
+    });
+    expect(frames.some((frame) => frame.type === "response" && String(frame.requestId) === staleFrame.requestId)).toBe(false);
+    await runtime.close();
+  });
+
+  it("falls back from both image features for a pre-image appserver", async () => {
+    const transports: Transport[] = [];
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      transportFactory: () => {
+        const next = new Transport(
+          welcome(),
+          transports.length === 0 ? { code: 1008, reason: "invalid frame" } : undefined,
+        );
+        transports.push(next);
+        return next as never;
+      },
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+
+    await runtime.connect();
+
+    expect(transports).toHaveLength(2);
+    const firstHello = JSON.parse(transports[0]?.sent[0] ?? "{}") as {
+      requestedFeatures?: string[];
+    };
+    const fallbackHello = JSON.parse(transports[1]?.sent[0] ?? "{}") as {
+      requestedFeatures?: string[];
+    };
+    expect(firstHello.requestedFeatures).toContain("prompt.images");
+    expect(firstHello.requestedFeatures).toContain("transcript.images");
+    expect(fallbackHello.requestedFeatures).not.toContain("prompt.images");
+    expect(fallbackHello.requestedFeatures).not.toContain("transcript.images");
+    await runtime.close();
+  });
+
   it("serializes concurrent target lifecycle and closes each generation", async () => {
     const transports: Transport[] = [];
     const registry = new Registry();

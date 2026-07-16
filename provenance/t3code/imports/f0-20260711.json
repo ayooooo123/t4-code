@@ -73,7 +73,7 @@
       "sourceBlobSha": "d0e21b3907eebffbb328e72927d35a2e9fdc9dfe",
       "targetPath": "packages/ui/src/motion/AnimatedHeight.tsx",
       "classification": "adapted",
-      "checksum": "sha256:a3efbaef32a14b956c4eb4c490b353402aa9fb30abddce14ca8af694b3f155ea"
+      "checksum": "sha256:ddc7624084d802d9d2dbdb1c325148a65dd6597da53eb1d5054f11d98f2a2707"
     },
     {
       "sourcePath": "apps/web/src/hooks/useResizableWidth.ts",

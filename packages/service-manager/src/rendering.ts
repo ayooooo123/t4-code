@@ -6,9 +6,11 @@ import {
 const MAX_PATH = 4096;
 const MAX_ARG = 2048;
 const MAX_ARGS = 128;
-const MAX_PROFILE = 32;
+const MAX_PROFILE = 64;
 const SAFE_ENV_KEYS: Record<string, true> = { OMP_LOG_LEVEL: true, OMP_PROFILE: true };
 const SECRET_KEY = /(token|secret|password|credential|authorization|api[_-]?key|private[_-]?key)/i;
+const PROFILE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const WINDOWS_RESERVED_PROFILE = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$/iu;
 
 function invalid(message: string): never {
   throw new ServiceValidationError(message);
@@ -43,14 +45,28 @@ export function validateAbsolutePath(value: string, label: string): string {
   return value;
 }
 
-function validateProfile(value: string): string {
+export function validateProfileId(value: string): string {
   validateText(value, "profile id", MAX_PROFILE);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(value)) invalid("Invalid profile id.");
+  if (
+    value === "." ||
+    value === ".." ||
+    value.endsWith(".") ||
+    !PROFILE_NAME.test(value) ||
+    WINDOWS_RESERVED_PROFILE.test(value)
+  )
+    invalid("Invalid profile id.");
   return value;
 }
 
+export function serviceLabelForProfile(profileId: string): string {
+  const profile = validateProfileId(profileId);
+  return profile === "default"
+    ? "dev.oh-my-pi.appserver"
+    : `dev.oh-my-pi.appserver.profile.${profile}`;
+}
+
 export function validateSpec(spec: ServiceSpec): ServiceSpec {
-  const profileId = validateProfile(spec.profileId);
+  const profileId = validateProfileId(spec.profileId);
   const executable = validateAbsolutePath(spec.executable, "executable");
   if (!Array.isArray(spec.argv) || spec.argv.length > MAX_ARGS) invalid("Invalid argv.");
   const argv = spec.argv.map((value, index) => validateText(value, `argv[${index}]`, MAX_ARG));
@@ -71,6 +87,20 @@ export function validateSpec(spec: ServiceSpec): ServiceSpec {
       invalid("Environment key is not permitted.");
     environment[key] = validateText(value, `environment value for ${key}`, MAX_ARG);
   }
+  // Service managers can retain environment imported from an unrelated shell.
+  // Explicitly selecting the default profile prevents ambient OMP_PROFILE state
+  // from silently routing the legacy singleton service to a named profile.
+  if (profileId === "default" && environment.OMP_PROFILE === undefined) {
+    environment.OMP_PROFILE = "default";
+  }
+  if (profileId !== "default" && environment.OMP_PROFILE !== profileId)
+    invalid("Named profile service must set matching OMP_PROFILE.");
+  if (
+    profileId === "default" &&
+    environment.OMP_PROFILE !== undefined &&
+    environment.OMP_PROFILE !== "default"
+  )
+    invalid("Default profile service has mismatched OMP_PROFILE.");
   return { profileId, executable, argv, logsDirectory, environment };
 }
 
@@ -110,6 +140,12 @@ export function renderSystemd(spec: ServiceSpec, _label: string): string {
     "[Service]",
     "Type=simple",
     `ExecStart=${shellFreeExec(spec)}`,
+    // The appserver owns independent session workers. If the kernel kills one
+    // runaway worker under memory pressure, keep the broker (and unrelated
+    // sessions) alive instead of treating the child OOM as a unit failure.
+    // This is isolation, not a memory limit: workers retain the full host
+    // environment and available memory.
+    "OOMPolicy=continue",
     "Restart=on-failure",
     "UMask=0077",
     `StandardOutput=append:${systemdFilePath(`${spec.logsDirectory}/appserver.log`)}`,

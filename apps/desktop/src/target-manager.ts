@@ -6,7 +6,14 @@ import type { PairOkFrame, WelcomeFrame } from "@t4-code/protocol";
 import { createLocalTransport, type UnixWebSocketTransport } from "./transport.ts";
 import { createRemoteWebSocketTransport, type RemoteWebSocketTransport } from "./remote-runtime/transport.ts";
 import { validateRemoteTarget, type CredentialStore, type PublicRemoteTarget, type RemoteTargetRecord, type RemoteTargetRegistry } from "./remote-runtime/registry.ts";
+import { DEFAULT_LOCAL_PROFILE, localTargetId, type LocalProfileRecord } from "./local-profiles.ts";
 const DEFAULT_CAPABILITIES: readonly DeviceCapability[] = Object.freeze([...DEVICE_CAPABILITIES]);
+const REQUESTED_FEATURES: readonly string[] = ADDITIVE_FEATURES;
+const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
+  REQUESTED_FEATURES.filter(
+    (feature) => feature !== "prompt.images" && feature !== "transcript.images",
+  ),
+);
 
 export type DesktopTargetState = "disconnected" | "connecting" | "connected" | "pairing-required" | "error";
 export interface PublicDesktopTarget {
@@ -28,6 +35,9 @@ export interface TargetManagerOptions {
   readonly cursorStore: CursorStore;
   readonly cursorStoreFactory?: (targetId: string) => CursorStore;
   readonly events: TargetManagerEvents;
+  readonly localProfiles?: () => Promise<readonly LocalProfileRecord[]>;
+  readonly localTransportFactory?: (profileId: string) => UnixWebSocketTransport;
+  /** Legacy default-local transport hook. */
   readonly transportFactory?: () => UnixWebSocketTransport;
   readonly remoteTransportFactory?: (target: RemoteTargetRecord) => RemoteWebSocketTransport;
   readonly registry?: RemoteTargetRegistry;
@@ -75,7 +85,8 @@ export class DesktopTargetManager {
   private readonly cursorStore: CursorStore;
   private readonly cursorStoreFactory: (targetId: string) => CursorStore;
   private readonly events: TargetManagerEvents;
-  private readonly localTransportFactory: () => UnixWebSocketTransport;
+  private readonly localProfiles: () => Promise<readonly LocalProfileRecord[]>;
+  private readonly localTransportFactory: (profileId: string) => UnixWebSocketTransport;
   private readonly remoteTransportFactory: (target: RemoteTargetRecord) => RemoteWebSocketTransport;
   private readonly deviceId: string;
   private readonly deviceName: string;
@@ -83,7 +94,7 @@ export class DesktopTargetManager {
   private readonly registryQueue = { tail: Promise.resolve() };
   private readonly targetQueues = new Map<string, { tail: Promise<void> }>();
   private readonly runtimes = new Map<string, Runtime>();
-  private localState: DesktopTargetState = "disconnected";
+  private readonly localStates = new Map<string, DesktopTargetState>();
   private closed = false;
   private readonly generations = new Map<string, number>();
   private readonly latestWelcomes = new Map<string, WelcomeFrame>();
@@ -94,7 +105,12 @@ export class DesktopTargetManager {
     this.cursorStore = options.cursorStore;
     this.cursorStoreFactory = options.cursorStoreFactory ?? (() => this.cursorStore);
     this.events = options.events;
-    this.localTransportFactory = options.transportFactory ?? createLocalTransport;
+    this.localProfiles = options.localProfiles ?? (() => Promise.resolve([DEFAULT_LOCAL_PROFILE]));
+    this.localTransportFactory = options.localTransportFactory ?? (
+      options.transportFactory === undefined
+        ? (profileId) => createLocalTransport(profileId)
+        : () => options.transportFactory!()
+    );
     this.remoteTransportFactory = options.remoteTransportFactory ?? ((target) => createRemoteWebSocketTransport({ target }));
     this.registry = options.registry;
     this.deviceId = options.deviceId ?? "desktop";
@@ -104,17 +120,28 @@ export class DesktopTargetManager {
   }
 
   isConnected(targetId = "local"): boolean { return this.runtimes.get(targetId)?.client.state === "ready"; }
-  isPaired(targetId: string): boolean { return this.runtimes.get(targetId)?.paired ?? (targetId === "local"); }
+  isPaired(targetId: string): boolean { return this.runtimes.get(targetId)?.paired ?? (localProfileId(targetId) !== undefined); }
   pairingStatus(targetId: string): { readonly targetId: string; readonly state: DesktopTargetState; readonly paired: boolean } {
     const runtime = this.runtimes.get(targetId);
-    if (targetId === "local") return { targetId, state: this.localState, paired: true };
+    if (localProfileId(targetId) !== undefined)
+      return { targetId, state: this.localStates.get(targetId) ?? "disconnected", paired: true };
     const state = runtime === undefined ? "disconnected" : this.stateFor(runtime.client.state);
     return { targetId, state, paired: runtime?.paired ?? false };
   }
   async listTargets(): Promise<readonly PublicDesktopTarget[]> {
     const remote = this.registry === undefined ? [] : await this.registry.list();
-    const local: PublicDesktopTarget = { targetId: "local", label: "Local OMP", kind: "local", state: this.localState, paired: true };
-    const targets = [local, ...remote.map((target) => this.publicTarget(target))];
+    const profiles = await this.localProfiles();
+    const local = profiles.map((profile): PublicDesktopTarget => {
+      const targetId = localTargetId(profile.profileId);
+      return {
+        targetId,
+        label: profile.profileId === "default" ? "Local OMP" : profile.label,
+        kind: "local",
+        state: this.localStates.get(targetId) ?? "disconnected",
+        paired: true,
+      };
+    });
+    const targets = [...local, ...remote.map((target) => this.publicTarget(target))];
     this.events.onTargets?.(targets);
     return targets;
   }
@@ -130,7 +157,7 @@ export class DesktopTargetManager {
   }
   async removeTarget(targetId: string): Promise<void> {
     return enqueueTarget(this.targetQueues, targetId, async () => {
-      if (targetId === "local") throw new Error("local target cannot be removed");
+      if (localProfileId(targetId) !== undefined) throw new Error("local target cannot be removed");
       await this.closeRuntime(targetId);
       if (this.credentials !== undefined) await this.credentials.revoke(targetId);
       await enqueue(this.registryQueue, async () => { if (this.registry !== undefined) await this.registry.remove(targetId); });
@@ -148,7 +175,7 @@ export class DesktopTargetManager {
   }
   async pairStart(targetId: string, code: string): Promise<{ readonly targetId: string; readonly paired: boolean }> {
     return enqueueTarget(this.targetQueues, targetId, async () => {
-      if (targetId !== "local") {
+      if (localProfileId(targetId) === undefined) {
         const remote = await this.remoteTarget(targetId);
         const current = this.runtimes.get(targetId);
         if (current !== undefined && !sameCapabilities(current.requestedCapabilities, remote.requestedCapabilities)) {
@@ -288,8 +315,9 @@ export class DesktopTargetManager {
   }
   private async connectNow(targetId: string): Promise<"connecting" | "connected"> {
     if (this.closed) throw new Error("target manager is closed");
-    const remote = targetId === "local" ? undefined : await this.remoteTarget(targetId);
-    const requestedCapabilities = Object.freeze([...(remote === undefined ? this.capabilities : remote.requestedCapabilities)]);
+    const local = await this.localProfile(targetId);
+    const remote = local === undefined ? await this.remoteTarget(targetId) : undefined;
+    const requestedCapabilities = Object.freeze([...(local !== undefined ? this.capabilities : remote!.requestedCapabilities)]);
     const existing = this.runtimes.get(targetId);
     if (existing?.client.state === "ready" && sameCapabilities(existing.requestedCapabilities, requestedCapabilities)) {
       const welcome = this.latestWelcomes.get(targetId);
@@ -308,14 +336,16 @@ export class DesktopTargetManager {
       }
     }
     const transportFactory = async (): Promise<Transport> => {
-      const transport = remote === undefined || remote === null ? this.localTransportFactory() : this.remoteTransportFactory(remote);
+      const transport = local === undefined
+        ? this.remoteTransportFactory(remote!)
+        : this.localTransportFactory(local.profileId);
       await transport.open();
       return transport;
     };
     const clientOptions = {
       transport: transportFactory,
       ...(remote?.expectedHostId === undefined ? {} : { hostId: remote.expectedHostId, expectedHostId: remote.expectedHostId }),
-      ...(remote === undefined || this.credentials === undefined ? {} : {
+      ...(local !== undefined || this.credentials === undefined ? {} : {
         authentication: () => {
           try {
             return this.credentials!.withCredential(targetId, (value) => ({ deviceId: value.deviceId, deviceToken: value.token }));
@@ -331,12 +361,13 @@ export class DesktopTargetManager {
       }),
       cursorStore: this.cursorStoreFactory(targetId),
       capabilities: requestedCapabilities,
-      requestedFeatures: ADDITIVE_FEATURES,
-      client: { name: "T4 Code", version: "0.1.11", build: "desktop", platform: process.platform },
+      requestedFeatures: REQUESTED_FEATURES,
+      compatibilityRequestedFeatures: COMPATIBILITY_FEATURES,
+      client: { name: "T4 Code", version: "0.1.21", build: "desktop", platform: process.platform },
       reconnect: { attemptCap: 12, baseMs: 250, maxMs: 10_000 },
     };
     const client = createOmpClient(clientOptions);
-    const runtime: Runtime = { generation, client, requestedCapabilities, paired: remote === undefined || hasCredential };
+    const runtime: Runtime = { generation, client, requestedCapabilities, paired: local !== undefined || hasCredential };
     this.runtimes.set(targetId, runtime);
     client.onFrame((frame) => {
       if (this.generations.get(targetId) !== generation) return;
@@ -346,7 +377,7 @@ export class DesktopTargetManager {
     client.onState((snapshot) => {
       if (this.generations.get(targetId) !== generation) return;
       const state = this.stateFor(snapshot.state);
-      if (targetId === "local") this.localState = state;
+      if (local !== undefined) this.localStates.set(targetId, state);
       this.events.onState({ targetId, state });
     });
     client.onError((error) => {
@@ -373,7 +404,7 @@ export class DesktopTargetManager {
     if (runtime !== undefined) await runtime.client.close();
   }
   private publishState(targetId: string, state: DesktopTargetState): void {
-    if (targetId === "local") this.localState = state;
+    if (localProfileId(targetId) !== undefined) this.localStates.set(targetId, state);
     this.events.onState({ targetId, state });
   }
   private stateFor(state: OmpClient["state"]): DesktopTargetState {
@@ -394,6 +425,25 @@ export class DesktopTargetManager {
       mode: target.mode,
       status: target.status,
     };
+  }
+
+  private async localProfile(targetId: string): Promise<LocalProfileRecord | undefined> {
+    const profileId = localProfileId(targetId);
+    if (profileId === undefined) return undefined;
+    const profile = (await this.localProfiles()).find((record) => record.profileId === profileId);
+    if (profile === undefined) throw new Error("target not found");
+    return profile;
+  }
+}
+
+function localProfileId(targetId: string): string | undefined {
+  if (targetId === "local") return "default";
+  if (!targetId.startsWith("local:")) return undefined;
+  const profileId = targetId.slice("local:".length);
+  try {
+    return localTargetId(profileId) === targetId ? profileId : undefined;
+  } catch {
+    return undefined;
   }
 }
 export { DesktopTargetManager as LocalTargetManager };

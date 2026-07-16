@@ -19,6 +19,7 @@ describe("remote target runtime", () => {
     expect(await fails(() => registry.put({ ...target("public"), address: "8.8.8.8" }))).toBe(true);
     expect(await fails(() => registry.put({ ...target("lan"), address: "192.168.1.2" }))).toBe(true);
     expect(await fails(() => registry.put({ ...target("bad"), mode: "serve", address: "https://host.ts.net/?token=x" }))).toBe(true);
+    expect(await fails(() => registry.put({ ...target("local:fable-swarm"), address: "100.64.0.4" }))).toBe(true);
   });
   it("serializes concurrent mutations and keeps credentials encrypted", async () => {
     const targetStore = new Store({ version: 1, records: [] });
