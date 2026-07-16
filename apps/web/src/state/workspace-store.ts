@@ -123,7 +123,7 @@ function readWorkspaceProjects(value: unknown): readonly WorkspaceRailProject[] 
   for (const item of value) {
     if (item === null || typeof item !== "object") continue;
     const project = item as Partial<WorkspaceRailProject>;
-    if (typeof project.hostId !== "string" || typeof project.projectId !== "string" || typeof project.name !== "string" || project.hostId === "" || project.projectId === "" || project.name === "") continue;
+    if (typeof project.hostId !== "string" || typeof project.projectId !== "string" || typeof project.name !== "string" || project.hostId === "" || project.projectId === "" || project.name === "" || /[\\/]/u.test(project.projectId)) continue;
     result.set(`${project.hostId}\u0000${project.projectId}`, { hostId: project.hostId, projectId: project.projectId, name: project.name });
   }
   return [...result.values()];

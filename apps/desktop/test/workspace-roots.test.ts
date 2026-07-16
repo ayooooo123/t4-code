@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
@@ -49,13 +50,20 @@ describe("WorkspaceRootsService", () => {
     const service = new WorkspaceRootsService({ store: store(), ids: (() => {
       let index = 0;
       return () => `id-${++index}`;
-    })() });
+    })(), agentDirectory: join(base, "agent"), homeDirectory: base } as ConstructorParameters<typeof WorkspaceRootsService>[0]);
     await service.addRoot(root);
 
     const project = await service.createProject("mobile-app");
 
     expect(project.name).toBe("mobile-app");
-    expect(project.id).toBe(await realpath(join(root, "mobile-app")));
+    const path = await realpath(join(root, "mobile-app"));
+    expect(project.id).toBe(`project-${createHash("sha256").update(path).digest("hex").slice(0, 24)}`);
+    const sessionFiles = await readdir(join(base, "agent", "sessions", "-projects-mobile-app"));
+    expect(sessionFiles).toHaveLength(1);
+    const session = await readFile(join(base, "agent", "sessions", "-projects-mobile-app", sessionFiles[0]!), "utf8");
+    const [titleSlot, header] = session.trimEnd().split("\n");
+    expect(Buffer.byteLength(`${titleSlot}\n`)).toBe(256);
+    expect(JSON.parse(header!)).toMatchObject({ type: "session", version: 3, cwd: path });
     await expect(service.createProject("../escape")).rejects.toThrow("folder name");
     await expect(service.createProject("nested/project")).rejects.toThrow("folder name");
   });

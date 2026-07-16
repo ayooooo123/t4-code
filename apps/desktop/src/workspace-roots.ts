@@ -1,6 +1,7 @@
-import { lstat, mkdir, realpath } from "node:fs/promises";
-import { basename, relative, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, writeFile } from "node:fs/promises";
+import { basename, join, relative, resolve, sep } from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 
 export interface WorkspaceRoot {
   readonly id: string;
@@ -27,6 +28,11 @@ export interface WorkspaceRootsStore {
 export interface WorkspaceRootsServiceOptions {
   readonly store: WorkspaceRootsStore;
   readonly ids?: () => string;
+  /** OMP's session home; configurable for non-default OMP installs and tests. */
+  readonly agentDirectory?: string;
+  readonly homeDirectory?: string;
+  readonly now?: () => number;
+  readonly sessionIds?: () => string;
 }
 
 function within(root: string, candidate: string): boolean {
@@ -36,6 +42,22 @@ function within(root: string, candidate: string): boolean {
 
 function safeName(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._ -]{0,80}$/u.test(value) && value !== "." && value !== "..";
+}
+
+function uuidV7(now: number): string {
+  const bytes = randomBytes(16);
+  for (let index = 5; index >= 0; index--) bytes[index] = Math.floor(now / (256 ** (5 - index))) & 0xff;
+  bytes[6] = (bytes[6]! & 0x0f) | 0x70;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function titleSlot(updatedAt: string): string {
+  const line = (pad: string): string => `${JSON.stringify({ type: "title", v: 1, title: "", updatedAt, pad })}\n`;
+  const value = line(" ".repeat(256 - Buffer.byteLength(line(""), "utf8")));
+  if (Buffer.byteLength(value, "utf8") !== 256) throw new Error("could not create OMP session title slot");
+  return value;
 }
 
 function record(value: unknown): WorkspaceRootsRecord {
@@ -51,7 +73,18 @@ function record(value: unknown): WorkspaceRootsRecord {
 export class WorkspaceRootsService {
   private readonly store: WorkspaceRootsStore;
   private readonly ids: () => string;
-  constructor(options: WorkspaceRootsServiceOptions) { this.store = options.store; this.ids = options.ids ?? randomUUID; }
+  private readonly agentDirectory: string;
+  private readonly homeDirectory: string;
+  private readonly now: () => number;
+  private readonly sessionIds: () => string;
+  constructor(options: WorkspaceRootsServiceOptions) {
+    this.store = options.store;
+    this.ids = options.ids ?? randomUUID;
+    this.agentDirectory = options.agentDirectory ?? process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
+    this.homeDirectory = options.homeDirectory ?? homedir();
+    this.now = options.now ?? Date.now;
+    this.sessionIds = options.sessionIds ?? (() => uuidV7(this.now()));
+  }
 
   async list(): Promise<{ readonly roots: readonly WorkspaceRoot[]; readonly activeRootId: string | null }> {
     const value = record(await this.store.load());
@@ -87,9 +120,31 @@ export class WorkspaceRootsService {
     if (!within(canonicalRoot, canonicalTarget)) throw new Error("project must stay inside the active root");
     const stat = await lstat(canonicalTarget);
     if (!stat.isDirectory()) throw new Error("project is not a directory");
-    // OMP uses its project id as the working directory. The host validates and
-    // creates this path before it is ever passed to an appserver command.
-    return { id: canonicalTarget, name };
+    // OMP derives a stable opaque project id from the canonical working
+    // directory. `session.create` accepts this identifier, never a path.
+    const projectId = `project-${createHash("sha256").update(canonicalTarget).digest("hex").slice(0, 24)}`;
+    await this.createEmptyOmpSession(canonicalTarget);
+    return { id: projectId, name };
+  }
+
+  private async createEmptyOmpSession(cwd: string): Promise<void> {
+    // OMP derives session-directory names from canonical paths. This matters on
+    // macOS, where /var is a symlink to /private/var (and for symlinked homes).
+    const canonicalHome = await realpath(this.homeDirectory).catch(() => resolve(this.homeDirectory));
+    const homeRelative = relative(canonicalHome, cwd);
+    const directoryName = within(canonicalHome, cwd)
+      ? `-${homeRelative.replace(/[\\/:]/gu, "-")}`
+      : `--${cwd.replace(/^[/\\]/u, "").replace(/[\\/:]/gu, "-")}--`;
+    const sessionDirectory = join(this.agentDirectory, "sessions", directoryName);
+    const timestamp = new Date(this.now()).toISOString();
+    const sessionId = this.sessionIds();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(sessionId)) {
+      throw new Error("could not create OMP session id");
+    }
+    const sessionFile = join(sessionDirectory, `${timestamp.replace(/[:.]/gu, "-")}_${sessionId}.jsonl`);
+    const header = `${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp, cwd })}\n`;
+    await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(sessionFile, titleSlot(timestamp) + header, { encoding: "utf8", flag: "wx", mode: 0o600 });
   }
 
   private async directory(input: string): Promise<string> {

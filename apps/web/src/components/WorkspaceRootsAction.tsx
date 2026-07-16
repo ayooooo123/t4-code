@@ -61,7 +61,7 @@ export function WorkspaceRootsAction({ placement = "toolbar" }: { readonly place
       const binding = snapshot?.targetHosts.entries().next().value as readonly [string, string] | undefined;
       if (binding !== undefined) workspaceStore.getState().addWorkspaceProject({ hostId: binding[1], projectId: project.project.id, name: project.project.name });
       setName("");
-      setMessage(binding === undefined ? `Created ${project.project.name}. Connect to OMP to show it in the left rail.` : `Created ${project.project.name}. It is now in the left rail.`);
+      setMessage(binding === undefined ? `Created ${project.project.name} and its first OMP session. Connect to OMP to sync it into the left rail.` : `Created ${project.project.name} and its first OMP session. Syncing it into the left rail…`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Couldn’t create the project folder."); }
     finally { setBusy(false); }
   };

@@ -162,6 +162,20 @@ describe("persistence", () => {
     expect(parsed?.sessionViewById["bad"]).toBeUndefined();
   });
 
+  it("drops legacy path project identifiers from persisted renderer state", () => {
+    const parsed = parsePersistedWorkspace({
+      version: WORKSPACE_STATE_VERSION,
+      workspaceProjects: [
+        { hostId: "host-1", projectId: "/Users/me/Projects/PearTube", name: "PearTube" },
+        { hostId: "host-1", projectId: "project-0123456789abcdef01234567", name: "PearTube" },
+      ],
+    });
+
+    expect(parsed?.workspaceProjects).toEqual([
+      { hostId: "host-1", projectId: "project-0123456789abcdef01234567", name: "PearTube" },
+    ]);
+  });
+
   it("never writes ephemeral overlay state", () => {
     const { store } = makeStore();
     store.getState().setPaletteOpen(true);

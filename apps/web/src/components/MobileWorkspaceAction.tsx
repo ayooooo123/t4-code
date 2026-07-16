@@ -1,18 +1,14 @@
 import { Button, Dialog, DialogClose, DialogDescription, DialogFooter, DialogHeader, DialogPopup, DialogTitle, IconButton, Spinner } from "@t4-code/ui";
-import { useNavigate } from "@tanstack/react-router";
 import { FolderPlus } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { createLiveSession } from "../features/session-runtime/live-create.ts";
-import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
+import { useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
 import { currentNativeMobilePeerInvite, nativeMobilePlatform } from "../platform/native-mobile.ts";
 import { rendererPlatform, workspaceStore } from "../state/store-instance.ts";
 
 export function MobileWorkspaceAction() {
   const shell = rendererPlatform.shell;
   const snapshot = useDesktopRuntimeSnapshot();
-  const controller = desktopRuntime();
-  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [roots, setRoots] = useState<{ readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null }>({ roots: [], activeRootId: null });
   const [name, setName] = useState("");
@@ -32,16 +28,15 @@ export function MobileWorkspaceAction() {
     finally { setBusy(false); }
   };
   const create = async (): Promise<void> => {
-    if (controller === null || snapshot === null || name.trim() === "") return;
+    if (snapshot === null || name.trim() === "") return;
     const binding = snapshot.targetHosts.entries().next().value as readonly [string, string] | undefined;
     if (binding === undefined) { setMessage("Connect to the desktop before creating a project."); return; }
     setBusy(true); setMessage(null);
     try {
       const project = await shell.workspaceProjectCreate!({ name: name.trim() });
       workspaceStore.getState().addWorkspaceProject({ hostId: binding[1], projectId: project.project.id, name: project.project.name });
-      const created = await createLiveSession(controller, { targetId: binding[0], hostId: binding[1], projectId: project.project.id });
-      setOpen(false);
-      void navigate({ params: { sessionId: created.viewId }, to: "/sessions/$sessionId" });
+      setName("");
+      setMessage(`Created ${project.project.name} and its first OMP session. Syncing it into the workspace…`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Couldn’t create the project."); }
     finally { setBusy(false); }
   };
