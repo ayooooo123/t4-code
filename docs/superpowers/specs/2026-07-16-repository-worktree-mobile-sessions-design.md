@@ -53,7 +53,7 @@ The renderer and mobile peer receive only safe metadata:
 - Local availability
 - Whether T4 created or acquired the clone
 
-Absolute paths never leave the desktop backend.
+Repository administration frames never contain absolute paths. Structured session data uses logical paths such as `repo://primary/src/main.ts`. Free-form OMP transcript, model prose, terminal output, and tool output are different: a remote peer with transcript/terminal capability may see host paths naturally printed by those streams. T4 replaces known registered-worktree prefixes with logical repo aliases in bounded structured logs and tool metadata, but does not claim perfect redaction of arbitrary free-form text. Mobile cannot submit host paths merely because one appeared in authorized session output.
 
 The registry builds on the existing approved-workspace-root boundary. A local repository must canonicalize inside an approved root before it can be registered or used remotely.
 
@@ -85,6 +85,15 @@ OMP receives an additive multi-root workspace capability:
 4. The runtime treats every registered canonical root as workspace scope for read and write policy while keeping the primary root as `cwd` and the primary Git/LSP context.
 5. The session persists the registered workspace roots locally so resume survives appserver restart.
 
+Every registered root has a unique stable alias persisted with the session. Worktrees use a sibling layout:
+
+```text
+<t4-workspaces>/<workspace-id>/repos/<primary-alias>
+<t4-workspaces>/<workspace-id>/repos/<secondary-alias>
+```
+
+OMP starts in the primary worktree. Additional repositories are reachable through stable relative paths such as `../shared-library`, and OMP's system workspace context lists each alias, relative path, repo ID, base revision, and branch. Structured tool/file events use `repo://<alias>/<relative-path>`. Aliases are sanitized from repository display names, collision-suffixed, and never changed when the session resumes.
+
 The registration command requires a new local administrative capability and is not granted to ordinary proxied mobile commands. Mobile asks T4 to prepare a workspace through T4's typed peer protocol; it never calls OMP workspace registration directly.
 
 OMP's first multi-root version may provide Git and LSP status only for the primary repository. Additional repositories remain fully accessible through their registered aliases and explicit `git -C`/path operations. The UI must state which repository is primary.
@@ -97,19 +106,21 @@ Mobile is a control surface over the authenticated direct peer. It may select ap
 
 Every selected repository receives a worktree before the first prompt. Although lazy creation would avoid unused worktrees, T4 cannot intercept OMP's exact first write safely because OMP executes tools directly. Eager preparation is therefore required for deterministic isolation.
 
-Workspace preparation is transactional:
+Workspace preparation is journaled and transactional:
 
 1. Resolve and canonicalize every repo.
 2. Validate Git state and the selected base ref.
 3. Fetch only when the requested ref requires it and the user initiated network work.
 4. Derive and validate a branch name.
 5. Find one collision-free branch name across all selected repositories.
-6. Create every branch and worktree beneath T4's workspace directory.
-7. Register the complete root set with OMP.
-8. Persist the workspace manifest.
-9. Create the OMP session.
+6. Persist and fsync a `planned` job manifest containing the intended resources, immutable base commits, and a unique ownership nonce.
+7. Create every branch and worktree beneath T4's workspace directory, atomically recording each completed mutation in the journal.
+8. For a multi-repo workspace, register the complete root set with OMP and journal the registration ID. A single-repo Increment 1 session uses the existing project/session mechanism.
+9. Create the OMP session and journal the reconciled session ID.
 
-If any step before session creation fails, T4 rolls back only branches, refs, and worktrees created by that preparation job. The base checkout and pre-existing refs remain untouched. If OMP session creation has an unknown outcome, T4 reconciles against appserver before retrying.
+The manifest exists before the first local or remote mutation. Acquisition jobs use the same journal rule before cloning or requesting a fork. If any step before session creation fails, T4 rolls back only local branches, refs, clones, and worktrees whose ownership nonce is recorded by that job. The base checkout and pre-existing refs remain untouched. External GitHub mutations such as a newly created fork are recorded but never silently deleted during rollback; the UI offers a separate explicit cleanup action.
+
+If OMP session creation has an unknown outcome, T4 enters `session_unknown`, performs no rollback, and reconciles against appserver before retrying or offering cleanup.
 
 ### Base refs
 
@@ -124,6 +135,8 @@ T4 derives a slug from the first prompt and previews it before submission, for e
 `t4/fix-hyperdht-reconnect`
 
 The user may edit the preview. Names are sanitized and checked against local and remote refs in every selected repository. When the name exists anywhere, T4 chooses one numeric suffix that is free across the entire repo set, keeping the branch name consistent for the multi-repo task. Existing branches are never reset or reused implicitly.
+
+Collision checks always include local refs and existing remote-tracking refs. The launcher offers **Refresh remote branches**; when enabled, T4 performs a bounded fetch before resolving bases and choosing the suffix. Without refresh, the UI labels remote collision state as cached and a later push may still report a newly created remote conflict.
 
 ## New Task Experience
 
@@ -163,7 +176,7 @@ Submitting the first prompt displays host-reported stages:
 2. Forking or cloning when requested
 3. Resolving/fetching base refs
 4. Creating worktrees and branches
-5. Registering OMP workspace scope
+5. Registering OMP workspace scope when multi-repo support is active
 6. Starting the session
 
 Failures preserve the prompt and selections, identify the failing repository and stage, and offer bounded retry or cancel. The agent does not start in a partially prepared workspace.
@@ -194,6 +207,8 @@ GitHub is the only acquisition provider in this version. GitLab and generic remo
 
 Acquisition is idempotent. Reconnecting or retrying with the same operation ID does not fork or clone twice. Existing destination directories, conflicting remote definitions, missing permissions, organization restrictions, authentication failures, and unavailable networks produce distinct actionable errors.
 
+All Git/GitHub subprocesses execute with argument vectors and no shell. Parsed GitHub slugs must match bounded owner/repository rules; T4 constructs canonical remotes rather than executing a pasted URL. Refs reject leading-option forms and are validated with Git's ref validator, then resolved to immutable commits using end-of-options handling. Git commands use option termination where supported. Environment and subprocess output are bounded and sanitized before logging, and credential-helper or authorization output is never forwarded.
+
 ## Direct Peer Protocol
 
 The authenticated peer protocol gains typed operations:
@@ -214,6 +229,24 @@ The protocol accepts repo IDs, GitHub slugs, branch refs, requested actions, and
 
 Cached mobile metadata is scoped to the paired desktop identity. Offline mode may display that safe cache, but all Git/session mutations remain disabled until the direct connection returns. There is no relay fallback.
 
+### Cancellation states
+
+Preparation uses explicit states:
+
+- `planned`
+- `acquiring`
+- `preparing_worktrees`
+- `registering_omp`
+- `session_pending`
+- `session_unknown`
+- `active`
+- `finishing`
+- `cleaning`
+- `complete`
+- `failed`
+
+`workspace.cancel` is valid only through `session_pending`. It requests subprocess cancellation, waits for the current atomic Git step to settle, and rolls back journal-owned local resources. During `registering_omp`, it also deregisters a confirmed unused OMP workspace. During `session_unknown`, cancellation is held until reconciliation determines whether a session exists. Once state is `active`, cancel is unavailable; the user must use the explicit stop/finish/archive lifecycle so a real session is never mistaken for failed preparation. External fork cleanup remains separate and explicit.
+
 ## Workspace Manifest and Recovery
 
 Every prepared session has a versioned desktop-private manifest containing:
@@ -221,6 +254,7 @@ Every prepared session has a versioned desktop-private manifest containing:
 - OMP session ID when known
 - T4 workspace ID and preparation job ID
 - Selected repository IDs and primary repository ID
+- Stable logical alias for every selected repository
 - Canonical worktree locations
 - Base branches and immutable base commits
 - Created branch names
@@ -229,7 +263,7 @@ Every prepared session has a versioned desktop-private manifest containing:
 - Preparation, review, and cleanup state
 - Created-resource ownership markers
 
-The manifest is the recovery source of truth for reopening sessions, reconciling unknown outcomes, and cleaning up after crashes. Mobile receives only a safe projection.
+The manifest/journal is created before mutation and is the recovery source of truth for reopening sessions, reconciling unknown outcomes, and cleaning up after crashes. Every state transition is written through a same-directory temporary file, fsynced, and renamed before the next mutation. Mobile receives only a safe projection.
 
 Startup recovery scans incomplete manifests and reconciles Git worktrees, refs, acquisition destinations, and OMP sessions before offering retry or cleanup. T4 never guesses that a failed command did or did not mutate state.
 
@@ -256,9 +290,23 @@ Desktop and mobile may request:
 
 Finish operations are per repository and resumable. A successful push or PR in one repository is not rolled back because another repository failed. T4 shows the partial result and offers targeted retry.
 
-T4 never auto-merges. Local merge verifies the target checkout and index are clean, records the exact source/target refs, and stops on conflicts. Discard removes only resources marked as created by the session and never deletes a remote branch by default.
+T4 never auto-merges. Local merge has two safe paths:
+
+- If the target branch is not checked out elsewhere, T4 creates a temporary integration worktree, performs the merge there, and updates the target ref only when its old commit still matches the preflight value. Conflict aborts and removes the integration worktree.
+- If the target branch is checked out in a user worktree, T4 refuses background ref movement. It may merge in that checkout only after an explicit confirmation that identifies the checkout and after verifying its index/worktree are clean. On conflict it immediately attempts `git merge --abort`; abort failure is surfaced with recovery instructions and the checkout is never reported clean.
+
+The invariant that T4 never edits a base checkout applies to preparation and session work. The second local-merge path is an explicit finish action requested by the user. Discard removes only resources marked as created by the session and never deletes a remote branch by default.
 
 Archiving does not silently delete work. Clean worktrees may be removed while preserving their branches; dirty worktrees stay recoverable until the user explicitly commits or discards. Cleanup failure remains visible and retryable.
+
+## Git Repository Edge Cases
+
+- Bare repositories are rejected as session repositories.
+- Detached HEAD has no implicit base; the user must select a branch or commit, and creating a session branch from that immutable commit is explicit.
+- Nested repositories are separate scope. Selecting a parent does not silently grant or prepare nested Git repositories.
+- Submodules are not initialized or updated automatically in the first version. Existing checked-out submodule state is inherited according to normal Git worktree behavior; missing submodules are reported.
+- Git LFS uses the desktop's installed Git/LFS configuration. Smudge/fetch failures are surfaced as acquisition/preparation failures; T4 does not implement an LFS client.
+- Sparse-checkout repositories are preserved only when Git can create a worktree with valid sparse state. Unsupported or inconsistent sparse configurations fail preflight rather than expanding the checkout silently.
 
 ## Error Taxonomy
 
@@ -291,7 +339,7 @@ Messages contain safe repo names and stages, never raw credentials, command outp
 - Desktop New Task launcher
 - Base-branch selector and prompt-derived branch preview
 - Transactional branch/worktree creation
-- OMP session startup in the prepared primary worktree
+- OMP session startup in the prepared primary worktree through the existing single-project/session mechanism; multi-root registration is not required in this increment
 - Manifest persistence, reopen, recovery, and cleanup
 
 ### Increment 2: Multi-repo scope and mobile parity
@@ -353,6 +401,14 @@ Temporary repositories prove:
 - Debug/release APK path is reported and installed for validation
 
 A live GitHub fork/clone/PR acceptance test uses a disposable repository only after explicit approval for that external mutation.
+
+## Retention
+
+- Active/recoverable manifests live as long as their sessions or owned worktrees.
+- Completed manifests retain their safe audit summary for 30 days, after which cleanup may remove them if no owned resources remain.
+- Each job keeps a bounded ring of 256 progress events; full subprocess output is never persisted by default.
+- Safe cached mobile repository metadata expires after 30 days without reconnect and is deleted when the pairing is revoked.
+- Diagnostic snippets are capped at 1 MiB per job, redacted before persistence, and removed with the completed manifest.
 
 ## Non-Goals
 
