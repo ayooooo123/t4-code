@@ -116,7 +116,7 @@ The topology is intentionally acyclic. Every specialist may spawn only `verifier
 
 `shipper` is explicitly permitted to spawn `verifier` after packaging and launch. The primary session may also invoke `verifier` directly for non-shipping acceptance checks.
 
-Only the primary session or `shipper` may present work as delivered, and delivery still requires the relevant `verifier` result.
+Only the primary session or `shipper` may present work as delivered, and delivery requires a relevant `verifier` result whose `verdict` is `pass`. A completed verifier run with `verdict: fail` blocks delivery.
 
 ## Completion Contract
 
@@ -125,7 +125,8 @@ Every non-verifier definition will enforce this structured handoff schema:
 - `outcome`: enum `complete`, `incomplete`, or `blocked`
 - `summary`: string containing the concise outcome
 - `changes`: array of objects with required string fields `path` and `description`
-- `verification`: array of objects with required string fields `command`, `result`, and `evidence`
+- `applicability`: array of objects with required fields `check` (string), `status` (enum `required` or `not_applicable`), and `reason` (string)
+- `verification`: array of objects with required string fields `check`, `result`, and `evidence`; `check` contains the exact command when automated and a concise procedure when manual
 - `artifacts`: array of strings containing exact paths or identifiers
 - `risks`: array of strings containing only concrete remaining uncertainty
 - `next_action`: string containing one next action, or an empty string when complete
@@ -136,7 +137,7 @@ Agents must not emit secrets, raw credentials, access tokens, or unnecessary per
 
 ## Acceptance Evidence
 
-The definition of completion depends on the changed surface. At task start, each agent lists applicable checks. A check may be marked not applicable only with a concrete reason in `risks`; analysis-only tasks do not require runtime mutation, and focused fixes do not need unrelated state coverage.
+The definition of completion depends on the changed surface. At task start, each agent records each relevant acceptance check in `applicability`. A check may be marked `not_applicable` only with a concrete reason; analysis-only tasks do not require runtime mutation, and focused fixes do not need unrelated state coverage. `risks` remains reserved for actual uncertainty.
 
 - P2P implementation affecting connection lifecycle: at least two real peers or an emulator/desktop peer pair connect, reconnect, and survive application reopen.
 - Android work: emulator launch, targeted log inspection, and an APK path.
@@ -149,7 +150,7 @@ No agent may use "should work" as acceptance evidence.
 
 ## Source of Truth, Installation, and Rollback
 
-The durable source of truth will be `config/omp-agents/` in this repository. It will contain the six agent Markdown files plus `manifest.json`, which records suite name, schema version, suite version, and the owned filenames. Each Markdown definition will include a suite/version marker in a comment so owned installed files can be distinguished from user-authored files.
+The durable source of truth will be `config/omp-agents/` in this repository. It will contain the six agent Markdown files plus `manifest.json`, which records suite name, schema version, suite version, and the owned filenames. Each Markdown definition will include a suite/version marker in a comment so owned installed files can be distinguished from user-authored files. The implementing primary session performs the initial bootstrap installation; once installed and validated, `shipper` owns later suite updates and uninstalls.
 
 The install process is all-or-nothing at the suite level:
 
