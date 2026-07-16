@@ -8,7 +8,7 @@ Make T4 Code feel like a local-first, serverless counterpart to the best Claude 
 - Choose a base branch per repository.
 - Start every new coding task on an isolated branch and Git worktree derived from the task.
 - Create, steer, review, and finish the same sessions from desktop or mobile.
-- Let mobile request GitHub clone and fork workflows without exposing desktop credentials or filesystem paths.
+- Let mobile request GitHub clone and fork workflows without exposing desktop credentials or filesystem paths through repository-administration APIs. Authorized free-form session streams may naturally contain host paths and are governed separately.
 
 Execution remains on the paired desktop through the existing direct HyperDHT connection. T4 must not add a hosted coordinator, relay, credential broker, or cloud execution service.
 
@@ -263,7 +263,7 @@ Every prepared session has a versioned desktop-private manifest containing:
 - Preparation, review, and cleanup state
 - Created-resource ownership markers
 
-The manifest/journal is created before mutation and is the recovery source of truth for reopening sessions, reconciling unknown outcomes, and cleaning up after crashes. Every state transition is written through a same-directory temporary file, fsynced, and renamed before the next mutation. Mobile receives only a safe projection.
+The manifest/journal is created before mutation and is the recovery source of truth for reopening sessions, reconciling unknown outcomes, and cleaning up after crashes. Every state transition is written through a same-directory temporary file, fsynced, renamed, and followed by an fsync of the manifest directory before the next mutation. Mobile receives only a safe projection.
 
 Startup recovery scans incomplete manifests and reconciles Git worktrees, refs, acquisition destinations, and OMP sessions before offering retry or cleanup. T4 never guesses that a failed command did or did not mutate state.
 
@@ -292,7 +292,7 @@ Finish operations are per repository and resumable. A successful push or PR in o
 
 T4 never auto-merges. Local merge has two safe paths:
 
-- If the target branch is not checked out elsewhere, T4 creates a temporary integration worktree, performs the merge there, and updates the target ref only when its old commit still matches the preflight value. Conflict aborts and removes the integration worktree.
+- If the target branch is not checked out elsewhere, T4 creates a temporary integration worktree detached at the preflight target commit and performs the merge there. It updates the target ref with an atomic compare-and-swap against that preflight commit. Conflict or compare-and-swap failure aborts and removes the integration worktree without moving the target.
 - If the target branch is checked out in a user worktree, T4 refuses background ref movement. It may merge in that checkout only after an explicit confirmation that identifies the checkout and after verifying its index/worktree are clean. On conflict it immediately attempts `git merge --abort`; abort failure is surfaced with recovery instructions and the checkout is never reported clean.
 
 The invariant that T4 never edits a base checkout applies to preparation and session work. The second local-merge path is an explicit finish action requested by the user. Discard removes only resources marked as created by the session and never deletes a remote branch by default.
@@ -379,7 +379,7 @@ Temporary repositories prove:
 - Idempotent replay and reconnect
 - Cancellation boundaries
 - Malformed input rejection
-- No path, credential, token, or command leakage
+- No credential, token, shell-command, or absolute-path leakage through repository administration frames, structured metadata/events, caches, or submitted mutations; authorized free-form transcript/terminal/tool streams are tested only for known-prefix aliasing and bounded credential redaction
 - Mobile cache scoping by paired desktop identity
 
 ### OMP integration tests
