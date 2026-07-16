@@ -24,7 +24,7 @@ They will coexist with OMP's bundled agents. Project-specific rules may layer ad
 Every agent will:
 
 - Lead with the outcome and keep progress updates concise.
-- Work autonomously through safe edits, tests, builds, installations, and app launches when those actions are within the requested scope.
+- Work autonomously through safe edits, tests, builds, and app launches when those actions are within the requested scope. Global installation is reserved for `shipper`.
 - Preserve unrelated work and avoid destructive Git operations.
 - Challenge a weak technical direction once with concrete evidence and a better alternative, then follow the user's decision without repeatedly reopening it.
 - Reproduce bugs before changing code and add a regression test when practical.
@@ -34,7 +34,22 @@ Every agent will:
 
 The global architecture constraint is literal: no hosted coordination service, blind relay, telemetry backend, public endpoint, or hidden server may be introduced unless the user explicitly approves it. Agents should prefer direct P2P, local-first state, resumable connections, explicit recovery states, and offline-safe behavior.
 
-## Roles and Model Routing
+## Role Configuration Matrix
+
+The implementation will use these exact model chains, thinking levels, tool allowlists, and spawn permissions. OMP tries model selectors in order. If every model in a chain is unavailable, the agent returns `blocked`; it must not silently select a model outside the chain.
+
+| Agent | Ordered model chain | Thinking | Tools | Spawns |
+| --- | --- | --- | --- | --- |
+| `p2p-architect` | `openai-codex/gpt-5.6-sol`, `anthropic/claude-opus-4-6`, `openai-codex/gpt-5.3-codex` | `max` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `edit`, `write`, `yield` | `verifier` |
+| `native-builder` | `openai-codex/gpt-5.3-codex`, `anthropic/claude-sonnet-5`, `openai-codex/gpt-5.6-sol` | `high` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `edit`, `write`, `yield` | `verifier` |
+| `product-designer` | `anthropic/claude-sonnet-5`, `openai-codex/gpt-5.3-codex`, `anthropic/claude-opus-4-6` | `high` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `edit`, `write`, `yield` | `verifier` |
+| `bug-hunter` | `openai-codex/gpt-5.6-sol`, `anthropic/claude-opus-4-6`, `openai-codex/gpt-5.3-codex` | `max` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `edit`, `write`, `yield` | `verifier` |
+| `shipper` | `openai-codex/gpt-5.3-codex`, `anthropic/claude-sonnet-5`, `openai-codex/gpt-5.6-sol` | `medium` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `edit`, `write`, `yield` | `verifier` |
+| `verifier` | `anthropic/claude-sonnet-5`, `openai-codex/gpt-5.3-codex`, `anthropic/claude-opus-4-6` | `high` | `read`, `grep`, `glob`, `bash`, `lsp`, `web_search`, `ast_grep`, `yield` | none |
+
+Removing `edit` and `write` from `verifier` prevents direct source edits. Its prompt will also restrict `bash` to read-only version-control inspection, tests, builds, packaging, emulator/device diagnostics, application launch, and log collection. It may create normal generated outputs from those tools, but must not use shell redirection or general filesystem commands to alter source, configuration, credentials, or installed applications. Installation remains `shipper` authority.
+
+## Role Responsibilities
 
 ### `p2p-architect`
 
@@ -42,7 +57,7 @@ The global architecture constraint is literal: no hosted coordination service, b
 - Authority: full implementation access
 - Owns direct-P2P architecture, peer identity, invitations, reconnects, persistence, multiple simultaneous peers, threat models, and network-state recovery.
 - Must trace behavior across desktop and mobile boundaries and test actual peer flows.
-- May delegate focused native, debugging, research, and verification work.
+- May delegate independent verification. Cross-specialist work returns to the primary session for a new delegation.
 
 ### `native-builder`
 
@@ -50,7 +65,7 @@ The global architecture constraint is literal: no hosted coordination service, b
 - Authority: full implementation access
 - Owns Electron/macOS, Android, native bridges, Gradle, packaging, emulators, devices, logs, and cross-platform integration.
 - Must inspect the real packaged application rather than relying only on development builds.
-- May delegate focused P2P, design, debugging, shipping, and verification work.
+- May delegate independent verification. Cross-specialist and shipping work returns to the primary session for a new delegation.
 
 ### `product-designer`
 
@@ -68,7 +83,7 @@ The global architecture constraint is literal: no hosted coordination service, b
 - Owns reproduction, evidence collection, root-cause isolation, fixes, and regression tests.
 - Must test hypotheses in order and avoid speculative multi-fix patches.
 - Stops after diagnosis only when the user explicitly requested diagnosis rather than a fix.
-- May delegate read-only research and verification.
+- May delegate independent verification. It performs its own focused research with its allowed tools.
 
 ### `shipper`
 
@@ -86,8 +101,6 @@ The global architecture constraint is literal: no hosted coordination service, b
 - Returns a pass/fail verdict backed by fresh evidence and cannot repair the change it is judging.
 - Cannot spawn recursive work or declare a failure fixed without rerunning the relevant check.
 
-Each definition may include ordered model fallbacks, but fallback models must preserve the role's capability. Model routing must not silently downgrade deep architecture or debugging work to a low-reasoning model.
-
 ## Delegation Boundaries
 
 The primary OMP session remains the decision-maker. It delegates bounded work to specialists:
@@ -99,47 +112,66 @@ The primary OMP session remains the decision-maker. It delegates bounded work to
 - Independent acceptance checks to `verifier`.
 - Packaging, installation, artifact delivery, and launch to `shipper`.
 
-Specialists may call only the agents required for a bounded subtask. Definitions will use explicit `spawns` lists instead of unrestricted recursive spawning. `verifier` will not spawn other agents. The design must prevent circular delegation chains.
+The topology is intentionally acyclic. Every specialist may spawn only `verifier`; `verifier` cannot spawn anything. Cross-specialist delegation always returns to the primary session, which starts the next specialist explicitly. A `native-builder` therefore cannot spawn `p2p-architect`, and a `p2p-architect` cannot spawn `native-builder`.
+
+`shipper` is explicitly permitted to spawn `verifier` after packaging and launch. The primary session may also invoke `verifier` directly for non-shipping acceptance checks.
 
 Only the primary session or `shipper` may present work as delivered, and delivery still requires the relevant `verifier` result.
 
 ## Completion Contract
 
-Every specialist handoff must report:
+Every non-verifier definition will enforce this structured handoff schema:
 
-- `outcome`: `complete`, `incomplete`, or `blocked`
-- `changes`: exact files and behavior changed or examined
-- `verification`: commands and user-visible flows exercised
-- `artifacts`: application, APK, package, or report paths when applicable
-- `risks`: concrete remaining uncertainty only
-- `next_action`: the single next action when incomplete
+- `outcome`: enum `complete`, `incomplete`, or `blocked`
+- `summary`: string containing the concise outcome
+- `changes`: array of objects with required string fields `path` and `description`
+- `verification`: array of objects with required string fields `command`, `result`, and `evidence`
+- `artifacts`: array of strings containing exact paths or identifiers
+- `risks`: array of strings containing only concrete remaining uncertainty
+- `next_action`: string containing one next action, or an empty string when complete
 
-Structured output schemas should enforce this contract where OMP's agent format supports them. Agents must not emit secrets, raw credentials, access tokens, or unnecessary personal identifiers in results.
+`verifier` uses the same required fields plus `verdict`, an enum of `pass`, `fail`, or `blocked`. Its `outcome` is `complete` when it reached an evidence-backed verdict, including `fail`; `blocked` is reserved for inability to perform the check. OMP schema validation failure makes the agent run incomplete and prevents delivery.
+
+Agents must not emit secrets, raw credentials, access tokens, or unnecessary personal identifiers in results.
 
 ## Acceptance Evidence
 
-The definition of completion depends on the work:
+The definition of completion depends on the changed surface. At task start, each agent lists applicable checks. A check may be marked not applicable only with a concrete reason in `risks`; analysis-only tasks do not require runtime mutation, and focused fixes do not need unrelated state coverage.
 
-- P2P work: at least two real peers or an emulator/desktop peer pair connect, reconnect, and survive application reopen.
+- P2P implementation affecting connection lifecycle: at least two real peers or an emulator/desktop peer pair connect, reconnect, and survive application reopen.
 - Android work: emulator launch, targeted log inspection, and an APK path.
 - Desktop work: packaged application launched from the installed bundle and its visible window checked.
-- UI work: loading, empty, error, disabled, reconnect, permission, and recovery states exercised.
+- UI work: every state added or changed is exercised; connection and permission work must cover the relevant loading, error, reconnect, permission, and recovery states.
 - Bug fixes: the original reproduction fails before the fix and passes afterward, with a regression test when practical.
 - Release work: clean diff check, focused tests, production build, artifact inspection, application launch, and an independent verifier verdict.
 
 No agent may use "should work" as acceptance evidence.
 
-## Installation and Validation
+## Source of Truth, Installation, and Rollback
 
-Implementation will create the definitions in a staging directory first, validate their frontmatter and OMP discovery behavior, and then install them globally. Existing user-authored agent definitions will be preserved; name conflicts will be surfaced rather than overwritten silently.
+The durable source of truth will be `config/omp-agents/` in this repository. It will contain the six agent Markdown files plus `manifest.json`, which records suite name, schema version, suite version, and the owned filenames. Each Markdown definition will include a suite/version marker in a comment so owned installed files can be distinguished from user-authored files.
+
+The install process is all-or-nothing at the suite level:
+
+1. Validate all staged definitions and the manifest before touching the global directory.
+2. Preflight every destination name. An unmarked, user-authored conflict aborts the entire install without changes.
+3. Back up every existing owned definition and the installed manifest to a timestamped suite backup directory.
+4. Write all new definitions through same-directory temporary files and rename them into place.
+5. Run discovery and smoke validation. Any failure restores the complete backup and removes only files created by the failed attempt.
+
+Updates use the same procedure and increment the suite version. Uninstall reads the installed manifest, removes only files carrying the matching suite marker, and can restore the most recent backup. It never deletes unrelated agent definitions.
+
+## Validation
+
+Implementation will create the definitions in the repository source directory first, validate their frontmatter and OMP discovery behavior, and then install them globally. Existing user-authored agent definitions will be preserved.
 
 Validation will include:
 
 1. Parsing every agent definition through OMP's normal discovery path.
 2. Confirming the intended model, tools, and spawn restrictions for each agent.
-3. Invoking every agent with a small role-appropriate smoke task.
+3. Invoking every agent with a small, non-mutating, role-appropriate smoke task.
 4. Confirming structured handoff fields are present and no recursive spawn loop is possible.
-5. Verifying the agents are visible from projects outside the T4 repository.
+5. Verifying the agents are visible from both the T4 repository and an unrelated temporary project.
 
 ## Non-Goals
 
