@@ -1,4 +1,4 @@
-import type { OmpClient, OmpClientOptions, PublicServerFrame } from "@t4-code/client";
+import { createOmpClient, type OmpClient, type OmpClientOptions, type OmpTransport, type PublicServerFrame } from "@t4-code/client";
 import { commandId, confirmationId, hostId, requestId } from "@t4-code/protocol";
 import { describe, expect, it, afterEach } from "vite-plus/test";
 
@@ -382,5 +382,354 @@ describe("browser platform boundary", () => {
     await shell.disconnect({ targetId: "remote" });
     stopFrames();
     expect(closed).toBe(true);
+  });
+
+  it("manages overlapping transport openings and prevents old ones from keeping sockets open or breaking new ones", async () => {
+    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws" }));
+
+    class ControllableWebSocket {
+      static readonly OPEN = 1;
+      readyState = 0; // CONNECTING
+      binaryType = "blob";
+      closed = false;
+      closeCode: number | undefined;
+      closeReason: string | undefined;
+      url: string;
+      protocols: string | string[] | undefined;
+      private readonly listeners = new Map<string, Set<EventListener>>();
+
+      static instances: ControllableWebSocket[] = [];
+
+      constructor(url: string, protocols?: string | string[]) {
+        this.url = url;
+        this.protocols = protocols;
+        ControllableWebSocket.instances.push(this);
+      }
+
+      addEventListener(type: string, listener: EventListener): void {
+        const set = this.listeners.get(type) ?? new Set<EventListener>();
+        set.add(listener);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, listener: EventListener): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      send(_data: string): void {}
+
+      close(code?: number, reason?: string): void {
+        this.closed = true;
+        this.closeCode = code;
+        this.closeReason = reason;
+        this.readyState = 3; // CLOSED
+        const closeEvent = {
+          code: code ?? 1000,
+          reason: reason ?? "",
+          type: "close",
+        } as unknown as CloseEvent;
+        for (const listener of this.listeners.get("close") ?? []) {
+          listener(closeEvent);
+        }
+      }
+
+      triggerOpen(): void {
+        this.readyState = 1; // OPEN
+        for (const listener of this.listeners.get("open") ?? []) {
+          listener({ type: "open" } as unknown as Event);
+        }
+      }
+    }
+
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: ControllableWebSocket,
+    });
+
+    let capturedTransportFactory: (() => OmpTransport | Promise<OmpTransport>) | undefined;
+    const shell = createBrowserShellPort({
+      clientFactory: (options) => {
+        capturedTransportFactory = options.transport;
+        return {
+          state: "idle",
+          connect: async () => undefined,
+          close: async () => undefined,
+          wake: () => undefined,
+          onFrame: () => () => undefined,
+          onState: () => () => undefined,
+          onError: () => () => undefined,
+        } as unknown as OmpClient;
+      },
+    });
+
+    if (shell === null) throw new Error("shell should not be null");
+    await shell.bootstrap();
+
+    expect(capturedTransportFactory).toBeDefined();
+
+    // Start old invocation
+    const p1 = Promise.resolve(capturedTransportFactory!());
+    expect(ControllableWebSocket.instances.length).toBe(1);
+    const ws1 = ControllableWebSocket.instances[0];
+    if (ws1 === undefined) throw new Error("ws1 should be defined");
+
+    // Start newer invocation
+    const p2 = Promise.resolve(capturedTransportFactory!());
+    expect(ControllableWebSocket.instances.length).toBe(2);
+    const ws2 = ControllableWebSocket.instances[1];
+    if (ws2 === undefined) throw new Error("ws2 should be defined");
+
+    // Resolve the old invocation first
+    ws1.triggerOpen();
+
+    // The old one should reject as superseded and close its own socket
+    await expect(p1).rejects.toThrow(/browser transport superseded/u);
+    expect(ws1.closed).toBe(true);
+    // The newer socket remains usable/unclosed
+    expect(ws2.closed).toBe(false);
+
+    // Resolve the newer invocation next
+    ws2.triggerOpen();
+
+    // The newer one resolves successfully to the transport
+    const transport2 = await p2;
+    expect(transport2).toBeDefined();
+    expect(ws2.closed).toBe(false);
+  });
+
+  it("proves shell disconnect closes/rejects a factory-level pending open promptly before client transport resolution", async () => {
+    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws" }));
+
+    class ControllableWebSocket {
+      static readonly OPEN = 1;
+      readyState = 0; // CONNECTING
+      binaryType = "blob";
+      closed = false;
+      closeCode: number | undefined;
+      closeReason: string | undefined;
+      url: string;
+      protocols: string | string[] | undefined;
+      private readonly listeners = new Map<string, Set<EventListener>>();
+
+      static instances: ControllableWebSocket[] = [];
+
+      constructor(url: string, protocols?: string | string[]) {
+        this.url = url;
+        this.protocols = protocols;
+        ControllableWebSocket.instances.push(this);
+      }
+
+      addEventListener(type: string, listener: EventListener): void {
+        const set = this.listeners.get(type) ?? new Set<EventListener>();
+        set.add(listener);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, listener: EventListener): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      send(_data: string): void {}
+
+      close(code?: number, reason?: string): void {
+        this.closed = true;
+        this.closeCode = code;
+        this.closeReason = reason;
+        this.readyState = 3; // CLOSED
+        const closeEvent = {
+          code: code ?? 1000,
+          reason: reason ?? "",
+          type: "close",
+        } as unknown as CloseEvent;
+        for (const listener of this.listeners.get("close") ?? []) {
+          listener(closeEvent);
+        }
+      }
+    }
+
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: ControllableWebSocket,
+    });
+
+    let capturedTransportFactory: (() => OmpTransport | Promise<OmpTransport>) | undefined;
+    const shell = createBrowserShellPort({
+      clientFactory: (options) => {
+        capturedTransportFactory = options.transport;
+        return {
+          state: "idle",
+          connect: async () => undefined,
+          close: async () => undefined,
+          wake: () => undefined,
+          onFrame: () => () => undefined,
+          onState: () => () => undefined,
+          onError: () => () => undefined,
+        } as unknown as OmpClient;
+      },
+    });
+
+    if (shell === null) throw new Error("shell should not be null");
+    await shell.bootstrap();
+
+    // Start pending open
+    const p = Promise.resolve(capturedTransportFactory!());
+    expect(ControllableWebSocket.instances.length).toBe(1);
+    const ws = ControllableWebSocket.instances[0];
+    if (ws === undefined) throw new Error("ws should be defined");
+    expect(ws.closed).toBe(false);
+
+    // Disconnect should reject the pending open promptly
+    await shell.disconnect({ targetId: "remote" });
+    await expect(p).rejects.toThrow(/closed while opening/u);
+    expect(ws.closed).toBe(true);
+  });
+
+  it("asserts duplicate wake events do not create parallel opens where the existing lifecycle seam supports it", async () => {
+    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws" }));
+
+    class ControllableWebSocket {
+      static readonly OPEN = 1;
+      readyState = 0; // CONNECTING
+      binaryType = "blob";
+      closed = false;
+      closeCode: number | undefined;
+      closeReason: string | undefined;
+      url: string;
+      protocols: string | string[] | undefined;
+      private readonly listeners = new Map<string, Set<EventListener>>();
+
+      static instances: ControllableWebSocket[] = [];
+
+      constructor(url: string, protocols?: string | string[]) {
+        this.url = url;
+        this.protocols = protocols;
+        ControllableWebSocket.instances.push(this);
+      }
+
+      addEventListener(type: string, listener: EventListener): void {
+        const set = this.listeners.get(type) ?? new Set<EventListener>();
+        set.add(listener);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, listener: EventListener): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      send(_data: string): void {}
+
+      close(code?: number, reason?: string): void {
+        this.closed = true;
+        this.closeCode = code;
+        this.closeReason = reason;
+        this.readyState = 3; // CLOSED
+        const closeEvent = {
+          code: code ?? 1000,
+          reason: reason ?? "",
+          type: "close",
+        } as unknown as CloseEvent;
+        for (const listener of this.listeners.get("close") ?? []) {
+          listener(closeEvent);
+        }
+      }
+
+      triggerOpen(): void {
+        this.readyState = 1; // OPEN
+        for (const listener of this.listeners.get("open") ?? []) {
+          listener({ type: "open" } as unknown as Event);
+        }
+      }
+    }
+
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: ControllableWebSocket,
+    });
+
+    class SpyLifecycleTarget {
+      visibilityState: DocumentVisibilityState = "visible";
+      readonly listeners = new Map<string, Set<EventListener>>();
+      readonly calls = new Map<string, number>();
+
+      addEventListener(type: string, listener: EventListener): void {
+        this.calls.set(type, (this.calls.get(type) ?? 0) + 1);
+        const set = this.listeners.get(type) ?? new Set<EventListener>();
+        set.add(listener);
+        this.listeners.set(type, set);
+      }
+
+      removeEventListener(type: string, listener: EventListener): void {
+        this.listeners.get(type)?.delete(listener);
+      }
+
+      dispatch(type: string): void {
+        const event = { type } as unknown as Event;
+        for (const listener of this.listeners.get(type) ?? []) {
+          listener(event);
+        }
+      }
+    }
+
+    const windowTarget = new SpyLifecycleTarget();
+    const documentTarget = new SpyLifecycleTarget();
+    let transportInvocations = 0;
+    let capturedTransport: (() => OmpTransport | Promise<OmpTransport>) | undefined;
+
+    const shell = createBrowserShellPort({
+      clientFactory: (options) => {
+        capturedTransport = options.transport;
+        options.transport = async () => {
+          transportInvocations++;
+          return capturedTransport!();
+        };
+        return createOmpClient(options);
+      },
+      lifecycle: { windowTarget, documentTarget },
+    });
+
+    if (shell === null) throw new Error("shell should not be null");
+
+    // Bootstrap. This binds the lifecycle and sets up the client (initially idle).
+    await shell.bootstrap();
+
+    // Assert that each event listener is bound exactly once.
+    expect(windowTarget.calls.get("online")).toBe(1);
+    expect(windowTarget.calls.get("pageshow")).toBe(1);
+    expect(documentTarget.calls.get("visibilitychange")).toBe(1);
+
+    // Call connect multiple times. Each call calls ensureLifecycle(),
+    // which should NOT duplicate event listener bindings.
+    await shell.connect({ targetId: "remote" });
+    await shell.connect({ targetId: "remote" });
+
+    expect(windowTarget.calls.get("online")).toBe(1);
+    expect(windowTarget.calls.get("pageshow")).toBe(1);
+    expect(documentTarget.calls.get("visibilitychange")).toBe(1);
+
+    // Now trigger duplicate wake events while the client is connecting.
+    // The first connect (from shell.connect()) has already started the transport opening process,
+    // so we should have 1 transport invocation pending.
+    expect(transportInvocations).toBe(1);
+    expect(ControllableWebSocket.instances.length).toBe(1);
+    const ws1 = ControllableWebSocket.instances[0];
+    if (ws1 === undefined) throw new Error("ws1 should be defined");
+
+    // Trigger wake events. Since the client is in "connecting" state,
+    // these should be coalesced and processed, but should NOT invoke the transport factory again.
+    windowTarget.dispatch("online");
+    windowTarget.dispatch("pageshow");
+    // Let the event queue flush (using microtask flush).
+    await Promise.resolve();
+
+    // Still exactly 1 transport invocation (no parallel opens created).
+    expect(transportInvocations).toBe(1);
+    expect(ControllableWebSocket.instances.length).toBe(1);
+
+    // Open the socket so that it connects successfully.
+    ws1.triggerOpen();
+    // Let it resolve.
+    await Promise.resolve();
+
+    await shell.disconnect({ targetId: "remote" });
   });
 });

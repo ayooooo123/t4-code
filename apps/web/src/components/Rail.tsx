@@ -57,6 +57,7 @@ import {
   terminateLiveSession,
 } from "../features/session-runtime/session-management.ts";
 import { resolveSessionManagementNavigation } from "../features/session-runtime/session-navigation.ts";
+import { presentSessionControlKind } from "../features/session-runtime/session-observer.ts";
 import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
 import {
   deriveWorkspaceData,
@@ -71,6 +72,9 @@ import { SessionListTabs } from "./SessionListTabs.tsx";
 function describeSessionState(session: WorkspaceSession): string {
   if (session.freshness === "offline") return "Offline";
   if (session.freshness === "cached") return "Cached";
+  // Owner kind is never proven across the wire, so labels stay generic —
+  // and only a confirmed live lock reads "Active elsewhere".
+  if (session.control !== undefined) return presentSessionControlKind(session.control).railLabel;
   return session.status === null ? "Idle" : "";
 }
 

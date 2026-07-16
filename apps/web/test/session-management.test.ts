@@ -30,6 +30,7 @@ import {
   sessionIsWorking,
   terminateLiveSession,
 } from "../src/features/session-runtime/session-management.ts";
+import { presentSessionControl } from "../src/features/session-runtime/session-observer.ts";
 import type { LiveSessionAddress } from "../src/platform/live-workspace.ts";
 
 const ADDRESS: LiveSessionAddress = {
@@ -89,6 +90,10 @@ class FakeManagementController {
   private readonly sessionIndex = new Map<string, SessionRef>();
   closeRejection: NonNullable<CommandResult["error"]> | null = null;
   emitStaleCloseChallengeDuringLease = false;
+  /** Marks the host inventory incomplete so the write link reads cached. */
+  inventoryTruncated = false;
+  /** Test hook: runs right after a destructive challenge is issued. */
+  onChallenge: (() => void) | null = null;
   private pendingMutation: "rename" | "archive" | "restore" | "close" | "delete" | null = null;
   private pendingName = "";
   private challengeGate: ReturnType<typeof Promise.withResolvers<void>> | null = null;
@@ -97,6 +102,31 @@ class FakeManagementController {
 
   constructor(initial: SessionRef = ref()) {
     this.sessionIndex.set(KEY, initial);
+  }
+
+  /** Test hook: swap the indexed ref (e.g. a takeover landing mid-flow). */
+  replaceRef(next: SessionRef): void {
+    this.sessionIndex.set(KEY, next);
+  }
+
+  /** Lease shape for close acquisitions; releases are recorded below. */
+  leaseRequired = false;
+  onLeaseAcquire: (() => void) | null = null;
+  readonly leaseReleases: string[] = [];
+
+  controllerLeaseFor(): undefined {
+    return undefined;
+  }
+
+  async releaseControllerLease(
+    _targetId: string,
+    _hostId: string,
+    _sessionId: string,
+    _expectedRevision: string,
+    leaseId?: string,
+  ): Promise<{ readonly required: boolean; readonly accepted: boolean }> {
+    this.leaseReleases.push(leaseId ?? "");
+    return { required: true, accepted: true };
   }
 
   getSnapshot(): DesktopRuntimeSnapshot {
@@ -133,7 +163,12 @@ class FakeManagementController {
         version: 1,
         sessions: new Map(),
         sessionIndex: this.sessionIndex,
-        sessionIndexMetadata: new Map(),
+        sessionIndexMetadata: new Map([
+          [
+            ADDRESS.hostId,
+            { truncated: this.inventoryTruncated, totalCount: this.sessionIndex.size },
+          ],
+        ]) as DesktopRuntimeSnapshot["projection"]["sessionIndexMetadata"],
         sessionRefArrivalOrdinals: new Map(),
         sessionDeltaCursors: new Map(),
         lru: [],
@@ -203,6 +238,7 @@ class FakeManagementController {
         expiresAt: "2999-01-01T00:00:00.000Z",
         summary: "session.close",
       });
+      this.onChallenge?.();
       try {
         await this.challengeGate.promise;
       } finally {
@@ -231,6 +267,7 @@ class FakeManagementController {
         expiresAt: "2999-01-01T00:00:00.000Z",
         summary: "session.delete",
       });
+      this.onChallenge?.();
       try {
         await this.challengeGate.promise;
       } finally {
@@ -259,7 +296,7 @@ class FakeManagementController {
     _hostId: string,
     _sessionId: string,
     expectedRevision: string,
-  ): Promise<{ readonly required: false }> {
+  ): Promise<{ readonly required: false } | { readonly required: true; readonly leaseId: string }> {
     this.controllerLeaseAcquisitions.push(expectedRevision);
     if (this.emitStaleCloseChallengeDuringLease) {
       this.emitFrame({
@@ -275,6 +312,8 @@ class FakeManagementController {
         summary: "session.close",
       });
     }
+    this.onLeaseAcquire?.();
+    if (this.leaseRequired) return { required: true, leaseId: "close-lease-1" };
     return { required: false };
   }
 
@@ -369,6 +408,22 @@ describe("session management authority helpers", () => {
     expect(sessionCreateSupport(missing, address)).toEqual({
       supported: false,
       reason: "This host does not offer session creation yet",
+    });
+
+    const unbound = {
+      ...snapshot,
+      targetHosts: new Map(),
+    } as DesktopRuntimeSnapshot;
+    expect(sessionCreateSupport(unbound, address)).toEqual({
+      supported: false,
+      reason: "Project host binding is no longer available.",
+    });
+
+    const syncingController = new FakeManagementController();
+    syncingController.inventoryTruncated = true;
+    expect(sessionCreateSupport(syncingController.getSnapshot(), address)).toEqual({
+      supported: false,
+      reason: "This host's session list is still syncing. Try again in a moment.",
     });
   });
 
@@ -479,6 +534,131 @@ describe("session management authority helpers", () => {
     expect(managementCommandSupport(fake.getSnapshot(), ADDRESS, "session.archive")).toEqual({
       supported: true,
       reason: null,
+    });
+  });
+
+  it("gates every lifecycle mutation while another app controls the session", () => {
+    const observed = {
+      ...ref(),
+      liveState: {
+        phase: "running",
+        sessionControl: { mode: "observer", lockStatus: "live", transcript: "live" },
+      },
+    } as SessionRef;
+    const fake = new FakeManagementController(observed);
+    const expectedReason = presentSessionControl({
+      mode: "observer",
+      lockStatus: "live",
+      transcript: "live",
+    }).managementReason;
+    for (const command of [
+      "session.rename",
+      "session.archive",
+      "session.restore",
+      "session.close",
+      "session.delete",
+    ] as const) {
+      expect(managementCommandSupport(fake.getSnapshot(), ADDRESS, command)).toEqual({
+        supported: false,
+        reason: expectedReason,
+      });
+    }
+    // Reconciling gates the same way: the takeover has to finish first.
+    const reconciling = new FakeManagementController({
+      ...ref(),
+      liveState: { phase: "idle", sessionControl: { mode: "reconciling", transcript: "live" } },
+    } as SessionRef);
+    expect(
+      managementCommandSupport(reconciling.getSnapshot(), ADDRESS, "session.archive").supported,
+    ).toBe(false);
+  });
+
+  const SYNCING_REASON = "This session is still syncing from the host. Try again in a moment.";
+  const ALL_COMMANDS = [
+    "session.rename",
+    "session.archive",
+    "session.restore",
+    "session.close",
+    "session.delete",
+  ] as const;
+
+  it("disables management honestly while the host inventory is truncated or incomplete", () => {
+    // Truncated inventory: the host said the list is cut short.
+    const truncated = new FakeManagementController();
+    truncated.inventoryTruncated = true;
+    for (const command of ALL_COMMANDS) {
+      expect(managementCommandSupport(truncated.getSnapshot(), ADDRESS, command)).toEqual({
+        supported: false,
+        reason: SYNCING_REASON,
+      });
+    }
+
+    // Incomplete inventory: the host claims more sessions than we indexed.
+    const base = new FakeManagementController().getSnapshot();
+    const incomplete = {
+      ...base,
+      projection: {
+        ...base.projection,
+        sessionIndexMetadata: new Map([[ADDRESS.hostId, { truncated: false, totalCount: 2 }]]),
+      },
+    } as DesktopRuntimeSnapshot;
+    for (const command of ALL_COMMANDS) {
+      expect(managementCommandSupport(incomplete, ADDRESS, command)).toEqual({
+        supported: false,
+        reason: SYNCING_REASON,
+      });
+    }
+
+    // A complete, current live inventory keeps allowed actions enabled.
+    const live = new FakeManagementController();
+    expect(managementCommandSupport(live.getSnapshot(), ADDRESS, "session.rename")).toEqual({
+      supported: true,
+      reason: null,
+    });
+    expect(managementCommandSupport(live.getSnapshot(), ADDRESS, "session.archive")).toEqual({
+      supported: true,
+      reason: null,
+    });
+  });
+
+  it("disables management while this session's warm projection is only cached", () => {
+    const base = new FakeManagementController().getSnapshot();
+    const warm = (freshness: string): DesktopRuntimeSnapshot => ({
+      ...base,
+      projection: {
+        ...base.projection,
+        sessions: new Map([
+          [KEY, { freshness }],
+        ]) as unknown as DesktopRuntimeSnapshot["projection"]["sessions"],
+      },
+    });
+    for (const command of ALL_COMMANDS) {
+      expect(managementCommandSupport(warm("cached"), ADDRESS, command)).toEqual({
+        supported: false,
+        reason: SYNCING_REASON,
+      });
+    }
+    // A fresh warm projection stays live.
+    expect(managementCommandSupport(warm("fresh"), ADDRESS, "session.close")).toEqual({
+      supported: true,
+      reason: null,
+    });
+  });
+
+  it("lets the syncing reason outrank the observer reason, matching the dispatch gate", () => {
+    const observed = new FakeManagementController({
+      ...ref(),
+      liveState: {
+        phase: "running",
+        sessionControl: { mode: "observer", lockStatus: "live", transcript: "live" },
+      },
+    } as SessionRef);
+    observed.inventoryTruncated = true;
+    // assertSessionWritableNow() rejects cached before it reads ownership;
+    // the support gate promises the same order.
+    expect(managementCommandSupport(observed.getSnapshot(), ADDRESS, "session.close")).toEqual({
+      supported: false,
+      reason: SYNCING_REASON,
     });
   });
 
@@ -641,5 +821,80 @@ describe("session management authority helpers", () => {
       } as SessionRef),
     ).toBe(false);
     expect(sessionIsWorking(ref())).toBe(false);
+  });
+});
+
+describe("dispatch-time ownership rechecks", () => {
+  const OBSERVED_REF = {
+    ...ref(),
+    liveState: {
+      phase: "idle",
+      sessionControl: { mode: "observer", lockStatus: "live", transcript: "live" },
+    },
+  } as SessionRef;
+  const OBSERVED_REASON = presentSessionControl({
+    mode: "observer",
+    lockStatus: "live",
+    transcript: "live",
+  }).managementReason;
+
+  it("refuses every lifecycle dispatch while another app owns the session", async () => {
+    const fake = new FakeManagementController(OBSERVED_REF);
+    await expect(renameLiveSession(controller(fake), ADDRESS, "New name")).rejects.toThrow(
+      OBSERVED_REASON,
+    );
+    await expect(archiveLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
+    await expect(restoreLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
+    await expect(terminateLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
+    await expect(deleteLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
+    expect(fake.commands).toHaveLength(0);
+    expect(fake.confirms).toHaveLength(0);
+  });
+
+  it("refuses malformed/unknown ownership with unclear copy, never another-app copy", async () => {
+    const fake = new FakeManagementController({
+      ...ref(),
+      liveState: { phase: "idle", sessionControl: { mode: "someday-mode" } },
+    } as unknown as SessionRef);
+    const unknownReason = presentSessionControl({ mode: "unknown" }).managementReason;
+    await expect(terminateLiveSession(controller(fake), ADDRESS)).rejects.toThrow(unknownReason);
+    expect(unknownReason.toLowerCase()).toContain("unclear");
+    expect(fake.commands).toHaveLength(0);
+  });
+
+  it("never approves a termination challenge raced by a takeover", async () => {
+    const fake = new FakeManagementController();
+    // The takeover lands exactly while the host's confirmation dialog round-
+    // trip is pending; the recheck before confirm must refuse the approval.
+    fake.onChallenge = () => fake.replaceRef(OBSERVED_REF);
+    await expect(terminateLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
+    expect(fake.confirms).toHaveLength(0);
+    expect(
+      fake.commands.filter((intent) => intent.command === "session.list"),
+    ).toHaveLength(0);
+  });
+});
+
+describe("close lease cleanup on takeover", () => {
+  it("releases a freshly acquired close lease when the takeover lands mid-acquisition", async () => {
+    const fake = new FakeManagementController();
+    fake.leaseRequired = true;
+    const observed = {
+      ...ref(),
+      liveState: {
+        phase: "idle",
+        sessionControl: { mode: "observer", lockStatus: "live", transcript: "live" },
+      },
+    } as SessionRef;
+    // The takeover lands exactly during controller-lease acquisition.
+    fake.onLeaseAcquire = () => fake.replaceRef(observed);
+    await expect(terminateLiveSession(controller(fake), ADDRESS)).rejects.toThrow(
+      presentSessionControl({ mode: "observer", lockStatus: "live", transcript: "live" })
+        .managementReason,
+    );
+    // No session.close left, and the new lease was released best-effort.
+    expect(fake.commands.filter((intent) => intent.command === "session.close")).toHaveLength(0);
+    expect(fake.leaseReleases).toEqual(["close-lease-1"]);
+    expect(fake.confirms).toHaveLength(0);
   });
 });

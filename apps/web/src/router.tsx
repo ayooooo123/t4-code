@@ -35,6 +35,7 @@ import {
 } from "./features/targets/targets-store.ts";
 import {
   applySessionRoutePendingGrace,
+  createSessionRouteActivationGate,
   createSessionRoutePendingGrace,
   decideSessionRoute,
   preferredHomeSessionId,
@@ -110,12 +111,17 @@ function SessionRoute() {
   }, [pendingGrace, pendingKey]);
   useEffect(() => () => pendingGrace.dispose(), [pendingGrace]);
 
-  // Activation stamps the visit and closes the overlay rail.
+  // Activation stamps the visit and closes the overlay rail — once per
+  // present route session ID. Streamed projections rebuild `session` on
+  // every output/status update; the gate keeps that churn from re-closing
+  // a rail the user just reopened.
+  const [activationGate] = useState(() => createSessionRouteActivationGate());
   useEffect(() => {
-    if (decision.kind === "present" && session !== undefined) {
-      workspaceStore.getState().activateSession(session.id, new Date().toISOString());
+    const target = activationGate.resolve(decision, session);
+    if (target !== null) {
+      workspaceStore.getState().activateSession(target, new Date().toISOString());
     }
-  }, [decision.kind, session]);
+  }, [activationGate, decision, session]);
 
   if (decision.kind === "pending") {
     return (

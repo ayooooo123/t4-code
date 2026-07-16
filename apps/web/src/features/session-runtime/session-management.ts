@@ -12,6 +12,8 @@ import type { LiveProjectAddress, LiveSessionAddress } from "../../platform/live
 import { commandSupport } from "./session-controls.ts";
 import { sessionActionRejectionReason } from "./command-errors.ts";
 import { pendingPromptsFromRef } from "./pending-prompts.ts";
+import { hostSessionInventoryIsComplete, sessionWriteLink } from "./session-inventory.ts";
+import { presentSessionControl, readSessionControl } from "./session-observer.ts";
 
 export type SessionManagementCommand =
   | "session.rename"
@@ -28,12 +30,29 @@ export interface SessionManagementSupport {
 const CONVERGENCE_TIMEOUT_MS = 10_000;
 const challengedManagementRuns = new Map<string, Promise<void>>();
 
+/**
+ * One shared freshness reason for the whole management surface: the support
+ * gate below and the dispatch-time recheck use the same words so the UI
+ * never promises an action that dispatch would immediately reject.
+ */
+const MANAGEMENT_SYNCING_REASON =
+  "This session is still syncing from the host. Try again in a moment.";
+
 export function sessionCreateSupport(
   snapshot: DesktopRuntimeSnapshot,
   address: LiveProjectAddress,
 ): SessionManagementSupport {
   if (snapshot.connections.get(address.targetId) !== "connected") {
     return { supported: false, reason: "Connect to this host to create a session" };
+  }
+  if (snapshot.targetHosts.get(address.targetId) !== address.hostId) {
+    return { supported: false, reason: "Project host binding is no longer available." };
+  }
+  if (!hostSessionInventoryIsComplete(snapshot, address.hostId)) {
+    return {
+      supported: false,
+      reason: "This host's session list is still syncing. Try again in a moment.",
+    };
   }
   const host = snapshot.hosts.get(address.hostId);
   const granted = host?.grantedCapabilities ?? [];
@@ -130,8 +149,16 @@ export function managementCommandSupport(
   address: LiveSessionAddress,
   command: SessionManagementCommand,
 ): SessionManagementSupport {
-  if (snapshot.connections.get(address.targetId) !== "connected") {
+  const link = sessionWriteLink(snapshot, address.targetId, address.hostId, address.sessionId);
+  if (link === "offline") {
     return { supported: false, reason: "Connect to this host to manage the session" };
+  }
+  // Mirror assertSessionWritableNow(): a truncated/incomplete host inventory
+  // or stale cached projection cannot prove this session's current state, so
+  // freshness gates before any ownership or per-command reason — exactly the
+  // order the dispatch gate rejects in.
+  if (link === "cached") {
+    return { supported: false, reason: MANAGEMENT_SYNCING_REASON };
   }
   const host = snapshot.hosts.get(address.hostId);
   const granted = host?.grantedCapabilities ?? [];
@@ -149,6 +176,13 @@ export function managementCommandSupport(
     };
   }
   const ref = sessionRefForAddress(snapshot, address);
+  // While another app owns the session (or this one is still taking it
+  // over), every lifecycle mutation — including restore — gates with the
+  // same honest reason the composer shows.
+  const control = readSessionControl(ref);
+  if (control !== null) {
+    return { supported: false, reason: presentSessionControl(control).managementReason };
+  }
   if (command === "session.rename" && sessionIsArchived(ref)) {
     return { supported: false, reason: "Restore this session before renaming it" };
   }
@@ -248,6 +282,31 @@ function currentRevision(
   return String(ref.revision);
 }
 
+/**
+ * Fail-closed recheck run against CURRENT truth immediately before every
+ * lifecycle mutation leaves — including after queue waits, lease
+ * acquisition, and confirmation dialogs. Full freshness first (offline and
+ * cached both explain themselves), then the strict ownership reader; the
+ * server remains final authority either way.
+ */
+function assertSessionWritableNow(
+  controller: DesktopRuntimeController,
+  address: LiveSessionAddress,
+): void {
+  const snapshot = controller.getSnapshot();
+  const link = sessionWriteLink(snapshot, address.targetId, address.hostId, address.sessionId);
+  if (link === "offline") {
+    throw new Error("Connect to this host to manage the session.");
+  }
+  if (link === "cached") {
+    throw new Error(MANAGEMENT_SYNCING_REASON);
+  }
+  const control = readSessionControl(sessionRefForAddress(snapshot, address));
+  if (control !== null) {
+    throw new Error(presentSessionControl(control).managementReason);
+  }
+}
+
 export async function renameLiveSession(
   controller: DesktopRuntimeController,
   address: LiveSessionAddress,
@@ -258,14 +317,21 @@ export async function renameLiveSession(
   if (sessionIsArchived(sessionRefForAddress(controller.getSnapshot(), address))) {
     throw new Error("Restore this session before renaming it.");
   }
+  assertSessionWritableNow(controller, address);
   const expectedRevision = currentRevision(controller, address);
-  const response = await controller.commandWithControllerLease(address.targetId, {
-    hostId: hostId(address.hostId),
-    sessionId: sessionId(address.sessionId),
-    command: "session.rename",
-    expectedRevision: revision(expectedRevision),
-    args: { name: trimmed },
-  });
+  const response = await controller.commandWithControllerLease(
+    address.targetId,
+    {
+      hostId: hostId(address.hostId),
+      sessionId: sessionId(address.sessionId),
+      command: "session.rename",
+      expectedRevision: revision(expectedRevision),
+      args: { name: trimmed },
+    },
+    undefined,
+    // Re-read after the controller-lease acquisition wait inside the client.
+    () => assertSessionWritableNow(controller, address),
+  );
   assertAccepted(response, "renamed");
   await refreshSessionList(controller, address, (snapshot) => {
     const ref = sessionRefForAddress(snapshot, address);
@@ -278,6 +344,7 @@ async function runUnchallengedManagementCommand(
   address: LiveSessionAddress,
   command: "session.archive" | "session.restore",
 ): Promise<void> {
+  assertSessionWritableNow(controller, address);
   const expectedRevision = currentRevision(controller, address);
   const ref = sessionRefForAddress(controller.getSnapshot(), address);
   if (command === "session.archive" && sessionIsWorking(ref)) {
@@ -336,6 +403,9 @@ async function runChallengedManagementCommandNow(
   address: LiveSessionAddress,
   commandName: "session.close" | "session.delete",
 ): Promise<void> {
+  // Runs behind the per-session queue: an earlier run's dialog round-trip
+  // may have spanned a takeover. Recheck before reading a revision.
+  assertSessionWritableNow(controller, address);
   const expectedRevision = currentRevision(controller, address);
   const current = sessionRefForAddress(controller.getSnapshot(), address);
   if (commandName === "session.close" && sessionIsArchived(current)) {
@@ -347,7 +417,18 @@ async function runChallengedManagementCommandNow(
 
   // Acquire before listening for the destructive-command challenge. Otherwise
   // a same-session challenge can arrive while lease acquisition is pending and
-  // be mistaken for the command this call has not sent yet.
+  // be mistaken for the command this call has not sent yet. Snapshot any
+  // already-cached lease first: a post-acquire gate failure may only release
+  // a NEWLY acquired lease, never a preexisting one other flows rely on.
+  const priorLease =
+    commandName === "session.close"
+      ? controller.controllerLeaseFor(
+          address.targetId,
+          address.hostId,
+          address.sessionId,
+          expectedRevision,
+        )
+      : undefined;
   const lease =
     commandName === "session.close"
       ? await controller.acquireControllerLease(
@@ -357,6 +438,25 @@ async function runChallengedManagementCommandNow(
           expectedRevision,
         )
       : { required: false as const };
+  // Lease acquisition is a wait; recheck before the command dispatches. On
+  // a gate failure, best-effort release of the freshly acquired lease so it
+  // cannot block peers until expiry.
+  try {
+    assertSessionWritableNow(controller, address);
+  } catch (error) {
+    if (lease.required && lease.leaseId !== undefined && lease.leaseId !== priorLease?.leaseId) {
+      void controller
+        .releaseControllerLease(
+          address.targetId,
+          address.hostId,
+          address.sessionId,
+          expectedRevision,
+          lease.leaseId,
+        )
+        .catch(() => undefined);
+    }
+    throw error;
+  }
 
   let stopChallengeWait = () => undefined;
   const challenge = new Promise<ConfirmationChallenge>((resolve, reject) => {
@@ -410,6 +510,11 @@ async function runChallengedManagementCommandNow(
         );
       }),
     ]);
+    // The challenge round-trip is a dialog-shaped wait: ownership may have
+    // moved while the host's confirmation was pending. Never approve a
+    // destructive action against a session this app no longer writes to —
+    // the unanswered challenge simply expires on the host.
+    assertSessionWritableNow(controller, address);
     const confirmation = await controller.confirm({
       targetId: address.targetId,
       confirmationId: hostChallenge.confirmationId,

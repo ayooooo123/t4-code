@@ -88,6 +88,9 @@ class Transport implements OmpTransport {
   receive(frame: Record<string, unknown>): void {
     for (const listener of this.messages) listener(JSON.stringify(frame));
   }
+  fail(): void {
+    for (const listener of this.errors) listener(new Error("outage"));
+  }
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -110,6 +113,25 @@ class Transport implements OmpTransport {
     this.errors.add(listener);
     return () => this.errors.delete(listener);
   }
+}
+class PendingOpenTransport extends Transport {
+  readonly openGate = Promise.withResolvers<void>();
+  override open(): Promise<void> {
+    return this.openGate.promise;
+  }
+}
+class RetryTransport extends Transport {
+  override send(data: string): void {
+    this.sent.push(data);
+    if (JSON.parse(data).type === "hello") this.fail();
+  }
+}
+class PendingLoadStore implements CursorStore {
+  readonly loadGate = Promise.withResolvers<readonly CursorRecord[]>();
+  load(): Promise<readonly CursorRecord[]> {
+    return this.loadGate.promise;
+  }
+  save(): void {}
 }
 class Store implements CursorStore {
   load(): readonly never[] {
@@ -179,6 +201,21 @@ function manager(
     capabilities: ["sessions.read"],
     events: { onFrame: (_targetId, frame) => onFrame(frame), onState: () => {}, onError: () => {} },
   });
+}
+async function settlesBeforeTurnLimit<T>(promise: Promise<T>): Promise<T> {
+  let turns = 0;
+  const watchdog = new Promise<never>((_, reject) => {
+    const tick = (): void => {
+      turns += 1;
+      if (turns > 100) {
+        reject(new Error("operation did not settle"));
+        return;
+      }
+      queueMicrotask(tick);
+    };
+    queueMicrotask(tick);
+  });
+  return Promise.race([promise, watchdog]);
 }
 
 describe("desktop target manager boundaries", () => {
@@ -427,6 +464,94 @@ describe("desktop target manager boundaries", () => {
     await runtime.close();
   });
 
+  it("disconnects while the transport open is still pending", async () => {
+    const transport = new PendingOpenTransport();
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      localTransportFactory: () => transport as never,
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+    const connecting = runtime.connect();
+
+    await settlesBeforeTurnLimit(runtime.disconnect());
+    expect(runtime.pairingStatus("local").state).toBe("disconnected");
+
+    transport.openGate.resolve();
+    await connecting.catch(() => undefined);
+    await runtime.close();
+  });
+
+  it("removes a remote target while its transport open is still pending", async () => {
+    const transport = new PendingOpenTransport();
+    const registry = new Registry();
+    await registry.put(target("pending-remove"));
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      registry,
+      remoteTransportFactory: () => transport as never,
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+    const connecting = runtime.connect("pending-remove");
+
+    await settlesBeforeTurnLimit(runtime.removeTarget("pending-remove"));
+    expect(await registry.get("pending-remove")).toBeNull();
+
+    transport.openGate.resolve();
+    await connecting.catch(() => undefined);
+    await runtime.close();
+  });
+
+  it("closes while an outage is retrying indefinitely", async () => {
+    const transports: Transport[] = [];
+    const registry = new Registry();
+    await registry.put(target("outage"));
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      registry,
+      remoteTransportFactory: () => {
+        const transport = new RetryTransport();
+        transports.push(transport);
+        return transport as never;
+      },
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+    const connecting = runtime.connect("outage");
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(transports).toHaveLength(1);
+
+    const internals = runtime as unknown as {
+      runtimes: Map<string, { client: { state: string } }>;
+    };
+    expect(internals.runtimes.get("outage")?.client.state).toBe("reconnect-wait");
+
+    await settlesBeforeTurnLimit(runtime.close());
+    await connecting.catch(() => undefined);
+  });
+
+  it("suppresses a late connect rejection after a newer generation is active", async () => {
+    const pendingStore = new PendingLoadStore();
+    let storeCalls = 0;
+    const errors: string[] = [];
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      cursorStoreFactory: () => {
+        storeCalls += 1;
+        return storeCalls === 1 ? pendingStore : new Store();
+      },
+      localTransportFactory: () => new Transport() as never,
+      events: { onFrame: () => {}, onState: () => {}, onError: (event) => errors.push(event.message) },
+    });
+    const firstConnect = runtime.connect();
+
+    await settlesBeforeTurnLimit(runtime.disconnect());
+    await runtime.connect();
+    pendingStore.loadGate.resolve([]);
+    await firstConnect.catch(() => undefined);
+
+    expect(errors).toEqual([]);
+    await runtime.close();
+  });
+
   it("serializes concurrent target lifecycle and closes each generation", async () => {
     const transports: Transport[] = [];
     const registry = new Registry();
@@ -543,6 +668,8 @@ describe("desktop target manager boundaries", () => {
       events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
     });
     await runtime.connect("observe-pair");
+    expect(await runtime.connect("observe-pair")).toBe("connecting");
+    expect(transports).toHaveLength(1);
     const hello = JSON.parse(transports[0]?.sent[0] ?? "{}") as Record<string, unknown>;
     expect(hello).toMatchObject({ capabilities: { client: remote.requestedCapabilities } });
     const pairTransport = transports[0];

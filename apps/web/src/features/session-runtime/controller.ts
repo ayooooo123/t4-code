@@ -27,6 +27,7 @@ import {
   type ThinkingLevel,
 } from "./intents.ts";
 import type { ComposerControlsSnapshot } from "./session-controls.ts";
+import type { SessionControlState } from "./session-observer.ts";
 import {
   createTranscriptImageSource,
   TRANSCRIPT_IMAGE_FIXTURE_REASON,
@@ -59,6 +60,11 @@ export interface SessionRuntimeSnapshot {
   readonly queuedFollowUps: readonly string[];
   /** Model / thinking / fast / mode truth for the composer's controls. */
   readonly controls: ComposerControlsSnapshot;
+  /**
+   * Observer/reconciling truth from the session ref; null means writable.
+   * Only set on a live link — cached/offline copy takes precedence.
+   */
+  readonly sessionControl: SessionControlState | null;
   /**
    * Time base for elapsed labels. The fixture runtime reports the fixed
    * scripted "now" so renders are reproducible; a real bridge runtime
@@ -200,6 +206,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
           modeSupported: link === "live",
           mode,
           attachmentsSupported: true,
+          attachmentsUnsupportedReason: null,
           pendingControl: null,
           controlError: null,
         };
@@ -216,6 +223,7 @@ export function createFixtureSessionRuntime(options: FixtureRuntimeOptions): Ses
           contextWindowTokens: script.contextWindowTokens,
           queuedFollowUps,
           controls,
+          sessionControl: null,
           nowMs: FIXTURE_NOW_MS,
         };
       }

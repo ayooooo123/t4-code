@@ -45,6 +45,7 @@ const CONTROLS: ComposerControlsSnapshot = {
   modeSupported: true,
   mode: "build",
   attachmentsSupported: true,
+  attachmentsUnsupportedReason: null,
   pendingControl: null,
   controlError: null,
 };

@@ -58,7 +58,19 @@ import {
   type PendingControl,
 } from "./session-controls.ts";
 import { sessionIsWorking } from "./session-management.ts";
-import { hostSessionInventoryIsComplete } from "./session-inventory.ts";
+import {
+  CACHED_WRITE_REASON,
+  gateComposerControls,
+  OFFLINE_WRITE_REASON,
+  presentSessionControl,
+  readSessionControl,
+  sessionControlForLink,
+  WriteGateError,
+} from "./session-observer.ts";
+import {
+  hostSessionInventoryIsComplete,
+  sessionWriteLink,
+} from "./session-inventory.ts";
 
 export interface LiveRuntimeOptions {
   readonly controller: DesktopRuntimeController;
@@ -180,6 +192,7 @@ function findCancelCommand(items: readonly CatalogItem[]): CatalogItem | undefin
   );
 }
 
+
 interface PendingChallenge {
   readonly challenge: ConfirmationChallenge;
   readonly approval: ApprovalRequest;
@@ -276,6 +289,40 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   const warmSession = (runtime: DesktopRuntimeSnapshot): SessionProjection | undefined =>
     runtime.projection.sessions.get(projectionKey);
 
+  /**
+   * Fail-closed write gate, evaluated against CURRENT truth immediately
+   * before every mutating dispatch — including after awaits, control
+   * barriers, and confirmation dialogs. Freshness precedence: offline
+   * always refuses; a present ownership field refuses with the cached
+   * copy on a cached link (freshness copy wins over observer copy) and
+   * with the honest observer copy on a live link. Strict dispatch also
+   * refuses on a bare cached link. The single narrow exception
+   * ("queued-prompt"): a `session.prompt` that was invoked against a live
+   * link and only waited out the control barrier may cross a bare cached
+   * blip — revision and lease protection fence that race, and the server
+   * remains final authority. Null means writable.
+   */
+  const writeGate = (
+    phase: "strict" | "queued-prompt" = "strict",
+  ): { readonly kind: "rejected"; readonly reason: string } | null => {
+    const runtime = controller.getSnapshot();
+    const link = sessionWriteLink(runtime, targetId, options.hostId, options.sessionId);
+    if (link === "offline") return { kind: "rejected", reason: OFFLINE_WRITE_REASON };
+    const state = readSessionControl(
+      warmSession(runtime)?.ref ?? runtime.projection.sessionIndex.get(projectionKey),
+    );
+    if (state !== null) {
+      if (sessionControlForLink(link, state) === null) {
+        return { kind: "rejected", reason: CACHED_WRITE_REASON };
+      }
+      return { kind: "rejected", reason: presentSessionControl(state).composerReason };
+    }
+    if (link === "cached" && phase !== "queued-prompt") {
+      return { kind: "rejected", reason: CACHED_WRITE_REASON };
+    }
+    return null;
+  };
+
   const withWarmHistoryTruncation = (
     projection: TranscriptProjection,
     runtime: DesktopRuntimeSnapshot,
@@ -337,10 +384,17 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     usePromptLease = true,
     revisionOverride?: Revision,
     promptLeaseRevision?: Revision,
+    gatePhase: "strict" | "queued-prompt" = "strict",
   ): Promise<PromptOutcome> => {
     const revisionValue = withRevision ? (revisionOverride ?? expectedRevision()) : undefined;
     if (withRevision && revisionValue === undefined)
       return { kind: "unknown", reason: UNKNOWN_REASON };
+    // Lease acquisition inside the client is a wait; the gate re-runs
+    // after it, immediately before the command dispatches.
+    const guard = () => {
+      const gated = writeGate(gatePhase);
+      if (gated !== null) throw new WriteGateError(gated.reason);
+    };
     try {
       const intentPayload = {
         hostId: wireHostId,
@@ -354,12 +408,14 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
             targetId,
             intentPayload,
             promptLeaseRevision === undefined ? undefined : String(promptLeaseRevision),
+            guard,
           )
-        : await controller.commandWithControllerLease(targetId, intentPayload);
+        : await controller.commandWithControllerLease(targetId, intentPayload, undefined, guard);
       return result.accepted
         ? { kind: "accepted" }
         : { kind: "rejected", reason: promptRejectionReason(result.error) };
-    } catch {
+    } catch (error) {
+      if (error instanceof WriteGateError) return { kind: "rejected", reason: error.reason };
       return { kind: "unknown", reason: UNKNOWN_REASON };
     }
   };
@@ -391,6 +447,8 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   // user approves it. Keeping the lease revision off the command prevents a
   // valid Stop confirmation from replaying as stale.
   const sendCancelCommand = async (): Promise<PromptOutcome> => {
+    const gated = writeGate();
+    if (gated !== null) return gated;
     const leaseRevision = expectedRevision();
     if (leaseRevision === undefined) return { kind: "unknown", reason: UNKNOWN_REASON };
     try {
@@ -403,11 +461,17 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
           args: {},
         },
         String(leaseRevision),
+        () => {
+          // Re-read after the controller-lease acquisition wait.
+          const raced = writeGate();
+          if (raced !== null) throw new WriteGateError(raced.reason);
+        },
       );
       return result.accepted
         ? { kind: "accepted" }
         : { kind: "rejected", reason: promptRejectionReason(result.error) };
-    } catch {
+    } catch (error) {
+      if (error instanceof WriteGateError) return { kind: "rejected", reason: error.reason };
       return { kind: "unknown", reason: UNKNOWN_REASON };
     }
   };
@@ -428,6 +492,14 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     command: string,
     args: Record<string, unknown>,
   ): Promise<PromptOutcome> => {
+    // This runs behind the control barrier: the session may have been taken
+    // over by another app while an earlier control round-trip was in flight.
+    const gated = writeGate();
+    if (gated !== null) {
+      controlError = gated.reason;
+      notify();
+      return gated;
+    }
     const runtime = controller.getSnapshot();
     const support = commandSupport(
       runtime.catalogs.get(options.hostId),
@@ -496,6 +568,9 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     args: Record<string, unknown>,
   ): Promise<PromptOutcome> => {
     await waitForControlCommands();
+    // The barrier wait can span a takeover; recheck before dispatch.
+    const gated = writeGate("queued-prompt");
+    if (gated !== null) return gated;
     const leaseRevision = expectedRevision();
     if (leaseRevision === undefined) return { kind: "unknown", reason: UNKNOWN_REASON };
     // Ordinary prompts are revision-optional on the wire for the same reason
@@ -503,7 +578,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     // the projection between composition and host receipt. The prompt lease
     // still binds against the captured authoritative revision; only the
     // volatile compare-and-swap field stays off the command itself.
-    return sendCommand(command, args, false, true, undefined, leaseRevision);
+    return sendCommand(command, args, false, true, undefined, leaseRevision, "queued-prompt");
   };
 
   // Active turns advance the session revision while output streams. Steer and
@@ -515,6 +590,8 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     args: Record<string, unknown>,
   ): Promise<PromptOutcome> => {
     await waitForControlCommands();
+    const gated = writeGate();
+    if (gated !== null) return gated;
     const leaseRevision = expectedRevision();
     if (leaseRevision === undefined) return { kind: "unknown", reason: UNKNOWN_REASON };
     return sendCommand(command, args, false, true, undefined, leaseRevision);
@@ -710,10 +787,20 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     return null;
   };
 
-  const confirmChallenge = async (approvalId: string, decision: "approve" | "deny") => {
+  const confirmChallenge = async (
+    approvalId: string,
+    decision: "approve" | "deny",
+  ): Promise<PromptOutcome> => {
+    // The approval dialog is a wait: ownership can change while it is open.
+    // Recheck immediately before the decision leaves; a gated challenge
+    // simply stays on screen with the surfaces explaining why.
+    const gated = writeGate();
+    if (gated !== null) return gated;
     const runtime = controller.getSnapshot();
     const challenge = warmSession(runtime)?.confirmations.get(approvalId);
-    if (challenge === undefined) return;
+    if (challenge === undefined) {
+      return { kind: "rejected", reason: "This approval was already resolved on the host." };
+    }
     try {
       const result = await controller.confirm({
         targetId,
@@ -729,13 +816,31 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       if (result.accepted) {
         decidedChallenges.add(approvalId);
         notify();
+        return { kind: "accepted" };
       }
+      return {
+        kind: "rejected",
+        reason: "The host did not accept this decision. The approval stays on screen.",
+      };
     } catch {
-      // Outcome unknown: keep the challenge on screen.
+      return {
+        kind: "unknown",
+        reason:
+          "The connection dropped before the host answered. The approval stays on screen; decide again once you're back.",
+      };
     }
   };
 
   const submitPrompt = async (intent: SessionIntent): Promise<PromptOutcome> => {
+    // Every intent below writes. Gate on CURRENT freshness precedence —
+    // cached/offline copy first, then strict ownership truth — never a
+    // stale raw ref. While another app owns this session (or this app is
+    // still reconciling the transcript), refuse locally with the same
+    // reason the surfaces show; the host would refuse anyway.
+    {
+      const gated = writeGate();
+      if (gated !== null) return gated;
+    }
     if (intent.kind === "prompt") {
       if (intent.attachments.length > 0) {
         const granted = grantedFor(controller.getSnapshot());
@@ -746,6 +851,9 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
         return runImagePromptUpload({
           targetId,
           attachments: intent.attachments,
+          // Upload begin/chunk are session mutations; each dispatch rechecks
+          // current freshness + ownership (discard cleanup stays allowed).
+          writeGate: () => writeGate(),
           command: (command, args) =>
             controller.command(targetId, {
               hostId: wireHostId,
@@ -843,8 +951,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     const runtime = controller.getSnapshot();
     const hasChallenge = warmSession(runtime)?.confirmations.has(intent.approvalId) ?? false;
     if (hasChallenge) {
-      await confirmChallenge(intent.approvalId, intent.decision === "approve" ? "approve" : "deny");
-      return { kind: "accepted" };
+      return confirmChallenge(intent.approvalId, intent.decision === "approve" ? "approve" : "deny");
     } else {
       return sendCommand(
         "session.ui.respond",
@@ -863,17 +970,13 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       if (snapshot === null) {
         const runtime = controller.getSnapshot();
         const warmNow = warmSession(runtime);
-        const connection = runtime.connections.get(targetId);
         const indexedRef = runtime.projection.sessionIndex.get(projectionKey);
-        const inventoryReady =
-          runtime.targetHosts.get(targetId) === options.hostId &&
-          (indexedRef === undefined || hostSessionInventoryIsComplete(runtime, options.hostId));
-        const link: SessionLink =
-          connection !== "connected"
-            ? "offline"
-            : !inventoryReady || (warmNow !== undefined && warmNow.freshness !== "fresh")
-              ? "cached"
-              : "live";
+        const link: SessionLink = sessionWriteLink(
+          runtime,
+          targetId,
+          options.hostId,
+          options.sessionId,
+        );
         const granted = grantedFor(runtime);
         const catalog = runtime.catalogs.get(options.hostId);
         // Session control truth: warm ref first, session index second.
@@ -886,14 +989,21 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
           (transcriptIsActive(transcript) ||
             pendingPrompts.length > 0 ||
             sessionIsWorkingWithPendingPrompts(ref, pendingPrompts));
+        const sessionControl = sessionControlForLink(link, readSessionControl(ref));
+        const controlGate =
+          sessionControl === null ? null : presentSessionControl(sessionControl);
         const cancelItem = catalog === undefined ? undefined : findCancelCommand(catalog.items);
         const cancelSupported = cancelItem !== undefined && cancelItem.supported !== false;
-        const canCancel = link === "live" && sessionActive && cancelSupported;
-        const cancelDisabledReason = cancelSupported
-          ? null
-          : catalog === undefined
-            ? "Waiting for this host's command list"
-            : (cancelItem?.reason ?? "This host does not offer a stop command");
+        const canCancel =
+          link === "live" && sessionActive && cancelSupported && controlGate === null;
+        const cancelDisabledReason =
+          controlGate !== null
+            ? controlGate.cancelReason
+            : cancelSupported
+              ? null
+              : catalog === undefined
+                ? "Waiting for this host's command list"
+                : (cancelItem?.reason ?? "This host does not offer a stop command");
         const challenge = pendingChallenge(runtime);
         let projection: TranscriptProjection =
           transcript.approval === null && challenge !== null
@@ -917,8 +1027,19 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
         const contextUsage = runtime.projection.sessionIndex.get(projectionKey)?.contextUsage;
 
         const canPrompt =
-          link === "live" && granted.includes("sessions.prompt") && ref?.status !== "closed";
+          link === "live" &&
+          granted.includes("sessions.prompt") &&
+          ref?.status !== "closed" &&
+          controlGate === null;
         const queuedFollowUps = getQueuedFollowUps(ref);
+        const derivedControls = deriveComposerControls({
+          catalog,
+          settings: runtime.settings.get(options.hostId),
+          ref,
+          granted,
+          pendingControl,
+          controlError,
+        });
 
         snapshot = {
           projection,
@@ -933,20 +1054,21 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
               ? []
               : slashCommandsFromCatalog(
                   catalog.items,
-                  { link, turnActive: sessionActive },
+                  {
+                    link,
+                    turnActive: sessionActive,
+                    readOnlyReason: controlGate === null ? null : controlGate.slashReason,
+                  },
                   granted,
                 ),
           contextUsedTokens: contextUsage?.used ?? 0,
           contextWindowTokens: contextUsage?.limit ?? 0,
           queuedFollowUps,
-          controls: deriveComposerControls({
-            catalog,
-            settings: runtime.settings.get(options.hostId),
-            ref,
-            granted,
-            pendingControl,
-            controlError,
-          }),
+          controls:
+            controlGate === null
+              ? derivedControls
+              : gateComposerControls(derivedControls, controlGate.controlReason),
+          sessionControl,
           nowMs: Date.now(),
         };
       }

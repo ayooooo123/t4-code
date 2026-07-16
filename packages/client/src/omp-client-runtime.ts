@@ -149,7 +149,6 @@ export class OmpClient {
         },
         close: (code, reason) => this.handleDisconnect(code, reason),
         error: (error) => this.handleTransportError(error),
-        reconnectLimit: () => this.fatal(this.error("transport", "reconnect attempt limit reached", true)),
         reconnectWait: () => this.transition("reconnect-wait"),
         heartbeatFailure: () => this.handleDisconnect(undefined, "heartbeat timeout"),
       },
@@ -234,8 +233,7 @@ export class OmpClient {
   /**
    * Nudge a backgrounded client back to health. Fresh ready sockets and
    * in-flight connection attempts are left alone; pending backoff is skipped,
-   * a stale ready socket is replaced, and retry-exhausted transport failures
-   * receive one fresh bounded reconnect budget.
+   * a stale ready socket is replaced.
    */
   wake(): void {
     if (this.stateValue === "idle") {
@@ -279,12 +277,8 @@ export class OmpClient {
       this.stateValue === "handshaking"
     ) return;
 
-    // Replacing a socket explicitly starts a new recovery episode. Reset the
-    // exhausted episode before scheduling so a ready connection that reached
-    // the previous cap can still receive one fresh, bounded reconnect budget.
-    // The replacement's attempt remains charged until its heartbeat and every
-    // attachment replay pass the normal reconnect-health gate.
-    this.connection.resetAttempts();
+    // Replacing a socket starts a new recovery episode.
+    // Attempts remain charged until heartbeat and replay recovery.
     this.handleDisconnect(undefined, "foreground reconnect");
     this.connection.beginReconnectNow();
   }
@@ -441,7 +435,8 @@ export class OmpClient {
       (encoded) => this.connection.send(encoded),
       (input) => decodeOutgoingFrame(input),
       () => this.fatal(this.error("auth", "authentication provider failed")),
-      () => this.protocolFailure("hello could not be sent"),
+      () => this.protocolFailure("hello could not be encoded"),
+      (error) => this.handleTransportError(error),
     );
   }
   private clearInbound(): void { this.inboundQueue.clear(); }
@@ -607,6 +602,12 @@ export class OmpClient {
         this.fatal(this.error("protocol", "Host rejected the protocol hello."));
         return;
       }
+    } else if (code === 1008) {
+      this.fatal(this.error("auth", reason?.trim() || "Host rejected the protocol session."));
+      return;
+    } else if (code === 1002) {
+      this.fatal(this.error("protocol", reason?.trim() || "Host rejected the protocol session."));
+      return;
     }
     this.clearTimer("handshakeTimer");
     this.heartbeatNonce = undefined;
@@ -715,7 +716,6 @@ export class OmpClient {
     if (this.stateValue !== "fatal" || this.fatalError?.code !== "transport" || !this.fatalError.retryable) return;
     this.closedByUser = false;
     this.fatalError = undefined;
-    this.connection.resetAttempts();
     this.transition("connecting");
     this.connection.begin();
   }

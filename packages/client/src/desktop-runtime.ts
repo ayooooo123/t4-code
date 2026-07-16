@@ -245,7 +245,14 @@ export class DesktopRuntimeController {
     const pending = this.acquireControllerLeaseNow(targetId, hostIdValue, sessionIdValue, expectedRevision, ownerId, generation, key);
     this.controllerLeases.set(key, { key, pending });
     void pending.then((result) => {
-      if (result.required) this.controllerLeases.set(key, { key, lease: result });
+      const currentEntry = this.controllerLeases.get(key);
+      const isCurrentPending = currentEntry?.pending === pending;
+      const isCurrentGeneration = this.generationFor(targetId) === generation;
+      if (result.required && (!isCurrentPending || this.stopped || !isCurrentGeneration)) {
+        void this.releaseLeaseBestEffort(result);
+      }
+      if (!isCurrentPending) return;
+      if (result.required && !this.stopped && isCurrentGeneration) this.controllerLeases.set(key, { key, lease: result });
       else this.controllerLeases.delete(key);
     }, () => {
       if (this.controllerLeases.get(key)?.pending === pending) this.controllerLeases.delete(key);
@@ -320,18 +327,99 @@ export class DesktopRuntimeController {
     }
     return undefined;
   }
-  async commandWithControllerLease(targetId: string, intent: CommandRequest["intent"], leaseRevision?: string): Promise<CommandResult> {
+  /**
+   * Callers currently inside one session's acquire→dispatch window. Two
+   * concurrent calls can coalesce onto the same pending acquisition with no
+   * prior cached lease; a gate rejection may only tear the lease down when
+   * no coalesced peer is still about to dispatch with it. Cleanup fails
+   * open — an unreleased lease simply expires.
+   */
+  private readonly leaseWindowHolds = new Map<string, number>();
+  private holdLeaseWindow(key: string): () => void {
+    this.leaseWindowHolds.set(key, (this.leaseWindowHolds.get(key) ?? 0) + 1);
+    return () => {
+      const next = (this.leaseWindowHolds.get(key) ?? 1) - 1;
+      if (next <= 0) this.leaseWindowHolds.delete(key);
+      else this.leaseWindowHolds.set(key, next);
+    };
+  }
+  async commandWithControllerLease(targetId: string, intent: CommandRequest["intent"], leaseRevision?: string, beforeDispatch?: () => void): Promise<CommandResult> {
     if (this.stopped) throw new DesktopRuntimeError("stopped", "desktop runtime is stopped");
     const revisionValue = intent.expectedRevision ?? leaseRevision;
-    if (intent.sessionId === undefined || revisionValue === undefined || !this.hasControllerLeaseFeature(targetId, String(intent.hostId))) return this.command(targetId, intent);
-    const acquired = await this.acquireControllerLease(targetId, String(intent.hostId), String(intent.sessionId), String(revisionValue));
-    if (!acquired.required) return this.command(targetId, intent);
-    const args = intent.args === undefined ? { leaseId: acquired.leaseId } : { ...intent.args, leaseId: acquired.leaseId };
-    return this.command(targetId, { ...intent, args });
+    if (intent.sessionId === undefined || revisionValue === undefined || !this.hasControllerLeaseFeature(targetId, String(intent.hostId))) {
+      beforeDispatch?.();
+      return this.command(targetId, intent);
+    }
+    // Snapshot any already-cached valid lease BEFORE the acquisition wait:
+    // a pre-dispatch gate failure must only release a NEWLY acquired lease,
+    // never a preexisting cached one other flows still rely on.
+    const priorLease = this.controllerLeaseFor(targetId, String(intent.hostId), String(intent.sessionId), String(revisionValue));
+    const holdKey = `c\u0000${targetId}\u0000${String(intent.hostId)}\u0000${String(intent.sessionId)}\u0000${String(revisionValue)}`;
+    const releaseHold = this.holdLeaseWindow(holdKey);
+    try {
+      const acquired = await this.acquireControllerLease(targetId, String(intent.hostId), String(intent.sessionId), String(revisionValue));
+      if (acquired.required && acquired.generation !== this.generationFor(targetId)) {
+        throw new DesktopRuntimeError("stale", "target connection generation changed during controller lease acquisition");
+      }
+      // Lease acquisition is a wait: the caller may need to re-read session
+      // truth (freshness/ownership) immediately before the command leaves.
+      try {
+        beforeDispatch?.();
+      } catch (error) {
+        // The command never dispatched; do not leave a freshly acquired
+        // lease cached until expiry where it can block peers — unless a
+        // coalesced peer is still inside the window and about to use it.
+        if (
+          acquired.required &&
+          acquired.leaseId !== priorLease?.leaseId &&
+          (this.leaseWindowHolds.get(holdKey) ?? 0) <= 1
+        ) {
+          void this
+            .releaseControllerLease(targetId, String(intent.hostId), String(intent.sessionId), String(revisionValue), acquired.leaseId)
+            .catch(() => undefined);
+        }
+        throw error;
+      }
+      if (!acquired.required) return this.command(targetId, intent);
+      const args = intent.args === undefined ? { leaseId: acquired.leaseId } : { ...intent.args, leaseId: acquired.leaseId };
+      return this.command(targetId, { ...intent, args });
+    } finally {
+      releaseHold();
+    }
   }
-  async commandWithPromptLease(targetId: string, intent: CommandRequest["intent"], leaseRevision?: string): Promise<CommandResult> {
+  async commandWithPromptLease(targetId: string, intent: CommandRequest["intent"], leaseRevision?: string, beforeDispatch?: () => void): Promise<CommandResult> {
     if (this.stopped) throw new DesktopRuntimeError("stopped", "desktop runtime is stopped");
-    return this.promptLeases.command(targetId, intent, this.generationFor(targetId), this.current.targetHosts.get(targetId) === String(intent.hostId) && this.current.hosts.get(String(intent.hostId))?.grantedFeatures.includes("prompt.lease") === true, (nextTargetId, nextIntent) => this.command(nextTargetId, nextIntent), leaseRevision);
+    const sessionIdValue = intent.sessionId === undefined ? undefined : String(intent.sessionId);
+    const generation = this.generationFor(targetId);
+    const priorPromptLeaseId =
+      sessionIdValue === undefined
+        ? undefined
+        : this.promptLeases.leaseIdFor(targetId, String(intent.hostId), sessionIdValue, generation);
+    const holdKey = `p\u0000${targetId}\u0000${String(intent.hostId)}\u0000${sessionIdValue ?? ""}\u0000${generation}`;
+    const releaseHold = sessionIdValue === undefined ? null : this.holdLeaseWindow(holdKey);
+    try {
+      return await this.promptLeases.command(targetId, intent, generation, this.current.targetHosts.get(targetId) === String(intent.hostId) && this.current.hosts.get(String(intent.hostId))?.grantedFeatures.includes("prompt.lease") === true, (nextTargetId, nextIntent) => {
+        // Runs after any internal lease acquisition, immediately before the
+        // actual command dispatch.
+        if (this.generationFor(nextTargetId) !== generation) {
+          throw new DesktopRuntimeError("stale", "target connection generation changed during prompt lease acquisition");
+        }
+        try {
+          beforeDispatch?.();
+        } catch (error) {
+          // Pre-dispatch gate failure: only a NEWLY acquired lease releases
+          // (a preexisting cached id survives), and never while a coalesced
+          // peer is still inside the window with the same lease.
+          if (sessionIdValue !== undefined && (this.leaseWindowHolds.get(holdKey) ?? 0) <= 1) {
+            this.promptLeases.invalidateSession(nextTargetId, String(intent.hostId), sessionIdValue, this.generationFor(nextTargetId), priorPromptLeaseId);
+          }
+          throw error;
+        }
+        return this.command(nextTargetId, nextIntent);
+      }, leaseRevision);
+    } finally {
+      releaseHold?.();
+    }
   }
   private generationFor(targetId: string): number {
     return this.connectionGenerations.get(targetId) ?? 0;

@@ -842,7 +842,6 @@ test("manages a session from a phone and converges another live client", async (
     await expect(page.getByText(managedTitle, { exact: true }).first()).toBeVisible();
     await expect(observer.getByText(managedTitle, { exact: true }).first()).toBeVisible();
 
-    await page.getByRole("button", { name: "Show session list", exact: true }).click();
     await expect(rail).toBeVisible();
     const managedRow = page.locator(`[data-session-row="${SESSION_VIEW_ID}"]`);
     await expect(managedRow).toContainText(managedTitle);

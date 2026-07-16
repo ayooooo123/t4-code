@@ -241,6 +241,33 @@ async function startedController(
   await controller.start();
   shell.emitFrame({ targetId: "local", frame: makeWelcome(HOST, capabilities, features) });
   shell.emitFrame({ targetId: "local", frame: snapshotFrame(1, []) });
+  // Complete session inventory: dispatch-time write freshness requires this
+  // session's indexed ref, not just a bound target. seq 0 stays below every
+  // frame the tests emit themselves.
+  shell.emitFrame({
+    targetId: "local",
+    frame: {
+      v: V,
+      type: "sessions",
+      cursor: { epoch: "session-index-1", seq: 0 },
+      sessions: [
+        {
+          hostId: hostId(HOST),
+          sessionId: sessionId(SESSION),
+          project: {
+            projectId: "project-1" as SessionsFrame["sessions"][number]["project"]["projectId"],
+          },
+          revision: revision("rev-1"),
+          title: "Session",
+          status: "idle",
+          updatedAt: "2026-07-11T09:59:00Z",
+          liveState: { isStreaming: false },
+        },
+      ],
+      totalCount: 1,
+      truncated: false,
+    } satisfies SessionsFrame,
+  });
   return { shell, controller };
 }
 
@@ -372,7 +399,9 @@ describe("prompt submission outcomes", () => {
 
     const outcome = await gate.submit(PROMPT, { text: "ship it", attachmentIds: [] }, harness.io);
 
-    expect(outcome?.kind).toBe("unknown");
+    // Fail-closed: without proven session freshness the prompt refuses
+    // locally (honest reason) instead of risking an unknown outcome.
+    expect(outcome?.kind).toBe("rejected");
     expect(harness.draft()).toBe("ship it");
     expect(shell.commandCount("session.prompt")).toBe(0);
   });
@@ -1980,6 +2009,61 @@ describe("session lifecycle", () => {
     await controller.stop();
   });
 
+  it("keeps an attached warm session cached when the complete index omits it", async () => {
+    const warm = applyPublicFrame(createProjectionSnapshot(), snapshotFrame(1, []));
+    const projection = new ProjectionStore({
+      cacheStore: {
+        load: () => encodeProjectionCache(warm),
+        save: () => undefined,
+      },
+    });
+    await projection.hydrated;
+    const shell = new FakeShell();
+    const controller = createDesktopRuntimeController({ shell, projection });
+    await controller.start();
+    shell.emitFrame({ targetId: "local", frame: makeWelcome(HOST, ["sessions.prompt"]) });
+    shell.emitFrame({
+      targetId: "local",
+      frame: {
+        v: V,
+        type: "sessions",
+        cursor: { epoch: "session-index-1", seq: 0 },
+        sessions: [],
+        totalCount: 0,
+        truncated: false,
+      } satisfies SessionsFrame,
+    });
+    const runtime = createLiveSessionRuntime({
+      controller,
+      targetId: "local",
+      hostId: HOST,
+      sessionId: SESSION,
+    });
+
+    shell.emitFrame({
+      targetId: "local",
+      frame: {
+        v: V,
+        type: "response",
+        requestId: "attach-missing-index" as never,
+        commandId: "attach-missing-index-command" as never,
+        command: "session.attach",
+        hostId: hostId(HOST),
+        sessionId: sessionId(SESSION),
+        ok: true,
+        result: { attached: true, cursor: { epoch: "epoch-1", seq: 1 } },
+      },
+    });
+
+    expect(runtime.getSnapshot()).toMatchObject({
+      link: "cached",
+      canPrompt: false,
+      canCancel: false,
+    });
+    runtime.dispose();
+    await controller.stop();
+  });
+
   it("keeps stale transcript activity visible as history but not as offline work", async () => {
     const { shell, runtime } = await startedRuntime();
     shell.emitFrame({ targetId: "local", frame: turnStart(2) });
@@ -2424,6 +2508,10 @@ describe("session lifecycle", () => {
       targetId: "local",
       frame: makeWelcome(HOST, ["sessions.prompt"]),
     });
+    shell.emitFrame({
+      targetId: "local",
+      frame: pendingPromptsSessionsFrame([], 0, "idle"),
+    });
     const runtime = createLiveSessionRuntime({
       controller,
       targetId: "local",
@@ -2568,6 +2656,9 @@ describe("session lifecycle", () => {
     expect(offline.projection.entries).toHaveLength(1);
 
     shell.emitState({ targetId: "local", state: "connected" });
+    // Reconnect drops inventory completeness; the host replays its session
+    // list before the link may claim live again.
+    shell.emitFrame({ targetId: "local", frame: pendingPromptsSessionsFrame([], 99, "idle") });
     const restored = runtime.getSnapshot();
     expect(restored.link).toBe("live");
     expect(restored.projection.entries.map((item) => String(item.id))).toEqual(["entry-1"]);

@@ -2,7 +2,6 @@ import {
   PROTOCOL_VERSION,
   decodeCommand,
   decodeConfirm,
-  decodeServerFrame,
   decodeTerminalClient,
   inputObject,
   isSecretLikeKey,
@@ -18,6 +17,7 @@ import {
   type SessionId,
   type TerminalId,
 } from "@oh-my-pi/app-wire";
+import { decodeServerFrame } from "./index.ts";
 
 export const DESKTOP_IPC_VERSION = PROTOCOL_VERSION;
 export type RendererServerFrame = Exclude<ServerFrame, { type: "pair.ok" }>;

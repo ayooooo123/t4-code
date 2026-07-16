@@ -69,6 +69,36 @@ export function applySessionRoutePendingGrace(
   return decision.kind === "pending" && pendingTimedOut ? { kind: "unavailable" } : decision;
 }
 
+export interface SessionRouteActivationGate {
+  /**
+   * Returns the session ID to activate, or null when this evaluation must not
+   * re-activate (route absent, or the same session already activated).
+   */
+  resolve(
+    decision: SessionRouteDecision,
+    session: { readonly id: string } | undefined,
+  ): string | null;
+}
+
+/**
+ * Streamed shell projections rebuild the session object on every output or
+ * status update, so effects keyed on that object re-fire while the route has
+ * not changed. Activation — which closes the narrow rail overlay — must fire
+ * once per present route session ID, not per object identity, or live output
+ * slams a deliberately reopened rail shut.
+ */
+export function createSessionRouteActivationGate(): SessionRouteActivationGate {
+  let activatedSessionId: string | null = null;
+  return {
+    resolve(decision, session) {
+      if (decision.kind !== "present" || session === undefined) return null;
+      if (session.id === activatedSessionId) return null;
+      activatedSessionId = session.id;
+      return session.id;
+    },
+  };
+}
+
 function routeHostId(viewId: string): string | null {
   const separator = viewId.indexOf("/");
   if (separator <= 0 || separator !== viewId.lastIndexOf("/") || separator === viewId.length - 1) {

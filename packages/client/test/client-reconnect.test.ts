@@ -66,6 +66,7 @@ class FakeClock implements Clock, TimerScheduler {
 
 interface FakeTransportOptions {
   welcome?: WelcomeFrame;
+  sendError?: unknown;
   onSend?: (frame: ClientFrame, transport: FakeTransport) => void;
 }
 class FakeTransport implements OmpTransport {
@@ -81,6 +82,7 @@ class FakeTransport implements OmpTransport {
   send(data: string): void {
     this.sent.push(data);
     const frame = decodeClientFrame(data);
+    if (frame.type === "hello" && this.options.sendError !== undefined) throw this.options.sendError;
     if (frame.type === "hello" && this.options.welcome !== undefined) this.emit(this.options.welcome);
     this.options.onSend?.(frame, this);
   }
@@ -95,11 +97,11 @@ class FakeTransport implements OmpTransport {
     // eslint-disable-next-line unicorn/no-useless-spread -- callbacks may unsubscribe while the fixture dispatches.
     for (const listener of [...this.messages]) listener(data);
   }
-  drop(): void {
+  drop(code = 1006, reason = "dropped"): void {
     if (this.closed) return;
     this.closed = true;
     // eslint-disable-next-line unicorn/no-useless-spread -- callbacks may unsubscribe while the fixture dispatches.
-    for (const listener of [...this.closes]) listener(1006, "dropped");
+    for (const listener of [...this.closes]) listener(code, reason);
   }
   lastClientFrame(): ClientFrame { return decodeClientFrame(this.sent[this.sent.length - 1]!); }
 }
@@ -165,7 +167,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       timers: clock,
       heartbeat: { intervalMs: 10, timeoutMs: 5 },
-      reconnect: { attemptCap: 0 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
     await client.connect();
 
@@ -173,6 +175,127 @@ describe("OmpClient reconnect stability", () => {
     expect(client.state).toBe("ready");
     clock.advanceBy(5);
     expect(client.state).toBe("ready");
+    await client.close();
+  });
+  it("lets a re-entrant reconnect-wait wake claim and clear its timer", async () => {
+    const clock = new FakeClock();
+    const first = new FakeTransport({ welcome: welcome() });
+    const second = new FakeTransport({ welcome: welcome({ resumed: true }) });
+    const transports = [first, second];
+    let factoryCalls = 0;
+    const client = new OmpClient({
+      transport: () => {
+        factoryCalls += 1;
+        return transports.shift() ?? new FakeTransport();
+      },
+      hostId: HOST,
+      clock,
+      timers: clock,
+      random: () => 0,
+      reconnect: { baseMs: 2_000, maxMs: 2_000 },
+    });
+    client.onState((snapshot) => {
+      if (snapshot.state === "reconnect-wait") client.wake();
+    });
+
+    await client.connect();
+    first.drop();
+    await flushReconnect(clock);
+
+    expect(client.state).toBe("ready");
+    expect(factoryCalls).toBe(2);
+    clock.advanceBy(2_000);
+    expect(factoryCalls).toBe(2);
+    await client.close();
+  });
+
+  it("retries when the hello transport send throws", async () => {
+    const clock = new FakeClock();
+    const first = new FakeTransport({ sendError: new Error("socket write failed") });
+    const second = new FakeTransport({ welcome: welcome() });
+    const transports = [first, second];
+    const errors: string[] = [];
+    const client = new OmpClient({
+      transport: () => transports.shift() ?? new FakeTransport(),
+      hostId: HOST,
+      clock,
+      timers: clock,
+      random: () => 0,
+      reconnect: { baseMs: 2, maxMs: 2 },
+    });
+    client.onError((error) => errors.push(error.code));
+
+    const connecting = client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(client.state).toBe("reconnect-wait");
+    clock.advanceBy(1);
+    await connecting;
+
+    expect(client.state).toBe("ready");
+    expect(errors).toContain("transport");
+    expect(client.snapshot().attempt).toBe(1);
+    await client.close();
+  });
+
+  for (const [code, expectedError] of [[1008, "auth"], [1002, "protocol"]] as const) {
+    it(`treats websocket close ${code} as fatal`, async () => {
+      const transport = new FakeTransport({ welcome: welcome() });
+      const errors: string[] = [];
+      const client = new OmpClient({
+        transport: () => transport,
+        hostId: HOST,
+        reconnect: { baseMs: 0, maxMs: 0 },
+      });
+      client.onError((error) => errors.push(error.code));
+      await client.connect();
+
+      transport.drop(code, "policy/protocol rejection");
+
+      expect(client.state).toBe("fatal");
+      expect(client.snapshot().attempt).toBe(0);
+      await client.close();
+      expect(client.resources().timers).toBe(0);
+      expect(errors).toContain(expectedError);
+    });
+  }
+
+  it("preserves attempts through manual wake until heartbeat health is proven", async () => {
+    const clock = new FakeClock();
+    const first = new FakeTransport({ welcome: welcome() });
+    const second = new FakeTransport({ welcome: welcome({ resumed: true }) });
+    const third = new FakeTransport({ welcome: welcome({ resumed: true }) });
+    const transports = [first, second, third];
+    const client = new OmpClient({
+      transport: () => transports.shift() ?? new FakeTransport(),
+      hostId: HOST,
+      clock,
+      timers: clock,
+      heartbeat: { intervalMs: 10, timeoutMs: 5 },
+      random: () => 0,
+      reconnect: { baseMs: 0, maxMs: 0 },
+      wakeStaleAfterMs: 1,
+    });
+
+    await client.connect();
+    first.drop();
+    await flushReconnect(clock);
+    expect(client.snapshot().attempt).toBe(1);
+
+    clock.advanceBy(1);
+    client.wake();
+    await flushReconnect(clock);
+    expect(client.state).toBe("ready");
+    expect(client.snapshot().attempt).toBe(2);
+
+    clock.advanceBy(10);
+    const ping = third.lastClientFrame();
+    expect(ping.type).toBe("ping");
+    if (ping.type === "ping") {
+      third.emit({ v: V, type: "pong", nonce: ping.nonce, timestamp: ping.timestamp });
+    }
+    expect(client.snapshot().attempt).toBe(0);
     await client.close();
   });
 
@@ -192,7 +315,7 @@ describe("OmpClient reconnect stability", () => {
       timers: clock,
       clock,
       random: () => 0,
-      reconnect: { baseMs: 10_000, maxMs: 10_000, attemptCap: 2 },
+      reconnect: { baseMs: 10_000, maxMs: 10_000 },
     });
 
     await client.connect();
@@ -212,7 +335,7 @@ describe("OmpClient reconnect stability", () => {
     await client.close();
   });
 
-  it("foreground wake revives retry-exhausted transport failure with a fresh bounded budget", async () => {
+  it("foreground wake skips pending backoff without duplicating transport generations", async () => {
     const clock = new FakeClock();
     const transports = [
       new FakeTransport({ welcome: welcome() }),
@@ -227,12 +350,12 @@ describe("OmpClient reconnect stability", () => {
       hostId: HOST,
       timers: clock,
       clock,
-      reconnect: { attemptCap: 0 },
+      reconnect: { baseMs: 250, maxMs: 10_000 },
     });
 
     await client.connect();
     transports[0]?.drop();
-    expect(client.state).toBe("fatal");
+    expect(client.state).toBe("reconnect-wait");
 
     client.wake();
     client.wake();
@@ -242,7 +365,7 @@ describe("OmpClient reconnect stability", () => {
 
     expect(factoryCalls).toBe(2);
     expect(client.state).toBe("ready");
-    expect(client.snapshot().attempt).toBe(0);
+    expect(client.snapshot().attempt).toBe(1);
     await client.close();
   });
 
@@ -258,7 +381,7 @@ describe("OmpClient reconnect stability", () => {
         return transport ?? new FakeTransport();
       },
       hostId: HOST,
-      reconnect: { baseMs: 10_000, maxMs: 10_000, attemptCap: 2 },
+      reconnect: { baseMs: 10_000, maxMs: 10_000 },
     });
 
     await client.connect();
@@ -327,7 +450,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 100, timeoutMs: 10 },
-      reconnect: { baseMs: 1_000, maxMs: 1_000, attemptCap: 2 },
+      reconnect: { baseMs: 1_000, maxMs: 1_000 },
       wakeStaleAfterMs: 10,
     });
 
@@ -358,7 +481,7 @@ describe("OmpClient reconnect stability", () => {
     await client.close();
   });
 
-  it("gives a stale ready foreground replacement a fresh bounded budget at the reconnect cap", async () => {
+  it("gives a stale ready foreground replacement an indefinite retry budget", async () => {
     const clock = new FakeClock();
     const first = new FakeTransport({ welcome: welcome() });
     const second = new FakeTransport({ welcome: welcome({ resumed: true }) });
@@ -377,7 +500,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 100_000, timeoutMs: 100 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 1 },
+      reconnect: { baseMs: 0, maxMs: 0 },
       wakeStaleAfterMs: 10,
     });
     client.onError((error) => errors.push(error.message));
@@ -397,18 +520,16 @@ describe("OmpClient reconnect stability", () => {
 
     expect(factoryCalls).toBe(3);
     expect(client.state).toBe("ready");
-    expect(client.snapshot().attempt).toBe(1);
-    expect(errors).not.toContain("reconnect attempt limit reached");
+    expect(client.snapshot().attempt).toBe(2);
 
     third.drop();
-    expect(client.state).toBe("fatal");
-    expect(client.snapshot().attempt).toBe(1);
-    expect(errors).toContain("reconnect attempt limit reached");
+    expect(client.state).toBe("reconnect-wait");
+    expect(client.snapshot().attempt).toBe(3);
     expect(factoryCalls).toBe(3);
     await client.close();
   });
 
-  it("coalesces repeated stale ready wakes at the reconnect cap into one foreground replacement", async () => {
+  it("coalesces repeated stale ready wakes into one foreground replacement", async () => {
     const clock = new FakeClock();
     const first = new FakeTransport({ welcome: welcome() });
     const second = new FakeTransport({ welcome: welcome({ resumed: true }) });
@@ -426,7 +547,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 100_000, timeoutMs: 100 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 1 },
+      reconnect: { baseMs: 0, maxMs: 0 },
       wakeStaleAfterMs: 10,
     });
 
@@ -446,14 +567,15 @@ describe("OmpClient reconnect stability", () => {
 
     expect(factoryCalls).toBe(3);
     expect(client.state).toBe("ready");
-    expect(client.snapshot().attempt).toBe(1);
+    expect(client.snapshot().attempt).toBe(2);
     await client.close();
   });
 
-  it("caps reconnects when every post-welcome attach loses its replay", async () => {
+  it("retries through an outage longer than twelve attempts and recovers", async () => {
     const clock = new FakeClock();
     const transports: FakeTransport[] = [];
     let attaches = 0;
+    const outageAttempts = 14;
     const client = new OmpClient({
       transport: () => {
         const transport = new FakeTransport({
@@ -462,7 +584,9 @@ describe("OmpClient reconnect stability", () => {
             if (frame.type !== "command" || frame.command !== "session.attach") return;
             attaches += 1;
             current.emit(responseFor(frame, { attached: true }));
-            queueMicrotask(() => current.drop());
+            if (transports.length <= outageAttempts) {
+              queueMicrotask(() => current.drop());
+            }
           },
         });
         transports.push(transport);
@@ -473,20 +597,19 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 100_000, timeoutMs: 100 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 2 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
     const errors: string[] = [];
     client.onError((error) => errors.push(error.message));
 
     await client.connect();
     await client.command({ hostId: HOST, sessionId: SESSION, command: "session.attach", args: {} });
-    for (let turn = 0; turn < 12 && client.state !== "fatal"; turn++) await flushReconnect(clock);
+    for (let turn = 0; turn < 20 && client.state !== "ready"; turn++) await flushReconnect(clock);
 
-    expect(client.state).toBe("fatal");
-    expect(client.snapshot().attempt).toBe(2);
-    expect(transports).toHaveLength(3);
-    expect(attaches).toBe(3);
-    expect(errors).toContain("reconnect attempt limit reached");
+    expect(client.state).toBe("ready");
+    expect(client.snapshot().attempt).toBe(14);
+    expect(transports.length).toBeGreaterThan(12);
+    expect(attaches).toBeGreaterThan(12);
     await client.close();
   });
 
@@ -502,7 +625,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 10, timeoutMs: 5 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 2 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
 
     await client.connect();
@@ -556,7 +679,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 10, timeoutMs: 5 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 3 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
 
     await client.connect();
@@ -618,7 +741,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       heartbeat: { intervalMs: 10, timeoutMs: 5 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 2 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
 
     await client.connect();
@@ -691,7 +814,7 @@ describe("OmpClient reconnect stability", () => {
       clock,
       random: () => 0,
       privilegedPairResult: () => undefined,
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 1 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
 
     await client.connect();

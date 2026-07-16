@@ -1,12 +1,17 @@
 import { hostId as brandHostId } from "@t4-code/protocol";
 import { sessionViewId } from "../../platform/live-workspace.ts";
+import { hostSessionInventoryIsComplete } from "./session-inventory.ts";
 
 export interface LiveCreateAddress { readonly targetId: string; readonly hostId: string; readonly projectId: string; }
 export interface LiveCreateResult { readonly viewId: string; }
 export interface LiveCreateController {
   getSnapshot(): {
+    connections: ReadonlyMap<string, string>;
     targetHosts: ReadonlyMap<string, string>;
-    projection: { sessionIndex: ReadonlyMap<string, { hostId: string; sessionId: string; project: { projectId: string } }> };
+    projection: {
+      sessionIndex: ReadonlyMap<string, { hostId: string; sessionId: string; project: { projectId: string } }>;
+      sessionIndexMetadata: ReadonlyMap<string, { truncated: boolean; totalCount: number }>;
+    };
   };
   subscribeFrames(filter: { targetId: string; hostId: string; types: readonly string[] }, listener: (event: { frame: unknown }) => void): () => void;
   command(targetId: string, request: { hostId: string; command: string; args: Record<string, unknown> }): Promise<{ accepted: boolean; requestId: string }>;
@@ -21,9 +26,28 @@ export async function createLiveSession(
   title?: string,
   timeoutMs = 15_000,
 ): Promise<LiveCreateResult> {
-  if (controller.getSnapshot().targetHosts.get(address.targetId) !== address.hostId) {
-    throw new Error("Project host binding is no longer available.");
-  }
+  // Dispatch-time guard, re-read at click time (UI support may be stale):
+  // the target must be connected, bound to this host, AND holding a
+  // complete session inventory before a mutating session.create leaves.
+  // No ownership field applies to a new session.
+  const assertCreatable = () => {
+    const snapshot = controller.getSnapshot();
+    if (snapshot.connections.get(address.targetId) !== "connected") {
+      throw new Error("Connect to this host to create a session.");
+    }
+    if (snapshot.targetHosts.get(address.targetId) !== address.hostId) {
+      throw new Error("Project host binding is no longer available.");
+    }
+    if (
+      !hostSessionInventoryIsComplete(
+        snapshot as Parameters<typeof hostSessionInventoryIsComplete>[0],
+        address.hostId,
+      )
+    ) {
+      throw new Error("This host's session list is still syncing. Try again in a moment.");
+    }
+  };
+  assertCreatable();
   const pending = new Map<string, { command: string; resolve: (f: Record<string, unknown>) => void; reject: (e: Error) => void }>();
   const early: Record<string, Record<string, unknown>> = {};
   const earlyIds: string[] = [];
@@ -48,6 +72,9 @@ export async function createLiveSession(
   const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => { failAll(timeoutError()); reject(timeoutError()); }, timeoutMs); });
   const response = async (command: string, args: Record<string, unknown>) => {
     const work = (async () => {
+      // `session.list` refresh stays allowed as a read; only the mutating
+      // create re-guards immediately before dispatch.
+      if (command === "session.create") assertCreatable();
       const result = await controller.command(address.targetId, { hostId: brandHostId(address.hostId), command, args });
       if (!result.accepted) throw new Error(`Host rejected ${command}.`);
       const buffered = early[result.requestId];

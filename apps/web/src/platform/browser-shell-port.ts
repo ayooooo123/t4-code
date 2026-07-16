@@ -219,6 +219,7 @@ export function createBrowserShellPort(
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
   let transport: BrowserWebSocketTransport | undefined;
+  const pendingOpens = new Set<BrowserWebSocketTransport>();
   let welcome: WelcomeFrame | undefined;
   let stopLifecycle: Unsubscribe | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
@@ -265,12 +266,21 @@ export function createBrowserShellPort(
     };
     return { ...frame, error };
   }
-
   function buildClient(): OmpClient {
     const transportFactory = async (): Promise<OmpTransport> => {
-      transport = new BrowserWebSocketTransport({ url: backendConfig.wsUrl });
-      await transport.open();
-      return transport;
+      const current = new BrowserWebSocketTransport({ url: backendConfig.wsUrl });
+      transport = current;
+      pendingOpens.add(current);
+      try {
+        await current.open();
+        if (transport !== current) {
+          current.close();
+          throw new Error("browser transport superseded");
+        }
+        return current;
+      } finally {
+        pendingOpens.delete(current);
+      }
     };
 
     const c = (options.clientFactory ?? createOmpClient)({
@@ -285,11 +295,11 @@ export function createBrowserShellPort(
       },
       client: {
         name: "T4 Code",
-        version: "0.1.21",
+        version: "0.1.22",
         build: mobilePlatform ?? "browser",
         platform: mobilePlatform ?? (platform === "darwin" ? "darwin" : "linux"),
       },
-      reconnect: { attemptCap: 12, baseMs: 250, maxMs: 10_000 },
+      reconnect: { baseMs: 250, maxMs: 10_000 },
     });
 
     c.onFrame((frame) => {
@@ -360,6 +370,7 @@ export function createBrowserShellPort(
     },
 
     async disconnect(_request: TargetRequest): Promise<DisconnectResult> {
+      for (const pending of pendingOpens) pending.close();
       if (client !== undefined) {
         await client.close();
         client = undefined;

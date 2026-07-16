@@ -14,6 +14,10 @@ import type {
 } from "../lib/workspace-data.ts";
 import { resolveCurrentHostTargetId } from "../lib/host-target.ts";
 import { sessionIsWorking } from "../features/session-runtime/session-management.ts";
+import {
+  readSessionControl,
+  sessionControlDisplayKind,
+} from "../features/session-runtime/session-observer.ts";
 import { hostSessionInventoryIsComplete } from "../features/session-runtime/session-inventory.ts";
 
 /** Composite route id for one live session; unambiguous and URL-safe. */
@@ -252,9 +256,15 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
     // losing freshness is not evidence that the turn completed.
     const lastKnownWorking = sessionIsWorking(ref);
     const displayWorking = freshness === "live" && lastKnownWorking;
+    // Ownership display: while another app provably runs this session, the
+    // rail says "Active elsewhere" instead of a status pill that implies this
+    // app's turn. A quiet, malformed, or unrecognized control shape is still
+    // read-only, but only a confirmed live lock may claim another app.
+    const control = freshness === "live" ? readSessionControl(ref) : null;
+    const controlKind = control === null ? undefined : sessionControlDisplayKind(control);
     let status: SessionStatus | null = null;
     if (connection.state === "connecting") status = "connecting";
-    else if (freshness === "live") {
+    else if (freshness === "live" && controlKind === undefined) {
       if (pendingApprovals > 0) status = "pendingApproval";
       else if (ref.pendingUserInput === true) status = "awaitingInput";
       else if (ref.proposedPlan !== undefined && ref.proposedPlan !== "") status = "planReady";
@@ -273,6 +283,7 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       updatedAt: ref.updatedAt,
       lastActivity: "",
       ...(archivedAt === null ? {} : { archivedAt }),
+      ...(controlKind === undefined ? {} : { control: controlKind }),
     });
   }
 

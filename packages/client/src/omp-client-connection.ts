@@ -7,12 +7,11 @@ export interface ConnectionCallbacks {
   message(raw: string | Uint8Array, generation: number): void;
   close(code?: number, reason?: string): void;
   error(error: unknown): void;
-  reconnectLimit(): void;
   reconnectWait(): void;
   heartbeatFailure(): void;
 }
 
-interface ReconnectOptions { baseMs?: number; maxMs?: number; attemptCap?: number; }
+interface ReconnectOptions { baseMs?: number; maxMs?: number; }
 interface HeartbeatOptions { intervalMs?: number; timeoutMs?: number; }
 
 /** Owns transport generations, socket handlers, reconnect backoff, and heartbeat scheduling. */
@@ -107,12 +106,9 @@ export class OmpClientConnection {
   }
 
   scheduleReconnect(): void {
-    if (!this.active()) return;
-    const cap = this.reconnect?.attemptCap ?? 8;
-    if (this.attempt >= cap) {
-      this.callbacks.reconnectLimit();
-      return;
-    }
+    if (!this.active() || this.reconnectTimer !== undefined) return;
+    // Retryable transport failures stay in the reconnect loop indefinitely.
+    // Backoff remains bounded by maxMs.
     this.attempt += 1;
     const base = this.reconnect?.baseMs ?? 250;
     const max = this.reconnect?.maxMs ?? 10_000;
@@ -120,12 +116,17 @@ export class OmpClientConnection {
     const ceiling = Math.min(max, base * 2 ** Math.max(0, this.attempt - 1));
     const floor = Math.floor(ceiling / 2);
     const delay = floor + Math.floor(random * (ceiling - floor));
-    this.callbacks.reconnectWait();
-    this.reconnectTimer = this.timers.schedule(() => {
+    let timer: ClientTimer | undefined;
+    timer = this.timers.schedule(() => {
+      if (this.reconnectTimer !== timer) return;
       this.reconnectTimer = undefined;
       this.callbacks.reconnectBegin();
       this.begin();
     }, delay);
+    // Own the timer before notifying listeners. A reconnect-wait observer may
+    // synchronously wake or close the client and must be able to clear it.
+    this.reconnectTimer = timer;
+    this.callbacks.reconnectWait();
   }
 
   /** Skip a pending backoff without creating a second in-flight transport generation. */
