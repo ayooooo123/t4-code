@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   buildMobileHostMigration,
+  commitPreparedMobileHostMigration,
   prepareMobileHostDirectoryLoad,
   readMobileHostDirectory,
   writeMobileHostDirectory,
@@ -726,4 +727,115 @@ describe("prepareMobileHostDirectoryLoad", () => {
       expectSafePreparationShape(result);
     },
   );
+});
+
+class TransactionStorage {
+  readonly values: Map<string, string>;
+  readonly operations: string[] = [];
+  throwOnSet: "before" | "after" | null = null;
+  throwOnRemove = new Set<string>();
+
+  constructor(values: ReadonlyMap<string, string>) { this.values = new Map(values); }
+  getItem(key: string): string | null {
+    this.operations.push(`get:${key}`);
+    return this.values.get(key) ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.operations.push(`set:${key}`);
+    if (this.throwOnSet === "before") throw new Error(`${SECRET}: before write`);
+    this.values.set(key, value);
+    if (this.throwOnSet === "after") throw new Error(`${SECRET}: after write`);
+  }
+  removeItem(key: string): void {
+    this.operations.push(`remove:${key}`);
+    if (this.throwOnRemove.has(key)) throw new Error(`${SECRET}: remove`);
+    this.values.delete(key);
+  }
+}
+
+function pendingTransaction(values: Map<string, string>) {
+  const storage = new TransactionStorage(values);
+  const pending = prepareMobileHostDirectoryLoad(storage, migrationIds());
+  expect(pending.kind).toBe("pending");
+  if (pending.kind !== "pending") throw new Error("expected pending migration");
+  storage.operations.length = 0;
+  return { storage, pending };
+}
+
+describe("commitPreparedMobileHostMigration", () => {
+  it("compares exact source bytes before writing, verifies exact v3, then removes v2 and legacy", () => {
+    const values = new Map([
+      [V2_STORAGE_KEY, JSON.stringify({ version: 2, kind: "peer", invite: INVITE, label: "T4 private host AAAAAAAA" })],
+      [LEGACY_STORAGE_KEY, JSON.stringify(tailnet("legacy"))],
+    ]);
+    const { storage, pending } = pendingTransaction(values);
+    const result = commitPreparedMobileHostMigration(pending, storage);
+    expect(result).toEqual({ kind: "ready", directory: pending.directory });
+    expect(storage.values.get(STORAGE_KEY)).toBe(JSON.stringify(pending.directory));
+    expect(storage.values.has(V2_STORAGE_KEY)).toBe(false);
+    expect(storage.values.has(LEGACY_STORAGE_KEY)).toBe(false);
+    expect(storage.operations).toEqual([
+      `get:${STORAGE_KEY}`, `get:${V2_STORAGE_KEY}`, `get:${LEGACY_STORAGE_KEY}`,
+      `set:${STORAGE_KEY}`, `get:${STORAGE_KEY}`,
+      `remove:${V2_STORAGE_KEY}`, `remove:${LEGACY_STORAGE_KEY}`,
+    ]);
+  });
+
+  it.each([STORAGE_KEY, V2_STORAGE_KEY, LEGACY_STORAGE_KEY])("refuses a compare-and-swap mismatch at %s without mutation", (key) => {
+    const values = new Map([[V2_STORAGE_KEY, JSON.stringify({ version: 2, kind: "peer", invite: INVITE, label: "T4 private host AAAAAAAA" })]]);
+    const { storage, pending } = pendingTransaction(values);
+    storage.values.set(key, `other-writer-${key}`);
+    const before = new Map(storage.values);
+    const result = commitPreparedMobileHostMigration(pending, storage);
+    expect(result.kind).toBe("repair");
+    expect(storage.values).toEqual(before);
+    expect(storage.operations.every((operation) => !operation.startsWith("set:") && !operation.startsWith("remove:"))).toBe(true);
+  });
+
+  it.each(["before", "after"] as const)("contains setItem throwing %s the write and removes only an exact owned candidate", (when) => {
+    const values = new Map([[V2_STORAGE_KEY, JSON.stringify({ version: 2, kind: "peer", invite: INVITE, label: "T4 private host AAAAAAAA" })]]);
+    const { storage, pending } = pendingTransaction(values);
+    storage.throwOnSet = when;
+    const result = commitPreparedMobileHostMigration(pending, storage);
+    expect(result.kind).toBe("repair");
+    expect(storage.values.has(STORAGE_KEY)).toBe(false);
+    expect(storage.values.get(V2_STORAGE_KEY)).toBe(values.get(V2_STORAGE_KEY));
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+  });
+
+  it.each([null, "valid-other", "invalid-other"] as const)("preserves %s other-writer bytes after failed verification", (kind) => {
+    const values = new Map([[V2_STORAGE_KEY, JSON.stringify({ version: 2, kind: "peer", invite: INVITE, label: "T4 private host AAAAAAAA" })]]);
+    const { storage, pending } = pendingTransaction(values);
+    const other = kind === null ? null : kind === "valid-other" ? JSON.stringify(canonicalDirectory()) : "{other-writer-invalid";
+    const originalGet = storage.getItem.bind(storage);
+    let v3Reads = 0;
+    storage.getItem = (key: string) => {
+      if (key === STORAGE_KEY && ++v3Reads >= 2) {
+        if (other === null) storage.values.delete(key); else storage.values.set(key, other);
+      }
+      return originalGet(key);
+    };
+    const result = commitPreparedMobileHostMigration(pending, storage);
+    expect(result.kind).toBe("repair");
+    expect(storage.values.get(STORAGE_KEY) ?? null).toBe(other);
+    expect(storage.values.get(V2_STORAGE_KEY)).toBe(values.get(V2_STORAGE_KEY));
+  });
+
+  it.each([V2_STORAGE_KEY, LEGACY_STORAGE_KEY])("returns ready after verified v3 when removing %s throws", (key) => {
+    const values = new Map([
+      [V2_STORAGE_KEY, JSON.stringify({ version: 2, kind: "peer", invite: INVITE, label: "T4 private host AAAAAAAA" })],
+      [LEGACY_STORAGE_KEY, JSON.stringify(tailnet("legacy"))],
+    ]);
+    const { storage, pending } = pendingTransaction(values);
+    storage.throwOnRemove.add(key);
+    expect(commitPreparedMobileHostMigration(pending, storage)).toEqual({ kind: "ready", directory: pending.directory });
+    expect(storage.values.get(STORAGE_KEY)).toBe(JSON.stringify(pending.directory));
+  });
+
+  it("refuses forged pending objects without reading or mutation", () => {
+    const storage = new TransactionStorage(new Map());
+    const forged = { kind: "pending", directory: parseMobileHostDirectory(canonicalDirectory()) } as const;
+    expect(commitPreparedMobileHostMigration(forged, storage).kind).toBe("repair");
+    expect(storage.operations).toEqual([]);
+  });
 });

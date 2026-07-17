@@ -48,6 +48,10 @@ export type PreparedMobileHostDirectoryLoad =
   | PendingMobileHostMigration
   | { readonly kind: "repair"; readonly message: string };
 
+export type CommittedMobileHostMigration =
+  | { readonly kind: "ready"; readonly directory: MobileHostDirectory }
+  | { readonly kind: "repair"; readonly message: string };
+
 interface PendingMobileHostMigrationSnapshot {
   readonly v2Raw: string | null;
   readonly legacyRaw: string | null;
@@ -277,6 +281,64 @@ export function prepareMobileHostDirectoryLoad(
   });
   pendingMobileHostMigrationSnapshots.set(pending, snapshot);
   return pending;
+}
+
+function commitRepair(): CommittedMobileHostMigration {
+  return Object.freeze({ kind: "repair", message: MIGRATION_REPAIR_MESSAGE });
+}
+
+/**
+ * Commits a preparation only while every source still has its observed bytes.
+ * The exact candidate is read back before its source generations are removed.
+ */
+export function commitPreparedMobileHostMigration(
+  pending: PendingMobileHostMigration,
+  storage: Pick<Storage, "getItem" | "setItem" | "removeItem">,
+): CommittedMobileHostMigration {
+  const snapshot = pendingMobileHostMigrationSnapshots.get(pending);
+  if (snapshot === undefined) return commitRepair();
+
+  try {
+    const currentV3 = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+    const currentV2 = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
+    const currentLegacy = storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
+    if (
+      currentV3 !== null ||
+      currentV2 !== snapshot.v2Raw ||
+      currentLegacy !== snapshot.legacyRaw
+    ) {
+      return commitRepair();
+    }
+  } catch {
+    return commitRepair();
+  }
+
+  let verified = false;
+  try {
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, snapshot.candidateRaw);
+    const written = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+    if (written === snapshot.candidateRaw) {
+      parseMobileHostDirectory(JSON.parse(written));
+      verified = true;
+    }
+  } catch {
+    verified = false;
+  }
+
+  if (!verified) {
+    try {
+      if (storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY) === snapshot.candidateRaw) {
+        storage.removeItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+      }
+    } catch {
+      // Preserve retryable source generations. Cleanup is strictly best effort.
+    }
+    return commitRepair();
+  }
+
+  try { storage.removeItem(MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
+  return Object.freeze({ kind: "ready", directory: snapshot.directory });
 }
 
 export function readMobileHostDirectory(

@@ -8,11 +8,18 @@ import {
   type StoredMobileConnection,
   type StoredPeerMobileBackend,
 } from "./mobile-connection-records.ts";
-import { MOBILE_HOST_DIRECTORY_STORAGE_KEY } from "./mobile-host-schema.ts";
 import {
+  MOBILE_HOST_DIRECTORY_STORAGE_KEY,
+  activeMobileHost,
+  type MobileHostDirectory,
+} from "./mobile-host-schema.ts";
+import {
+  commitPreparedMobileHostMigration,
   decodeStoredMobileBackend,
   decodeStoredMobileBackendDirectory,
   decodeStoredPeerMobileBackend,
+  prepareMobileHostDirectoryLoad,
+  type MobileHostMigrationIdKind,
   type StoredMobileBackendDirectory,
 } from "./mobile-host-storage.ts";
 
@@ -374,15 +381,14 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   const platform = nativeMobilePlatform();
   if (platform === null) return { kind: "web" };
   document.documentElement.dataset.platform = platform;
-  let shouldMigrateLegacyCredentials = false;
-  let backend: StoredMobileConnection | null;
-  let current: string | null;
-  let legacy: string | null;
-  let reserved: string | null;
+  const nextId = (kind: MobileHostMigrationIdKind): string => {
+    const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
+      `${Date.now().toString(36)}${Math.random().toString(36).slice(2).padEnd(16, "0")}`;
+    return `${kind}_${random}`.slice(0, 64);
+  };
+  let observedV3: string | null;
   try {
-    current = window.localStorage.getItem(MOBILE_BACKEND_STORAGE_KEY);
-    legacy = window.localStorage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
-    reserved = window.localStorage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+    observedV3 = window.localStorage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
   } catch {
     return {
       kind: "setup",
@@ -391,69 +397,108 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
       message: "T4 Code cannot read saved connection storage. Close and reopen the app, then check system storage settings.",
     };
   }
-  if (reserved !== null) {
-    return {
-      kind: "setup",
-      mode: "repair",
-      repairAction: "upgrade",
-      message: "A newer saved host directory is present but is not available in this build.",
-    };
-  }
-  if (current === null && legacy === null) return { kind: "setup", mode: "first-run" };
-
-  shouldMigrateLegacyCredentials = current === null && legacy !== null;
-  try {
-    backend = readStoredMobileConnection();
-    if (backend?.version === 1 && window.localStorage.getItem(MOBILE_BACKEND_STORAGE_KEY) === null) {
-      writeStoredMobileBackend(backend);
+  const prepared = prepareMobileHostDirectoryLoad(window.localStorage, nextId);
+  if (prepared.kind === "empty") return { kind: "setup", mode: "first-run" };
+  if (prepared.kind === "repair") {
+    if (observedV3 !== null) {
+      return {
+        kind: "setup",
+        mode: "repair",
+        repairAction: "upgrade",
+        message: "A newer saved host directory is present but is not available in this build.",
+      };
     }
-  } catch (error) {
-    const repairable = error instanceof StoredMobileStateError;
-    return {
-      kind: "setup",
-      mode: "repair",
-      repairAction: repairable ? "tailnet" : "unavailable",
-      message: repairable
-        ? "The saved connection cannot be opened. You can replace it with a verified Tailnet address."
-        : "T4 Code cannot update saved connection storage. Close and reopen the app, then check system storage settings.",
-    };
+    return mobileMigrationRepair("tailnet");
   }
-  if (backend === null) return { kind: "setup", mode: "first-run" };
 
-  if (backend.version === 2) {
-    delete window.__t4MobileBackend;
-    window.__t4MobilePeerInvite = backend.invite;
+  const directory = prepared.directory;
+  const backend = projectedStoredConnection(directory);
+  if (prepared.kind === "existing") {
+    applyProjectedNativeConnection(backend, null);
     return { kind: "ready", backend };
   }
 
   const plugin = secureStorage();
-  if (plugin === null) {
-    return {
-      kind: "setup",
-      mode: "repair",
-      repairAction: "unavailable",
-      message: "The Android security bridge did not start. Close T4 Code and open it again.",
-    };
-  }
-
   let credentials: { readonly deviceId: string; readonly deviceToken: string } | null = null;
-  try {
-    const result = await plugin.getCredentials({
-      hostKey: backend.origin,
-      migrateLegacy: shouldMigrateLegacyCredentials,
-    });
-    if (result.credentials !== null) {
-      const deviceId = result.credentials.deviceId;
-      if (deviceId.length === 0 || deviceId.length > 256) throw new Error("invalid device id");
-      credentials = {
-        deviceId,
-        deviceToken: validateDeviceToken(result.credentials.deviceToken, "deviceToken"),
-      };
+  if (prepared.legacyOrigin !== undefined) {
+    if (plugin === null) {
+      if (backend.version === 2) {
+        applyProjectedNativeConnection(backend, null);
+        return { kind: "ready", backend };
+      }
+      return mobileMigrationRepair("unavailable");
     }
-  } catch {
-    await plugin.clearCredentials({ hostKey: backend.origin }).catch(() => undefined);
+    try {
+      const result = await plugin.getCredentials({
+        hostKey: prepared.legacyOrigin,
+        migrateLegacy: true,
+      });
+      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
+    } catch {
+      applyProjectedNativeConnection(backend, null);
+      return { kind: "ready", backend };
+    }
+    if (backend.version === 2 || backend.origin !== prepared.legacyOrigin) credentials = null;
+  } else if (backend.version === 1) {
+    if (plugin === null) return mobileMigrationRepair("unavailable");
+    try {
+      const result = await plugin.getCredentials({ hostKey: backend.origin, migrateLegacy: false });
+      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
+    } catch {
+      await plugin.clearCredentials({ hostKey: backend.origin }).catch(() => undefined);
+    }
   }
 
+  const committed = commitPreparedMobileHostMigration(prepared, window.localStorage);
+  if (committed.kind === "repair") return mobileMigrationRepair("unavailable");
+  applyProjectedNativeConnection(backend, credentials);
+  return { kind: "ready", backend };
+}
+
+function mobileMigrationRepair(
+  repairAction: "tailnet" | "unavailable",
+): Extract<MobileBootResult, { readonly kind: "setup"; readonly mode: "repair" }> {
+  return {
+    kind: "setup",
+    mode: "repair",
+    repairAction,
+    message: repairAction === "tailnet"
+      ? "The saved connection cannot be opened. You can replace it with a verified Tailnet address."
+      : "T4 Code cannot update saved connection storage. Close and reopen the app, then check system storage settings.",
+  };
+}
+
+function projectedStoredConnection(directory: MobileHostDirectory): StoredMobileConnection {
+  const host = activeMobileHost(directory);
+  const preferredId = host.preferredTransportIds[0]!;
+  const transport = host.transports.find((item) => item.id === preferredId)!;
+  return transport.kind === "tailscale"
+    ? parseTailnetBackend(transport.origin)
+    : parsePeerBackend(transport.invite);
+}
+
+function validatedNativeCredentials(credentials: {
+  readonly deviceId: string;
+  readonly deviceToken: string;
+}): { readonly deviceId: string; readonly deviceToken: string } {
+  if (credentials.deviceId.length === 0 || credentials.deviceId.length > 256) {
+    throw new Error("invalid device id");
+  }
+  return {
+    deviceId: credentials.deviceId,
+    deviceToken: validateDeviceToken(credentials.deviceToken, "deviceToken"),
+  };
+}
+
+function applyProjectedNativeConnection(
+  backend: StoredMobileConnection,
+  credentials: { readonly deviceId: string; readonly deviceToken: string } | null,
+): void {
+  if (backend.version === 2) {
+    delete window.__t4MobileBackend;
+    window.__t4MobilePeerInvite = backend.invite;
+    return;
+  }
   window.__t4MobileBackend = {
     origin: backend.origin,
     wsUrl: backend.wsUrl,
@@ -461,7 +506,6 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
     ...(credentials === null ? {} : credentials),
   };
   delete window.__t4MobilePeerInvite;
-  return { kind: "ready", backend };
 }
 
 export async function persistNativeMobileCredentials(credentials: {
