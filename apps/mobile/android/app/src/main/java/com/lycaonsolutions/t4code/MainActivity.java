@@ -12,6 +12,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(T4SecureStoragePlugin.class);
         registerPlugin(T4PeerConnectionPlugin.class);
         registerPlugin(T4UpdatePlugin.class);
+        registerPlugin(T4QrScannerPlugin.class);
         super.onCreate(savedInstanceState);
     }
 

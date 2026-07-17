@@ -1,17 +1,22 @@
 import { BrandLockup, Button, Spinner } from "@t4-code/ui";
-import { Cable, LockKeyhole, Network, ScanLine } from "lucide-react";
+import { Cable, KeyRound, LockKeyhole, Network } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
 import {
-  nativeMobilePlatform,
-  parseTailnetBackend,
-  parsePeerBackend,
   probeMobileBackend,
-  scanPrivatePeerInvite,
-  writeStoredPeerBackend,
   replaceStoredMobileBackend,
-  type StoredMobileBackend,
+  writeFirstRunPeerBackend,
+  writeFirstRunTailnetBackend,
 } from "../platform/native-mobile.ts";
+import {
+  MobileConnectionUserError,
+  parseTailnetBackend,
+  type StoredMobileBackend,
+} from "../platform/mobile-connection-records.ts";
+import { buildPeerPairingCandidate } from "../platform/mobile-qr-scanner.ts";
+import { MobileQrScannerFlow } from "./MobileQrScannerFlow.tsx";
+
+export { MobileQrAttemptOwner, useMobileQrAttemptOwner } from "./MobileQrScannerFlow.tsx";
 
 /**
  * Shared Tailnet address form: parse, probe, then persist-and-reload. Used by
@@ -26,6 +31,13 @@ type MobileBackendProbe = (
   options: { readonly signal?: AbortSignal },
 ) => Promise<void>;
 
+/** Shared validation boundary used by the pasted-key submit path. */
+export function buildPastedPeerPairingCandidate(
+  value: string,
+): ReturnType<typeof buildPeerPairingCandidate> {
+  return buildPeerPairingCandidate(value);
+}
+
 /**
  * Probe before persistence, and re-check cancellation after the async boundary.
  * This keeps a closed or backed-out Add view from saving a late probe result.
@@ -35,10 +47,10 @@ export async function probeAndSaveMobileBackend(
   io: {
     readonly signal: AbortSignal;
     readonly probe?: MobileBackendProbe;
-    readonly save: (backend: StoredMobileBackend) => void;
+    readonly save: (backend: StoredMobileBackend) => boolean | void;
     readonly reload: () => void;
   },
-): Promise<"cancelled" | "saved"> {
+): Promise<"cancelled" | "refused" | "saved"> {
   const probe = io.probe ?? probeMobileBackend;
   try {
     await probe(backend, { signal: io.signal });
@@ -47,25 +59,32 @@ export async function probeAndSaveMobileBackend(
     throw error;
   }
   if (io.signal.aborted) return "cancelled";
-  io.save(backend);
+  if (io.save(backend) === false) return "refused";
   io.reload();
   return "saved";
 }
 
+export function safeTailnetFormMessage(error: unknown, phase: "validation" | "probe"): string {
+  if (error instanceof MobileConnectionUserError) return error.message;
+  return phase === "validation"
+    ? "Enter a valid HTTPS Tailnet address."
+    : "T4 Code could not verify that host. Check Tailscale and try again.";
+}
+
 export function TailnetAddressForm({
   cancelSignal,
-  initialMessage,
+  probe,
   save,
   submitLabel = "Connect",
 }: {
   readonly cancelSignal?: AbortSignal;
-  readonly initialMessage?: string;
-  readonly save: (backend: StoredMobileBackend) => void;
+  readonly probe?: MobileBackendProbe;
+  readonly save: (backend: StoredMobileBackend) => boolean | void;
   readonly submitLabel?: string;
 }) {
   const id = useId();
   const [address, setAddress] = useState("");
-  const [message, setMessage] = useState<string | null>(initialMessage ?? null);
+  const [message, setMessage] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const activeProbe = useRef<AbortController | null>(null);
   useEffect(
@@ -89,7 +108,7 @@ export function TailnetAddressForm({
         try {
           backend = parseTailnetBackend(address);
         } catch (error) {
-          setMessage(error instanceof Error ? error.message : "Enter a valid Tailnet address.");
+          setMessage(safeTailnetFormMessage(error, "validation"));
           return;
         }
         const controller = new AbortController();
@@ -100,12 +119,17 @@ export function TailnetAddressForm({
         setChecking(true);
         void probeAndSaveMobileBackend(backend, {
           signal: controller.signal,
+          ...(probe === undefined ? {} : { probe }),
           save,
           reload: () => window.location.reload(),
+        }).then((outcome) => {
+          if (outcome === "refused") {
+            setMessage("Another saved connection appeared. Nothing was replaced; reopen setup to continue.");
+          }
         })
           .catch((error: unknown) => {
             if (controller.signal.aborted) return;
-            setMessage(error instanceof Error ? error.message : "T4 Code could not reach that host.");
+            setMessage(safeTailnetFormMessage(error, "probe"));
           })
           .finally(() => {
             cancelSignal?.removeEventListener("abort", cancel);
@@ -153,31 +177,22 @@ export function TailnetAddressForm({
   );
 }
 
-export function MobileConnectionScreen({ startupMessage }: { readonly startupMessage?: string }) {
-  const [address, setAddress] = useState("");
-  const [message, setMessage] = useState<string | null>(startupMessage ?? null);
-  const [checking, setChecking] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const canScan = nativeMobilePlatform() !== null;
+export function MobileConnectionScreen({
+  mode,
+  repairAction,
+  startupMessage,
+}: {
+  readonly mode: "first-run" | "repair";
+  readonly repairAction?: "tailnet" | "upgrade" | "unavailable";
+  readonly startupMessage?: string;
+}) {
+  const [showPrivatePairing, setShowPrivatePairing] = useState(mode === "first-run");
+  const [showTailnet, setShowTailnet] = useState(mode === "repair" && repairAction === "tailnet");
 
-  const savePrivateInvite = (backend: ReturnType<typeof parsePeerBackend>): void => {
-    writeStoredPeerBackend(backend);
-    window.location.reload();
-  };
-
-  const scanCode = async (): Promise<void> => {
-    if (checking || scanning) return;
-    setScanning(true);
-    setMessage(null);
-    try {
-      const backend = await scanPrivatePeerInvite();
-      setAddress(backend.invite);
-      savePrivateInvite(backend);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Couldn’t open the QR scanner.");
-    } finally {
-      setScanning(false);
-    }
+  const savePrivateInvite = (backend: ReturnType<typeof buildPeerPairingCandidate>): boolean => {
+    const saved = writeFirstRunPeerBackend(backend);
+    if (saved) window.location.reload();
+    return saved;
   };
 
   return (
@@ -189,83 +204,45 @@ export function MobileConnectionScreen({ startupMessage }: { readonly startupMes
         <div className="mb-8 flex size-11 items-center justify-center rounded-lg bg-primary text-primary-foreground">
           <Cable aria-hidden="true" className="size-5" />
         </div>
-        <h1 className="text-balance font-heading font-semibold text-2xl">Connect to your T4 host</h1>
+        <h1 className="text-balance font-heading font-semibold text-2xl">
+          {mode === "first-run" ? "Connect to your T4 host" : "Repair your saved connection"}
+        </h1>
         <p className="mt-2 max-w-[62ch] text-pretty text-muted-foreground text-sm leading-relaxed">
-          Scan the key from your desktop to connect directly. OMP and your projects stay on your computer.
+          {mode === "first-run"
+            ? "Scan the key from your desktop to connect directly. OMP and your projects stay on your computer."
+            : "T4 Code found saved connection data it cannot safely open. Existing bytes will not be replaced by QR or pasted-key setup."}
         </p>
 
-        <form
-          className="mt-8 flex flex-col gap-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (checking || scanning) return;
-            setMessage(null);
-            const privateInvite = address.trim().startsWith("t4peer://");
-            try {
-              if (privateInvite) {
-                const backend = parsePeerBackend(address);
-                setChecking(true);
-                savePrivateInvite(backend);
-                return;
-              }
-              const backend = parseTailnetBackend(address);
-              setChecking(true);
-              void probeMobileBackend(backend)
-                .then(() => {
-                  replaceStoredMobileBackend(backend);
-                  window.location.reload();
-                })
-                .catch((error: unknown) => {
-                  setMessage(error instanceof Error ? error.message : "T4 Code could not reach that host.");
-                  setChecking(false);
-                });
-            } catch (error) {
-              setMessage(error instanceof Error ? error.message : "Enter a valid Tailnet address.");
-              return;
-            }
-          }}
-        >
-          <label className="font-medium text-sm" htmlFor="mobile-tailnet-address">
-            Private connection key
-          </label>
-          <input
-            aria-describedby="mobile-tailnet-help mobile-tailnet-status"
-            aria-invalid={message !== null}
-            autoCapitalize="none"
-            autoComplete="url"
-            autoCorrect="off"
-            className="h-12 w-full rounded-lg border border-input bg-background px-3 font-mono text-base outline-none transition-shadow duration-(--motion-duration-fast) placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            disabled={checking || scanning}
-            id="mobile-tailnet-address"
-            inputMode="url"
-            onChange={(event) => setAddress(event.target.value)}
-            placeholder="t4peer://v1/…"
-            spellCheck={false}
-            type="url"
-            value={address}
-          />
-          <p className="text-muted-foreground text-xs leading-relaxed" id="mobile-tailnet-help">
-            Scan the QR code first, or paste the private key shown by T4 Code on your desktop.
-          </p>
-          <p
-            aria-live="polite"
-            className="min-h-5 text-destructive-foreground text-sm"
-            id="mobile-tailnet-status"
-            role={message === null ? undefined : "alert"}
-          >
-            {message}
-          </p>
-          {canScan && (
-            <Button className="h-12 w-full text-base" disabled={checking || scanning} onClick={() => void scanCode()} size="lg" type="button" variant="outline">
-              {scanning && <Spinner />}
-              <ScanLine /> {scanning ? "Opening scanner…" : "Scan QR code"}
-            </Button>
-          )}
-          <Button className="mt-1 h-12 w-full text-base" disabled={checking || scanning} size="lg" type="submit">
-            {checking && <Spinner />}
-            {checking ? "Connecting…" : "Connect"}
+        {startupMessage !== undefined && (
+          <p className="mt-5 rounded-lg border border-border p-3 text-destructive-foreground text-sm" role="alert">{startupMessage}</p>
+        )}
+
+        {mode === "first-run" && showPrivatePairing && (
+          <div className="mt-8 overflow-hidden rounded-2xl border border-border">
+            <MobileQrScannerFlow onDismiss={() => setShowPrivatePairing(false)} save={savePrivateInvite} />
+          </div>
+        )}
+
+        {mode === "first-run" && !showPrivatePairing && !showTailnet && (
+          <Button autoFocus className="mt-8 h-12 w-full text-base" onClick={() => setShowPrivatePairing(true)} size="lg" type="button">
+            <KeyRound aria-hidden="true" /> Scan or paste private key
           </Button>
-        </form>
+        )}
+
+        {showTailnet && (
+          <div className="mt-8 rounded-xl border border-border p-4">
+            <TailnetAddressForm
+              save={mode === "first-run" ? writeFirstRunTailnetBackend : replaceStoredMobileBackend}
+              submitLabel={mode === "repair" ? "Repair with Tailnet" : "Use Tailscale address"}
+            />
+          </div>
+        )}
+
+        {mode === "first-run" && !showTailnet && !showPrivatePairing && (
+          <Button className="mt-4 h-12 w-full text-base" onClick={() => { setShowPrivatePairing(false); setShowTailnet(true); }} size="lg" type="button" variant="outline">
+            <Network aria-hidden="true" /> Use Tailscale address
+          </Button>
+        )}
 
         <div className="mt-9 divide-y divide-border border-border border-y">
           <div className="flex gap-3 py-3.5">

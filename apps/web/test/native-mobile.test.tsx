@@ -4,14 +4,13 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { MobileConnectionScreen } from "../src/components/MobileConnectionScreen.tsx";
 import {
   MOBILE_BACKEND_STORAGE_KEY,
-  parsePeerBackend,
-  parseTailnetBackend,
+  MOBILE_HOST_DIRECTORY_STORAGE_KEY,
+  nativeQrScanner,
   persistNativeMobileCredentials,
   prepareNativeMobileBackend,
   probeMobileBackend,
   readStoredMobileBackend,
   readStoredMobileConnection,
-  scanPrivatePeerInvite,
   readStoredMobileBackendDirectory,
   replaceStoredMobileBackend,
   removeNativeMobileBackend,
@@ -19,7 +18,14 @@ import {
   type StoredMobileBackendDirectory,
   writeStoredMobileBackend,
   writeStoredPeerBackend,
+  writeFirstRunPeerBackend,
+  writeFirstRunTailnetBackend,
 } from "../src/platform/native-mobile.ts";
+import {
+  parsePeerBackend,
+  parseTailnetBackend,
+} from "../src/platform/mobile-connection-records.ts";
+import { MOBILE_HOST_DIRECTORY_STORAGE_KEY as SCHEMA_MOBILE_HOST_DIRECTORY_STORAGE_KEY } from "../src/platform/mobile-host-schema.ts";
 
 const originalDocument = globalThis.document;
 const originalWindow = globalThis.window;
@@ -31,12 +37,162 @@ class MemoryStorage {
   removeItem(key: string): void { this.values.delete(key); }
 }
 
+const TEST_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const TEST_PEER = parsePeerBackend(`t4peer://v1/${TEST_KEY}/${TEST_KEY}`);
+const TEST_TAILNET = parseTailnetBackend("https://guard.tailnet.ts.net:8445");
+const TEST_TAILNET_DIRECTORY = {
+  version: 2,
+  activeOrigin: TEST_TAILNET.origin,
+  backends: [TEST_TAILNET],
+};
+
 afterEach(() => {
   Object.defineProperty(globalThis, "document", { configurable: true, value: originalDocument });
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
 });
 
 describe("native mobile connection", () => {
+  it("re-exports the schema-owned v3 storage key for compatibility", () => {
+    expect(MOBILE_HOST_DIRECTORY_STORAGE_KEY).toBe(SCHEMA_MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+  });
+
+  it("writes a first-run peer only when every mobile connection key is absent", () => {
+    const storage = new MemoryStorage();
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const peer = parsePeerBackend(`t4peer://v1/${key}/${key}`);
+
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(true);
+    expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(JSON.stringify(peer));
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(false);
+  });
+
+  it("writes a canonical first-run Tailnet directory once and refuses every occupied key", () => {
+    const candidate = parseTailnetBackend("https://first.tailnet.ts.net:8445");
+    const clean = new MemoryStorage();
+    expect(writeFirstRunTailnetBackend(candidate, clean)).toBe(true);
+    expect(JSON.parse(clean.getItem(MOBILE_BACKEND_STORAGE_KEY) ?? "null")).toEqual({
+      version: 2,
+      activeOrigin: candidate.origin,
+      backends: [candidate],
+    });
+    expect(writeFirstRunTailnetBackend(candidate, clean)).toBe(false);
+
+    for (const occupiedKey of [
+      "t4-code:mobile-backend:v1",
+      MOBILE_BACKEND_STORAGE_KEY,
+      MOBILE_HOST_DIRECTORY_STORAGE_KEY,
+    ]) {
+      const storage = new MemoryStorage();
+      storage.setItem(occupiedKey, "exact opaque bytes");
+      expect(writeFirstRunTailnetBackend(candidate, storage)).toBe(false);
+      expect(storage.getItem(occupiedKey)).toBe("exact opaque bytes");
+      expect([...storage.values.keys()]).toEqual([occupiedKey]);
+    }
+  });
+
+  it("refuses invalid first-run Tailnet candidates and storage read failures without writing", () => {
+    const candidate = parseTailnetBackend("https://first.tailnet.ts.net:8445");
+    const storage = new MemoryStorage();
+    expect(writeFirstRunTailnetBackend({ ...candidate, label: "untrusted" }, storage)).toBe(false);
+    expect(storage.values.size).toBe(0);
+
+    const unreadable = {
+      getItem: () => { throw new Error("private storage failure"); },
+      setItem: () => { throw new Error("must not write"); },
+    };
+    expect(writeFirstRunTailnetBackend(candidate, unreadable)).toBe(false);
+  });
+
+  it.each([
+    ["legacy v1", "t4-code:mobile-backend:v1", JSON.stringify(TEST_TAILNET)],
+    ["peer v2", MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(TEST_PEER)],
+    ["Tailnet v2", MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(TEST_TAILNET_DIRECTORY)],
+    ["corrupt v2 bytes", MOBILE_BACKEND_STORAGE_KEY, "{not-json"],
+    ["reserved v3", MOBILE_HOST_DIRECTORY_STORAGE_KEY, "v3 bytes"],
+  ])("refuses first-run persistence when %s exists and preserves exact bytes", (_label, keyName, bytes) => {
+    const storage = new MemoryStorage();
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const peer = parsePeerBackend(`t4peer://v1/${key}/${key}`);
+    storage.setItem(keyName, bytes);
+
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(false);
+    expect(storage.getItem(keyName)).toBe(bytes);
+    expect([...storage.values.keys()]).toEqual([keyName]);
+  });
+
+  it("refuses first-run persistence after any storage read failure", () => {
+    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const peer = parsePeerBackend(`t4peer://v1/${key}/${key}`);
+    const values = new Map([["t4-code:mobile-backend:v1", "untouched"]]);
+    const storage = {
+      getItem: () => { throw new Error("storage unavailable"); },
+      setItem: (name: string, value: string) => { values.set(name, value); },
+      removeItem: (name: string) => { values.delete(name); },
+    };
+
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(false);
+    expect(values).toEqual(new Map([["t4-code:mobile-backend:v1", "untouched"]]));
+  });
+
+  it("classifies only an entirely clean native store as first run", async () => {
+    const storage = new MemoryStorage();
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { documentElement: { dataset: {} } },
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: storage,
+        Capacitor: { isNativePlatform: () => true, getPlatform: () => "android" },
+      },
+    });
+
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "setup", mode: "first-run" });
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, "opaque-v3");
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({
+      kind: "setup",
+      mode: "repair",
+      repairAction: "upgrade",
+      message: "A newer saved host directory is present but is not available in this build.",
+    });
+  });
+
+  it("classifies corrupt existing bytes as controlled Tailnet repair without leaking bytes", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, "{secret-/private/path");
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { documentElement: { dataset: {} } },
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: storage,
+        Capacitor: { isNativePlatform: () => true, getPlatform: () => "android" },
+      },
+    });
+
+    const result = await prepareNativeMobileBackend();
+    expect(result).toEqual({
+      kind: "setup",
+      mode: "repair",
+      repairAction: "tailnet",
+      message: "The saved connection cannot be opened. You can replace it with a verified Tailnet address.",
+    });
+    expect(JSON.stringify(result)).not.toContain("secret-/private/path");
+  });
+
+  it("obtains only the app-registered T4 QR scanner plugin", () => {
+    const plugin = { marker: "registered" };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: { Capacitor: { Plugins: { T4QrScanner: plugin } } },
+    });
+
+    expect(nativeQrScanner()).toBe(plugin);
+  });
+
   it("normalizes a full Tailnet HTTPS origin and rejects unsafe addresses", () => {
     expect(parseTailnetBackend("lycaon-bunker.tail9f9e1a.ts.net:8445")).toEqual({
       version: 1,
@@ -98,23 +254,6 @@ describe("native mobile connection", () => {
 
     expect(readStoredMobileConnection(storage)).toEqual(backend);
     expect(() => readStoredMobileBackend(storage)).toThrow(/private/u);
-  });
-
-  it("accepts only a private T4 key from the native QR scanner", async () => {
-    const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let listener: ((event: { readonly barcodes: readonly { readonly rawValue?: string }[] }) => void) | undefined;
-    const scanner = {
-      isSupported: () => Promise.resolve({ supported: true }),
-      addListener: async (_event: "barcodesScanned", callback: (event: { readonly barcodes: readonly { readonly rawValue?: string }[] }) => void) => {
-        listener = callback;
-        return { remove: () => undefined };
-      },
-      startScan: async () => { listener?.({ barcodes: [{ rawValue: `t4peer://v1/${key}/${key}` }] }); },
-      stopScan: async () => {},
-    };
-    await expect(scanPrivatePeerInvite(scanner)).resolves.toEqual(
-      parsePeerBackend(`t4peer://v1/${key}/${key}`),
-    );
   });
 
   it("loads only the active host credential from the keyed native bridge", async () => {
@@ -232,7 +371,9 @@ describe("native mobile connection", () => {
 
     await expect(prepareNativeMobileBackend()).resolves.toEqual({
       kind: "setup",
-      message: "Host storage is unavailable.",
+      mode: "repair",
+      repairAction: "unavailable",
+      message: "T4 Code cannot read saved connection storage. Close and reopen the app, then check system storage settings.",
     });
   });
 
@@ -440,10 +581,37 @@ describe("native mobile connection", () => {
   });
 
   it("renders focused first-run instructions instead of fixture sessions", () => {
-    const markup = renderToStaticMarkup(<MobileConnectionScreen />);
+    const markup = renderToStaticMarkup(<MobileConnectionScreen mode="first-run" />);
     expect(markup).toContain("Connect to your T4 host");
+    expect(markup).toContain("Checking camera");
+    expect(markup).toContain("Paste private key");
+    expect(markup).not.toContain("Use Tailscale address");
     expect(markup).toContain("Open Tailscale on this phone");
     expect(markup).toContain("h-12 w-full");
     expect(markup).not.toContain("Sample data");
+  });
+
+  it("keeps private-key persistence actions out of repair mode", () => {
+    const markup = renderToStaticMarkup(
+      <MobileConnectionScreen mode="repair" repairAction="tailnet" startupMessage="Saved state needs attention." />,
+    );
+    expect(markup).toContain("Repair your saved connection");
+    expect(markup).toContain("Repair with Tailnet");
+    expect(markup).not.toContain("Scan QR code");
+    expect(markup).not.toContain("Paste private key");
+    expect(markup.match(/Saved state needs attention\./gu)).toHaveLength(1);
+    expect(markup).not.toContain('aria-invalid="true"');
+  });
+
+  it.each(["upgrade", "unavailable"] as const)("renders bounded %s repair without destructive address actions", (repairAction) => {
+    const message = repairAction === "upgrade"
+      ? "A newer saved host directory is present but is not available in this build."
+      : "T4 Code cannot read saved connection storage. Close and reopen the app, then check system storage settings.";
+    const markup = renderToStaticMarkup(
+      <MobileConnectionScreen mode="repair" repairAction={repairAction} startupMessage={message} />,
+    );
+    expect(markup).toContain(message);
+    expect(markup).not.toContain("Repair with Tailnet");
+    expect(markup).not.toContain(">Tailnet address</label>");
   });
 });
