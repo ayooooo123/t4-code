@@ -4,6 +4,7 @@ import { useEffect, useId, useRef, useState } from "react";
 
 import {
   probeMobileBackend,
+  replaceBrokenMobileConnectionWithPeer,
   replaceStoredMobileBackend,
   writeFirstRunPeerBackend,
   writeFirstRunTailnetBackend,
@@ -190,7 +191,9 @@ export function MobileConnectionScreen({
   const [showTailnet, setShowTailnet] = useState(mode === "repair" && repairAction === "tailnet");
 
   const savePrivateInvite = (backend: ReturnType<typeof buildPeerPairingCandidate>): boolean => {
-    const saved = writeFirstRunPeerBackend(backend);
+    const saved = mode === "first-run"
+      ? writeFirstRunPeerBackend(backend)
+      : replaceBrokenMobileConnectionWithPeer(backend);
     if (saved) window.location.reload();
     return saved;
   };
@@ -210,17 +213,35 @@ export function MobileConnectionScreen({
         <p className="mt-2 max-w-[62ch] text-pretty text-muted-foreground text-sm leading-relaxed">
           {mode === "first-run"
             ? "Scan the key from your desktop to connect directly. OMP and your projects stay on your computer."
-            : "T4 Code found saved connection data it cannot safely open. Existing bytes will not be replaced by QR or pasted-key setup."}
+            : "T4 Code found saved connection data it cannot safely open. Confirming a new key replaces the unreadable saved connection metadata."}
         </p>
 
         {startupMessage !== undefined && (
           <p className="mt-5 rounded-lg border border-border p-3 text-destructive-foreground text-sm" role="alert">{startupMessage}</p>
         )}
 
-        {mode === "first-run" && showPrivatePairing && (
+        {showPrivatePairing && (
           <div className="mt-8 overflow-hidden rounded-2xl border border-border">
-            <MobileQrScannerFlow onDismiss={() => setShowPrivatePairing(false)} save={savePrivateInvite} />
+            <MobileQrScannerFlow
+              onDismiss={() => {
+                setShowPrivatePairing(false);
+                if (mode === "repair" && repairAction === "tailnet") setShowTailnet(true);
+              }}
+              save={savePrivateInvite}
+            />
           </div>
+        )}
+
+        {mode === "repair" && !showPrivatePairing && (
+          <Button
+            autoFocus
+            className="mt-8 h-12 w-full text-base"
+            onClick={() => { setShowTailnet(false); setShowPrivatePairing(true); }}
+            size="lg"
+            type="button"
+          >
+            <KeyRound aria-hidden="true" /> Scan or paste replacement key
+          </Button>
         )}
 
         {mode === "first-run" && !showPrivatePairing && !showTailnet && (

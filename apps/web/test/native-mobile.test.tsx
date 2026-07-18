@@ -12,6 +12,7 @@ import {
   readStoredMobileBackend,
   readStoredMobileConnection,
   readStoredMobileBackendDirectory,
+  replaceBrokenMobileConnectionWithPeer,
   replaceStoredMobileBackend,
   removeNativeMobileBackend,
   selectStoredMobileBackend,
@@ -180,6 +181,30 @@ describe("native mobile connection", () => {
 
     expect(writeFirstRunPeerBackend(peer, storage)).toBe(false);
     expect(values).toEqual(new Map([["t4-code:mobile-backend:v1", "untouched"]]));
+  });
+
+  it("explicitly replaces unreadable saved metadata with a canonical peer directory", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, "{damaged-v3");
+    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, "older opaque bytes");
+
+    expect(replaceBrokenMobileConnectionWithPeer(TEST_PEER, storage)).toBe(true);
+    expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBeNull();
+    installNativeWindow(storage);
+    await expect(prepareNativeMobileBackend()).resolves.toMatchObject({
+      kind: "ready",
+      connection: { kind: "hyperdht", invite: TEST_PEER.invite },
+    });
+  });
+
+  it("never replaces a valid saved directory through the repair boundary", () => {
+    const storage = new MemoryStorage();
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, "{damaged-v3");
+    expect(replaceBrokenMobileConnectionWithPeer(TEST_PEER, storage)).toBe(true);
+    const validDirectory = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+
+    expect(replaceBrokenMobileConnectionWithPeer(TEST_PEER, storage)).toBe(false);
+    expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(validDirectory);
   });
 
   it("classifies only an entirely clean native store as first run", async () => {
@@ -1097,14 +1122,14 @@ describe("native mobile connection", () => {
     expect(markup).not.toContain("Sample data");
   });
 
-  it("keeps private-key persistence actions out of repair mode", () => {
+  it("offers explicit private-key replacement in repair mode", () => {
     const markup = renderToStaticMarkup(
       <MobileConnectionScreen mode="repair" repairAction="tailnet" startupMessage="Saved state needs attention." />,
     );
     expect(markup).toContain("Repair your saved connection");
     expect(markup).toContain("Repair with Tailnet");
-    expect(markup).not.toContain("Scan QR code");
-    expect(markup).not.toContain("Paste private key");
+    expect(markup).toContain("Scan or paste replacement key");
+    expect(markup).toContain("replaces the unreadable saved connection metadata");
     expect(markup.match(/Saved state needs attention\./gu)).toHaveLength(1);
     expect(markup).not.toContain('aria-invalid="true"');
   });
@@ -1119,5 +1144,6 @@ describe("native mobile connection", () => {
     expect(markup).toContain(message);
     expect(markup).not.toContain("Repair with Tailnet");
     expect(markup).not.toContain(">Tailnet address</label>");
+    expect(markup).toContain("Scan or paste replacement key");
   });
 });

@@ -4,6 +4,7 @@ import {
   MobileConnectionUserError,
   parsePeerBackend,
   parseTailnetBackend,
+  peerDesktopFingerprint,
   type StoredMobileBackend,
   type StoredMobileConnection,
   type StoredPeerMobileBackend,
@@ -11,6 +12,7 @@ import {
 import {
   MOBILE_HOST_DIRECTORY_STORAGE_KEY,
   activeMobileHost,
+  parseMobileHostDirectory,
   type MobileHost,
   type MobileHostDirectory,
 } from "./mobile-host-schema.ts";
@@ -366,6 +368,88 @@ export function writeFirstRunPeerBackend(
   } catch {
     return false;
   }
+}
+
+/**
+ * Explicit repair boundary for a QR/pasted private key.
+ *
+ * A valid directory is never replaced here. Unreadable generations are
+ * snapshotted, checked again immediately before the write, and retained until
+ * the canonical v3 replacement has been read back successfully.
+ */
+export function replaceBrokenMobileConnectionWithPeer(
+  candidate: StoredPeerMobileBackend,
+  storage: MutableMobileStorage = window.localStorage,
+): boolean {
+  let canonical: StoredPeerMobileBackend;
+  try {
+    canonical = parsePeerBackend(candidate.invite);
+    if (canonical.label !== candidate.label) return false;
+  } catch {
+    return false;
+  }
+
+  const nextId = (kind: MobileHostMigrationIdKind): string => {
+    const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
+      `${Date.now().toString(36)}${Math.random().toString(36).slice(2).padEnd(16, "0")}`;
+    return `${kind}_${random}`.slice(0, 64);
+  };
+  let originalV3: string | null;
+  let originalV2: string | null;
+  let originalLegacy: string | null;
+  try {
+    originalV3 = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+    originalV2 = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
+    originalLegacy = storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
+    if (prepareMobileHostDirectoryLoad(storage, nextId).kind !== "repair") return false;
+    if (
+      storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY) !== originalV3 ||
+      storage.getItem(MOBILE_BACKEND_STORAGE_KEY) !== originalV2 ||
+      storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY) !== originalLegacy
+    ) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  const hostId = nextId("host");
+  const transportId = nextId("hyperdht");
+  const directory = parseMobileHostDirectory({
+    version: 3,
+    activeHostId: hostId,
+    hosts: [{
+      id: hostId,
+      label: canonical.label,
+      transports: [{
+        id: transportId,
+        kind: "hyperdht",
+        invite: canonical.invite,
+        desktopFingerprint: peerDesktopFingerprint(canonical.invite),
+      }],
+      preferredTransportIds: [transportId],
+      lastConnection: null,
+    }],
+  });
+  const replacement = JSON.stringify(directory);
+  try {
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, replacement);
+    const written = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+    if (written !== replacement) throw new Error("saved repair did not verify");
+    parseMobileHostDirectory(JSON.parse(written));
+  } catch {
+    try {
+      if (originalV3 === null) storage.removeItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
+      else storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, originalV3);
+    } catch {
+      // Restoration is best effort when the platform storage itself is broken.
+    }
+    return false;
+  }
+
+  try { storage.removeItem(MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
+  return true;
 }
 
 /** Guarded first-run equivalent for a verified Tailnet backend. */
