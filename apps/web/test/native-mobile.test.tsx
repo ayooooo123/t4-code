@@ -423,6 +423,34 @@ describe("native mobile connection", () => {
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
   });
 
+  it.each(["rejection", "invalid"] as const)(
+    "boots pending HyperDHT after secure plugin %s while preserving exact source bytes and never clearing",
+    async (failure) => {
+      const storage = new MemoryStorage();
+      const legacy = parseTailnetBackend("https://legacy.tailnet.ts.net:8445");
+      const v2Raw = JSON.stringify(TEST_PEER);
+      const legacyRaw = JSON.stringify(legacy);
+      storage.setItem(MOBILE_BACKEND_STORAGE_KEY, v2Raw);
+      storage.setItem("t4-code:mobile-backend:v1", legacyRaw);
+      let clears = 0;
+      installNativeWindow(storage, {
+        getCredentials: () => failure === "rejection"
+          ? Promise.reject(new Error("private plugin failure"))
+          : Promise.resolve({ credentials: { deviceId: "", deviceToken: "invalid" } }),
+        setCredentials: () => Promise.resolve(),
+        clearCredentials: () => { clears += 1; return Promise.resolve(); },
+      });
+
+      await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: TEST_PEER });
+      expect(window.__t4MobileBackend).toBeUndefined();
+      expect(window.__t4MobilePeerInvite).toBe(TEST_PEER.invite);
+      expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
+      expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
+      expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
+      expect(clears).toBe(0);
+    },
+  );
+
   it("migrates peer-active legacy credentials at the legacy scope and discards them from the peer projection", async () => {
     const storage = new MemoryStorage();
     const legacy = parseTailnetBackend("https://legacy.tailnet.ts.net:8445");
