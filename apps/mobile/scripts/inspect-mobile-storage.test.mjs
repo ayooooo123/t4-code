@@ -4,15 +4,87 @@ import test from "node:test";
 
 import {
   APPROVED_MOBILE_STORAGE_KEY,
+  LEGACY_MOBILE_STORAGE_KEY,
   evaluateCdp,
   inspectMobileStorage,
   parseStorageInspectorArguments,
   summarizeStoredConnection,
 } from "./inspect-mobile-storage.mjs";
 
-const invite = "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const PUBLIC_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const invite = `t4peer://v1/${PUBLIC_KEY}/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA`;
+const HOST_ID = "host_AAAAAAAAAAA";
+const TAILSCALE_ID = "tail_AAAAAAAAAAA";
+const HYPERDHT_ID = "peer_AAAAAAAAAAA";
 
-test("summarizes peer storage without returning values", () => {
+function validV3() {
+  return {
+    version: 3,
+    activeHostId: HOST_ID,
+    hosts: [{
+      id: HOST_ID,
+      label: "Private desktop label",
+      transports: [
+        {
+          id: TAILSCALE_ID,
+          kind: "tailscale",
+          origin: "https://desk.tailnet.ts.net:8445",
+          wsUrl: "wss://desk.tailnet.ts.net:8445/v1/ws",
+          displayAddress: "https://desk.tailnet.ts.net:8445",
+          credentialScopeKey: "https://desk.tailnet.ts.net:8445",
+        },
+        { id: HYPERDHT_ID, kind: "hyperdht", invite, desktopFingerprint: "AAAAAAAA" },
+      ],
+      preferredTransportIds: [HYPERDHT_ID, TAILSCALE_ID],
+      lastConnection: { kind: "hyperdht", at: 42, outcome: "connected" },
+    }],
+  };
+}
+
+test("summarizes a valid v3 directory with the exact bounded shape", () => {
+  const summary = summarizeStoredConnection(JSON.stringify(validV3()));
+  assert.deepEqual(summary, {
+    present: true,
+    version: 3,
+    activeHost: true,
+    hostCount: 1,
+    transportKinds: ["hyperdht", "tailscale"],
+  });
+  const output = JSON.stringify(summary);
+  for (const forbidden of [HOST_ID, TAILSCALE_ID, HYPERDHT_ID, invite, PUBLIC_KEY, "desk.tailnet", "Private desktop label", "AAAAAAAA"]) {
+    assert.equal(output.includes(forbidden), false);
+  }
+});
+
+test("summarizes v3 absence with the exact bounded field set", () => {
+  assert.deepEqual(summarizeStoredConnection(null), {
+    present: false,
+    version: null,
+    activeHost: false,
+    hostCount: 0,
+    transportKinds: [],
+  });
+});
+
+test("rejects an invalid v3 active-host reference", () => {
+  assert.throws(
+    () => summarizeStoredConnection(JSON.stringify({ ...validV3(), activeHostId: "host_BBBBBBBBBBB" })),
+    /mobile storage inspection failed/,
+  );
+});
+
+for (const mutate of [
+  (value) => ({ ...value, credential: "private" }),
+  (value) => ({ ...value, hosts: [{ ...value.hosts[0], extra: true }] }),
+  (value) => ({ ...value, hosts: [{ ...value.hosts[0], transports: [{ ...value.hosts[0].transports[0], secret: true }] }] }),
+  (value) => ({ ...value, hosts: [{ ...value.hosts[0], preferredTransportIds: [TAILSCALE_ID] }] }),
+]) {
+  test("rejects forbidden or inconsistent v3 shapes without echoing bytes", () => {
+    assert.throws(() => summarizeStoredConnection(JSON.stringify(mutate(validV3()))), /mobile storage inspection failed/);
+  });
+}
+
+test("retains bounded v2 peer compatibility without returning values", () => {
   const summary = summarizeStoredConnection(JSON.stringify({ version: 2, kind: "peer", invite, label: "private label" }));
   assert.deepEqual(summary, {
     present: true,
@@ -22,16 +94,6 @@ test("summarizes peer storage without returning values", () => {
     inviteLength: invite.length,
   });
   assert.doesNotMatch(JSON.stringify(summary), /t4peer|private label/);
-});
-
-test("summarizes absence with the same bounded field set", () => {
-  assert.deepEqual(summarizeStoredConnection(null), {
-    present: false,
-    version: null,
-    kind: null,
-    fieldNames: [],
-    inviteLength: null,
-  });
 });
 
 for (const raw of ["{", "[]", JSON.stringify({ version: 99 }), JSON.stringify({ version: 2, kind: "peer", invite: 3, label: "x" })]) {
@@ -130,14 +192,15 @@ test("attempts allocated-forward cleanup and normalizes a cleanup throw", async 
   assert.doesNotMatch(error.message, /private|secret/);
 });
 
-test("rejects every storage key except the production v2 key", async () => {
+test("accepts only production v3 and legacy v2 storage keys", async () => {
   await assert.rejects(
-    () => inspectMobileStorage({ key: "t4-code:mobile-hosts:v3", runAdb: async () => { throw new Error("must not run"); } }),
+    () => inspectMobileStorage({ key: "other", runAdb: async () => { throw new Error("must not run"); } }),
     /mobile storage inspection failed/,
   );
+  assert.equal(LEGACY_MOBILE_STORAGE_KEY, "t4-code:mobile-backends:v2");
 });
 
-test("accepts only the bounded Task 7 emulator CLI arguments", () => {
+test("accepts only bounded production storage inspector CLI arguments", () => {
   assert.deepEqual(parseStorageInspectorArguments([
     "--serial", "emulator-5554",
     "--package", "com.lycaonsolutions.t4code",
@@ -153,6 +216,25 @@ test("accepts only the bounded Task 7 emulator CLI arguments", () => {
     ["--key", "other"],
     ["--unknown", "value"],
   ]) assert.throws(() => parseStorageInspectorArguments(args), /mobile storage inspection failed/);
+});
+
+test("uses the explicitly approved legacy v2 key for compatibility inspection", async () => {
+  const evaluations = [];
+  const summary = await inspectMobileStorage({
+    key: LEGACY_MOBILE_STORAGE_KEY,
+    runAdb: async (args) => {
+      if (args[0] === "shell") return { status: 0, stdout: "4321", stderr: "", truncated: false };
+      if (args[1] === "tcp:0") return { status: 0, stdout: "59321", stderr: "", truncated: false };
+      return { status: 0, stdout: "", stderr: "", truncated: false };
+    },
+    fetchTargets: async () => JSON.stringify([{ type: "page", webSocketDebuggerUrl: "ws://127.0.0.1:59321/devtools/page/1" }]),
+    evaluate: async (_url, expression) => {
+      evaluations.push(expression);
+      return JSON.stringify({ id: 1, result: { result: { type: "string", value: JSON.stringify({ version: 2, kind: "peer", invite, label: "hidden" }) } } });
+    },
+  });
+  assert.equal(summary.version, 2);
+  assert.deepEqual(evaluations, [`localStorage.getItem(${JSON.stringify(LEGACY_MOBILE_STORAGE_KEY)})`]);
 });
 
 test("scopes every ADB command to the approved serial when provided", async () => {

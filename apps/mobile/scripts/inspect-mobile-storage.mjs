@@ -5,7 +5,8 @@ import { promisify } from "node:util";
 import WebSocket from "ws";
 
 const execFileAsync = promisify(execFile);
-export const APPROVED_MOBILE_STORAGE_KEY = "t4-code:mobile-backends:v2";
+export const APPROVED_MOBILE_STORAGE_KEY = "t4-code:mobile-hosts:v3";
+export const LEGACY_MOBILE_STORAGE_KEY = "t4-code:mobile-backends:v2";
 const APPLICATION_ID = "com.lycaonsolutions.t4code";
 const MAX_PROTOCOL_BYTES = 64 * 1024;
 const CDP_TIMEOUT_MS = 5_000;
@@ -35,7 +36,7 @@ export function parseStorageInspectorArguments(args) {
       if (value !== APPLICATION_ID) fail();
       result.applicationId = value;
     } else if (option === "--key") {
-      if (value !== APPROVED_MOBILE_STORAGE_KEY) fail();
+      if (value !== APPROVED_MOBILE_STORAGE_KEY && value !== LEGACY_MOBILE_STORAGE_KEY) fail();
       result.key = value;
     } else {
       fail();
@@ -59,9 +60,119 @@ function validTailnetBackend(value) {
     typeof value.label === "string";
 }
 
+const ID_PATTERN = /^[A-Za-z0-9_-]{16,64}$/u;
+const CONNECTION_OUTCOMES = new Set(["connected", "unavailable", "auth", "protocol", "cancelled"]);
+
+function validId(value) {
+  return typeof value === "string" && ID_PATTERN.test(value);
+}
+
+function validLabel(value) {
+  return typeof value === "string" && value.length >= 1 && value.length <= 128 &&
+    value === value.trim() && !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    });
+}
+
+function canonicalTailnetTransport(value) {
+  if (!plainObject(value) || !exactFields(value, ["credentialScopeKey", "displayAddress", "id", "kind", "origin", "wsUrl"]) ||
+      !validId(value.id) || value.kind !== "tailscale" || typeof value.origin !== "string") return null;
+  let parsed;
+  try { parsed = new URL(value.origin); } catch { return null; }
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "" ||
+    parsed.pathname !== "/" || parsed.search !== "" || parsed.hash !== "" ||
+    hostname === "ts.net" || !hostname.endsWith(".ts.net") || hostname.split(".").some((part) => part.length === 0) ||
+    parsed.origin !== value.origin
+  ) return null;
+  const websocket = new URL(parsed.origin);
+  websocket.protocol = "wss:";
+  websocket.pathname = "/v1/ws";
+  if (
+    value.wsUrl !== websocket.toString() || value.displayAddress !== parsed.origin ||
+    value.credentialScopeKey !== parsed.origin
+  ) return null;
+  return { id: value.id, kind: value.kind, identity: `tailscale:${parsed.origin}` };
+}
+
+function canonicalBase64Url32(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value)) return false;
+  try {
+    const decoded = Buffer.from(value, "base64url");
+    return decoded.length === 32 && decoded.toString("base64url") === value;
+  } catch {
+    return false;
+  }
+}
+
+function canonicalHyperDhtTransport(value) {
+  if (!plainObject(value) || !exactFields(value, ["desktopFingerprint", "id", "invite", "kind"]) ||
+      !validId(value.id) || value.kind !== "hyperdht" || typeof value.invite !== "string" ||
+      typeof value.desktopFingerprint !== "string") return null;
+  const match = /^t4peer:\/\/v1\/([^/]+)\/([^/]+)$/u.exec(value.invite);
+  if (!match || !canonicalBase64Url32(match[1]) || !canonicalBase64Url32(match[2]) ||
+      value.desktopFingerprint !== match[1].slice(0, 8)) return null;
+  return { id: value.id, kind: value.kind, identity: `hyperdht:${match[1]}` };
+}
+
+function parseV3Directory(value) {
+  if (!plainObject(value) || !exactFields(value, ["activeHostId", "hosts", "version"]) ||
+      value.version !== 3 || !validId(value.activeHostId) || !Array.isArray(value.hosts) ||
+      value.hosts.length < 1 || value.hosts.length > 16) fail();
+  const allIds = new Set();
+  const canonicalIdentities = new Set();
+  const configuredKinds = new Set();
+  let activeHost = false;
+  for (const host of value.hosts) {
+    if (!plainObject(host) || !exactFields(host, ["id", "label", "lastConnection", "preferredTransportIds", "transports"]) ||
+        !validId(host.id) || !validLabel(host.label) || allIds.has(host.id) ||
+        !Array.isArray(host.transports) || host.transports.length < 1 || host.transports.length > 2 ||
+        !Array.isArray(host.preferredTransportIds)) fail();
+    allIds.add(host.id);
+    if (host.id === value.activeHostId) activeHost = true;
+    const hostKinds = new Set();
+    const transportIds = new Set();
+    for (const transportValue of host.transports) {
+      const transport = transportValue?.kind === "tailscale"
+        ? canonicalTailnetTransport(transportValue)
+        : transportValue?.kind === "hyperdht" ? canonicalHyperDhtTransport(transportValue) : null;
+      if (
+        transport === null || allIds.has(transport.id) || hostKinds.has(transport.kind) ||
+        canonicalIdentities.has(transport.identity)
+      ) fail();
+      allIds.add(transport.id);
+      transportIds.add(transport.id);
+      hostKinds.add(transport.kind);
+      configuredKinds.add(transport.kind);
+      canonicalIdentities.add(transport.identity);
+    }
+    if (
+      host.preferredTransportIds.length !== transportIds.size ||
+      new Set(host.preferredTransportIds).size !== host.preferredTransportIds.length ||
+      host.preferredTransportIds.some((id) => !validId(id) || !transportIds.has(id))
+    ) fail();
+    if (host.lastConnection !== null) {
+      const last = host.lastConnection;
+      if (!plainObject(last) || !exactFields(last, ["at", "kind", "outcome"]) ||
+          !hostKinds.has(last.kind) || !Number.isSafeInteger(last.at) || last.at < 0 ||
+          !CONNECTION_OUTCOMES.has(last.outcome)) fail();
+    }
+  }
+  if (!activeHost || configuredKinds.size > 2) fail();
+  return {
+    present: true,
+    version: 3,
+    activeHost: true,
+    hostCount: value.hosts.length,
+    transportKinds: [...configuredKinds].sort(),
+  };
+}
+
 export function summarizeStoredConnection(rawValue) {
   if (rawValue === null) {
-    return { present: false, version: null, kind: null, fieldNames: [], inviteLength: null };
+    return { present: false, version: null, activeHost: false, hostCount: 0, transportKinds: [] };
   }
   if (typeof rawValue !== "string" || rawValue.length === 0 || rawValue.length > MAX_PROTOCOL_BYTES) fail();
   let value;
@@ -71,6 +182,7 @@ export function summarizeStoredConnection(rawValue) {
     fail();
   }
   if (!plainObject(value)) fail();
+  if (value.version === 3) return parseV3Directory(value);
   const fieldNames = Object.keys(value).sort();
   if (
     exactFields(value, ["invite", "kind", "label", "version"]) && value.version === 2 &&
@@ -261,7 +373,8 @@ export async function inspectMobileStorage({
   evaluate = evaluateCdp,
 } = {}) {
   if (
-    key !== APPROVED_MOBILE_STORAGE_KEY || applicationId !== APPLICATION_ID ||
+    (key !== APPROVED_MOBILE_STORAGE_KEY && key !== LEGACY_MOBILE_STORAGE_KEY) ||
+    applicationId !== APPLICATION_ID ||
     !Number.isInteger(adbTimeoutMs) || adbTimeoutMs < 1 || adbTimeoutMs > ADB_TIMEOUT_MS
   ) fail();
   if (serial !== null && !/^[A-Za-z0-9._:-]{1,128}$/u.test(serial)) fail();
@@ -288,7 +401,7 @@ export async function inspectMobileStorage({
       );
     } catch { fail(); }
     const webSocketUrl = parseTargets(targetBytes, port);
-    const expression = `localStorage.getItem(${JSON.stringify(APPROVED_MOBILE_STORAGE_KEY)})`;
+    const expression = `localStorage.getItem(${JSON.stringify(key)})`;
     let evaluationBytes;
     try {
       evaluationBytes = await withDeadline(
