@@ -102,6 +102,9 @@ test("Android foreground resume wakes the browser connection immediately", async
 
   assert.match(activity, /void onResume\(\)/);
   assert.match(activity, /super\.onResume\(\)/);
+  assert.match(activity, /void onPause\(\)/);
+  assert.match(activity, /hasEnteredBackground = true/);
+  assert.match(activity, /if \(hasEnteredBackground && getBridge\(\) != null\)/);
   assert.match(activity, /triggerWindowJSEvent\(APP_RESUME_EVENT\)/);
   assert.match(activity, /APP_RESUME_EVENT = "t4:native-resume"/);
 });

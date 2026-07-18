@@ -6,6 +6,7 @@ import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
     private static final String APP_RESUME_EVENT = "t4:native-resume";
+    private boolean hasEnteredBackground = false;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -17,9 +18,16 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    public void onPause() {
+        hasEnteredBackground = true;
+        super.onPause();
+    }
+
+    @Override
     public void onResume() {
         super.onResume();
-        if (getBridge() != null) {
+        if (hasEnteredBackground && getBridge() != null) {
+            hasEnteredBackground = false;
             getBridge().triggerWindowJSEvent(APP_RESUME_EVENT);
         }
     }
