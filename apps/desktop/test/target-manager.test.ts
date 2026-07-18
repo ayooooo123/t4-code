@@ -219,6 +219,31 @@ async function settlesBeforeTurnLimit<T>(promise: Promise<T>): Promise<T> {
 }
 
 describe("desktop target manager boundaries", () => {
+  it("wakes a pending reconnect when the renderer explicitly connects again", async () => {
+    const transports: Transport[] = [new Transport(), new Transport(welcome("host-fixture"))];
+    let factoryCalls = 0;
+    const runtime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      transportFactory: () => {
+        const next = transports[factoryCalls];
+        factoryCalls += 1;
+        return (next ?? new Transport()) as never;
+      },
+      events: { onFrame: () => {}, onState: () => {}, onError: () => {} },
+    });
+
+    expect(await runtime.connect()).toBe("connected");
+    transports[0]!.fail();
+    const recovery = runtime.connect();
+    for (let turn = 0; turn < 10 && factoryCalls < 2; turn += 1) {
+      await Promise.resolve();
+    }
+
+    expect(factoryCalls).toBe(2);
+    expect(await recovery).toBe("connected");
+    await runtime.close();
+  });
+
   it("lists and connects named local profiles through profile-scoped transports", async () => {
     const transports: Transport[] = [];
     const requestedProfiles: string[] = [];

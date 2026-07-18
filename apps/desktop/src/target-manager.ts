@@ -331,7 +331,26 @@ export class DesktopTargetManager {
         if (welcome !== undefined) this.events.onFrame(targetId, welcome);
         return { result: Promise.resolve("connected") };
       }
-      if (existing.client.state === "connecting" || existing.client.state === "handshaking" || existing.client.state === "pairing" || existing.client.state === "reconnect-wait") {
+      if (existing.client.state === "reconnect-wait") {
+        const pending = this.connectAttempts.get(targetId);
+        const result = pending?.generation === existing.generation
+          ? pending.result
+          : existing.client.connect().then(() => existing.client.state === "ready" ? "connected" as const : "connecting" as const);
+        if (pending?.generation !== existing.generation) {
+          this.connectAttempts.set(targetId, { generation: existing.generation, result });
+          void result.then(
+            () => {
+              if (this.connectAttempts.get(targetId)?.generation === existing.generation) this.connectAttempts.delete(targetId);
+            },
+            () => {
+              if (this.connectAttempts.get(targetId)?.generation === existing.generation) this.connectAttempts.delete(targetId);
+            },
+          );
+        }
+        existing.client.wake();
+        return { result };
+      }
+      if (existing.client.state === "connecting" || existing.client.state === "handshaking" || existing.client.state === "pairing") {
         const pending = this.connectAttempts.get(targetId);
         return { result: pending?.generation === existing.generation ? pending.result : Promise.resolve("connecting") };
       }
