@@ -248,6 +248,55 @@ describe("browser platform boundary", () => {
     expect(wakes).toBe(1);
   });
 
+  it("replaces a private peer transport immediately after native resume", async () => {
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4PreparedMobileConnection: {
+          hostId: "host_RESUMEAAAAA",
+          label: "Peer desktop",
+          transportId: "peer_RESUMEAAAAA",
+          kind: "hyperdht",
+          invite:
+            "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        },
+        location: { search: "" },
+      },
+    });
+    const windowTarget = new FakeLifecycleTarget();
+    const documentTarget = new FakeLifecycleTarget();
+    let wakes = 0;
+    let reconnects = 0;
+    const fakeClient = {
+      state: "ready",
+      connect: async () => undefined,
+      close: async () => undefined,
+      wake: () => {
+        wakes += 1;
+      },
+      reconnectNow: () => {
+        reconnects += 1;
+      },
+      onFrame: () => () => undefined,
+      onState: () => () => undefined,
+      onError: () => () => undefined,
+    };
+    const shell = createBrowserShellPort({
+      clientFactory: () => fakeClient as unknown as OmpClient,
+      lifecycle: { windowTarget, documentTarget },
+    });
+    if (shell === null) throw new Error("shell should not be null");
+
+    await shell.bootstrap();
+    windowTarget.dispatch("t4:native-resume");
+    await Promise.resolve();
+
+    expect(reconnects).toBe(1);
+    expect(wakes).toBe(0);
+    await shell.disconnect({ targetId: "remote" });
+  });
+
   it("bounds transport URLs and cleans listeners on close", () => {
     expect(() => new BrowserWebSocketTransport({ url: "https://not-websocket" })).toThrow(
       /invalid browser transport URL/u,

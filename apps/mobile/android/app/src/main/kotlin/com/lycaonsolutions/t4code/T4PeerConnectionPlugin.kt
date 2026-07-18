@@ -1,5 +1,6 @@
 package com.lycaonsolutions.t4code
 
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import com.getcapacitor.JSObject
@@ -34,6 +35,8 @@ class T4PeerConnectionPlugin : Plugin() {
     private var opening = false
     private var openingAttemptId: String? = null
     private var openingJob: Job? = null
+    private var pausedAtElapsedMs: Long? = null
+    private var resetDhtBeforeNextOpen = false
 
     @PluginMethod
     fun open(call: PluginCall) {
@@ -59,6 +62,18 @@ class T4PeerConnectionPlugin : Plugin() {
             var dht: HyperDHT? = null
             var phase = "starting DHT"
             try {
+                val retiredDht = synchronized(sessions) {
+                    if (!resetDhtBeforeNextOpen) null else {
+                        resetDhtBeforeNextOpen = false
+                        val current = activeDht
+                        activeDht = null
+                        current
+                    }
+                }
+                if (retiredDht != null) {
+                    Log.i(TAG, "Recreating private DHT after an extended background interval.")
+                }
+                try { retiredDht?.close() } catch (_: Exception) {}
                 val activeDht = dht()
                 dht = activeDht
                 withTimeout(NATIVE_OPEN_TIMEOUT_MS) {
@@ -170,6 +185,29 @@ class T4PeerConnectionPlugin : Plugin() {
         }
     }
 
+    override fun handleOnPause() {
+        val activeDht = synchronized(sessions) {
+            pausedAtElapsedMs = SystemClock.elapsedRealtime()
+            activeDht
+        }
+        activeDht?.suspend()
+        super.handleOnPause()
+    }
+
+    override fun handleOnResume() {
+        super.handleOnResume()
+        val now = SystemClock.elapsedRealtime()
+        val activeDht = synchronized(sessions) {
+            val pausedAt = pausedAtElapsedMs
+            pausedAtElapsedMs = null
+            if (pausedAt != null && now - pausedAt >= LONG_BACKGROUND_RESET_MS) {
+                resetDhtBeforeNextOpen = true
+            }
+            activeDht
+        }
+        activeDht?.resume()
+    }
+
     override fun handleOnDestroy() {
         val ids = synchronized(sessions) { sessions.keys.toList() }
         for (id in ids) closeSession(id, true)
@@ -209,6 +247,7 @@ class T4PeerConnectionPlugin : Plugin() {
     private companion object {
         const val TAG = "T4PeerConnection"
         const val NATIVE_OPEN_TIMEOUT_MS = 45_000L
+        const val LONG_BACKGROUND_RESET_MS = 60_000L
         const val MAX_MESSAGE_BYTES = 4 * 1024 * 1024
         const val MAX_ENCODED_BYTES = (MAX_MESSAGE_BYTES * 4 / 3) + 8
     }

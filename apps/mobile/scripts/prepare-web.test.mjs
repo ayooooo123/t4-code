@@ -213,6 +213,25 @@ test("private Android reconnects retain the app-process DHT node", async () => {
   assert.doesNotMatch(plugin, /session\.dht\.close\(\)/);
 });
 
+test("private Android DHT follows activity pause and resume", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  assert.match(plugin, /override fun handleOnPause\(\)/);
+  assert.match(plugin, /activeDht\?\.suspend\(\)/);
+  assert.match(plugin, /override fun handleOnResume\(\)/);
+  assert.match(plugin, /activeDht\?\.resume\(\)/);
+});
+
+test("private Android reconnects recreate stale DHT state after a long background interval", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  assert.match(plugin, /SystemClock\.elapsedRealtime\(\)/);
+  assert.match(plugin, /LONG_BACKGROUND_RESET_MS/);
+  assert.match(plugin, /resetDhtBeforeNextOpen = true/);
+  assert.match(plugin, /activeDht = null/);
+  assert.match(plugin, /retiredDht\?\.close\(\)/);
+});
+
 test("Android QR scanning is app-owned, offline, and pinned", async () => {
   const packageJson = JSON.parse(await readFile(resolve(mobileRoot, "package.json"), "utf8"));
   const appGradle = await readFile(resolve(mobileRoot, "android/app/build.gradle"), "utf8");

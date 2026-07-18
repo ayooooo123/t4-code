@@ -350,7 +350,13 @@ export function createBrowserShellPort(
   }
 
   function ensureLifecycle(): void {
-    stopLifecycle ??= bindBrowserConnectionWake(() => client?.wake(), options.lifecycle);
+    stopLifecycle ??= bindBrowserConnectionWake((source) => {
+      if (source === "native-resume" && peerInvite !== null) {
+        client?.reconnectNow();
+        return;
+      }
+      client?.wake();
+    }, options.lifecycle);
   }
 
   // ------------------------------------------------------------------ shell port
