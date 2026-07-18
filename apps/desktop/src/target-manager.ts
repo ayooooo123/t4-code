@@ -8,7 +8,13 @@ import { createRemoteWebSocketTransport, type RemoteWebSocketTransport } from ".
 import { validateRemoteTarget, type CredentialStore, type PublicRemoteTarget, type RemoteTargetRecord, type RemoteTargetRegistry } from "./remote-runtime/registry.ts";
 import { DEFAULT_LOCAL_PROFILE, localTargetId, type LocalProfileRecord } from "./local-profiles.ts";
 const DEFAULT_CAPABILITIES: readonly DeviceCapability[] = Object.freeze([...DEVICE_CAPABILITIES]);
-const REQUESTED_FEATURES: readonly string[] = ADDITIVE_FEATURES;
+// OMP 17 can enqueue one retained agent-transcript frame per subagent during
+// attach and exceed its 1 MiB WebSocket backpressure limit, closing the entire
+// session with code 1006. Lifecycle/progress frames remain available without
+// negotiating the bulk transcript replay feature.
+const REQUESTED_FEATURES: readonly string[] = Object.freeze(
+  ADDITIVE_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
 const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
   REQUESTED_FEATURES.filter(
     (feature) => feature !== "prompt.images" && feature !== "transcript.images",

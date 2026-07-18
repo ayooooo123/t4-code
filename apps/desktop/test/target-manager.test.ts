@@ -484,6 +484,7 @@ describe("desktop target manager boundaries", () => {
     };
     expect(firstHello.requestedFeatures).toContain("prompt.images");
     expect(firstHello.requestedFeatures).toContain("transcript.images");
+    expect(firstHello.requestedFeatures).not.toContain("agent.transcript");
     expect(fallbackHello.requestedFeatures).not.toContain("prompt.images");
     expect(fallbackHello.requestedFeatures).not.toContain("transcript.images");
     await runtime.close();
