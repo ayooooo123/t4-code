@@ -48,7 +48,7 @@ test("current source tree has one consistent release version", () => {
 
 test("tracks the current verified runtime separately from published release provenance", () => {
   const matrix = JSON.parse(files.get("compat/omp-app-matrix.json"));
-  assert.equal(matrix.verifiedRuntime.sourceTag, "t4code-17.0.4-appserver-3");
+  assert.equal(matrix.verifiedRuntime.sourceTag, "t4code-17.0.4-appserver-4");
   assert.equal(matrix.publishedRuntime.sourceTag, "t4code-17.0.0-appserver-6");
   assert.notEqual(matrix.verifiedRuntime.sourceCommit, matrix.publishedRuntime.sourceCommit);
 });
@@ -282,10 +282,10 @@ test("rejects drift in verified OMP runtime provenance", () => {
   const cases = [
     (text) =>
       text.replace(
-        "c77cd02a67304b529b6f19d42f4c7cc22de39ce9",
+        "be0301f566ef172b6a7e1864853b3f04d6545758",
         "0000000000000000000000000000000000000000",
       ),
-    (text) => text.replace('"sourceTag": "t4code-17.0.4-appserver-3"', '"sourceTag": "wrong-tag"'),
+    (text) => text.replace('"sourceTag": "t4code-17.0.4-appserver-4"', '"sourceTag": "wrong-tag"'),
     (text) =>
       text.replace(
         '"upstreamCommit": "3fdd85ab6c6bab6c0cdee80abbbec0981740a5c0"',
