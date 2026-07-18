@@ -11,6 +11,7 @@ import {
 import {
   MOBILE_HOST_DIRECTORY_STORAGE_KEY,
   activeMobileHost,
+  type MobileHost,
   type MobileHostDirectory,
 } from "./mobile-host-schema.ts";
 import {
@@ -129,14 +130,39 @@ interface CapacitorBridge {
 declare global {
   interface Window {
     Capacitor?: CapacitorBridge;
+    __t4PreparedMobileConnection?: PreparedMobileConnection;
     __t4MobileBackend?: NativeMobileBackendConfig;
     __t4MobilePeerInvite?: string;
   }
 }
 
+interface PreparedMobileConnectionBase {
+  readonly hostId: string;
+  readonly label: string;
+  readonly transportId: string;
+}
+
+export type PreparedMobileConnection =
+  | (PreparedMobileConnectionBase & {
+      readonly kind: "tailscale";
+      readonly origin: string;
+      readonly wsUrl: string;
+      readonly credentialScopeKey: string;
+      readonly credentials?: { readonly deviceId: string; readonly deviceToken: string };
+    })
+  | (PreparedMobileConnectionBase & {
+      readonly kind: "hyperdht";
+      readonly invite: string;
+    });
+
 export type MobileBootResult =
   | { readonly kind: "web" }
-  | { readonly kind: "ready"; readonly backend: StoredMobileConnection }
+  | {
+      readonly kind: "ready";
+      readonly host: MobileHost;
+      readonly directory: MobileHostDirectory;
+      readonly connection: PreparedMobileConnection;
+    }
   | { readonly kind: "setup"; readonly mode: "first-run"; readonly message?: string }
   | {
       readonly kind: "setup";
@@ -369,17 +395,33 @@ export function writeFirstRunTailnetBackend(
 
 export function currentNativeMobileBackend(): NativeMobileBackendConfig | null {
   if (typeof window === "undefined") return null;
-  return window.__t4MobileBackend ?? null;
+  const connection = window.__t4PreparedMobileConnection;
+  if (connection?.kind !== "tailscale") return null;
+  return {
+    origin: connection.origin,
+    wsUrl: connection.wsUrl,
+    label: connection.label,
+    ...(connection.credentials ?? {}),
+  };
 }
 
 export function currentNativeMobilePeerInvite(): string | null {
   if (typeof window === "undefined") return null;
-  return window.__t4MobilePeerInvite ?? null;
+  const connection = window.__t4PreparedMobileConnection;
+  return connection?.kind === "hyperdht" ? connection.invite : null;
+}
+
+export function currentPreparedMobileConnection(): PreparedMobileConnection | null {
+  if (typeof window === "undefined") return null;
+  return window.__t4PreparedMobileConnection ?? null;
 }
 
 export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   const platform = nativeMobilePlatform();
   if (platform === null) return { kind: "web" };
+  delete window.__t4PreparedMobileConnection;
+  delete window.__t4MobileBackend;
+  delete window.__t4MobilePeerInvite;
   document.documentElement.dataset.platform = platform;
   const nextId = (kind: MobileHostMigrationIdKind): string => {
     const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
@@ -412,20 +454,30 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   }
 
   const directory = prepared.directory;
-  const backend = projectedStoredConnection(directory);
+  const host = activeMobileHost(directory);
+  const connection = projectedMobileConnection(host);
   if (prepared.kind === "existing") {
-    applyProjectedNativeConnection(backend, null);
-    return { kind: "ready", backend };
+    if (connection.kind === "hyperdht") return readyMobileBoot(directory, host, connection);
+    const plugin = secureStorage();
+    if (plugin === null) return mobileMigrationRepair("unavailable");
+    let credentials: { readonly deviceId: string; readonly deviceToken: string } | null = null;
+    try {
+      const result = await plugin.getCredentials({
+        hostKey: connection.credentialScopeKey,
+        migrateLegacy: false,
+      });
+      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
+    } catch {
+      try { await plugin.clearCredentials({ hostKey: connection.credentialScopeKey }); } catch { /* best effort */ }
+    }
+    return readyMobileBoot(directory, host, withPreparedCredentials(connection, credentials));
   }
 
   const plugin = secureStorage();
   let credentials: { readonly deviceId: string; readonly deviceToken: string } | null = null;
   if (prepared.legacyOrigin !== undefined) {
     if (plugin === null) {
-      if (backend.version === 2) {
-        applyProjectedNativeConnection(backend, null);
-        return { kind: "ready", backend };
-      }
+      if (connection.kind === "hyperdht") return readyMobileBoot(directory, host, connection);
       return mobileMigrationRepair("unavailable");
     }
     try {
@@ -435,25 +487,28 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
       });
       if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
     } catch {
-      applyProjectedNativeConnection(backend, null);
-      return { kind: "ready", backend };
+      return readyMobileBoot(directory, host, connection);
     }
-    if (backend.version === 2 || backend.origin !== prepared.legacyOrigin) credentials = null;
-  } else if (backend.version === 1) {
+    if (connection.kind !== "tailscale" || connection.credentialScopeKey !== prepared.legacyOrigin) {
+      credentials = null;
+    }
+  } else if (connection.kind === "tailscale") {
     if (plugin === null) return mobileMigrationRepair("unavailable");
     try {
-      const result = await plugin.getCredentials({ hostKey: backend.origin, migrateLegacy: false });
+      const result = await plugin.getCredentials({ hostKey: connection.credentialScopeKey, migrateLegacy: false });
       if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
     } catch {
-      applyProjectedNativeConnection(backend, null);
-      return { kind: "ready", backend };
+      return readyMobileBoot(directory, host, connection);
     }
   }
 
   const committed = commitPreparedMobileHostMigration(prepared, window.localStorage);
   if (committed.kind === "repair") return mobileMigrationRepair("unavailable");
-  applyProjectedNativeConnection(backend, credentials);
-  return { kind: "ready", backend };
+  return readyMobileBoot(
+    committed.directory,
+    activeMobileHost(committed.directory),
+    withPreparedCredentials(connection, credentials),
+  );
 }
 
 function mobileMigrationRepair(
@@ -469,13 +524,26 @@ function mobileMigrationRepair(
   };
 }
 
-function projectedStoredConnection(directory: MobileHostDirectory): StoredMobileConnection {
-  const host = activeMobileHost(directory);
+function projectedMobileConnection(host: MobileHost): PreparedMobileConnection {
   const preferredId = host.preferredTransportIds[0]!;
   const transport = host.transports.find((item) => item.id === preferredId)!;
   return transport.kind === "tailscale"
-    ? parseTailnetBackend(transport.origin)
-    : parsePeerBackend(transport.invite);
+    ? {
+        hostId: host.id,
+        label: host.label,
+        transportId: transport.id,
+        kind: "tailscale",
+        origin: transport.origin,
+        wsUrl: transport.wsUrl,
+        credentialScopeKey: transport.credentialScopeKey,
+      }
+    : {
+        hostId: host.id,
+        label: host.label,
+        transportId: transport.id,
+        kind: "hyperdht",
+        invite: transport.invite,
+      };
 }
 
 function validatedNativeCredentials(credentials: {
@@ -491,22 +559,23 @@ function validatedNativeCredentials(credentials: {
   };
 }
 
-function applyProjectedNativeConnection(
-  backend: StoredMobileConnection,
+function withPreparedCredentials(
+  connection: PreparedMobileConnection,
   credentials: { readonly deviceId: string; readonly deviceToken: string } | null,
-): void {
-  if (backend.version === 2) {
-    delete window.__t4MobileBackend;
-    window.__t4MobilePeerInvite = backend.invite;
-    return;
-  }
-  window.__t4MobileBackend = {
-    origin: backend.origin,
-    wsUrl: backend.wsUrl,
-    label: backend.label,
-    ...(credentials === null ? {} : credentials),
-  };
+): PreparedMobileConnection {
+  if (connection.kind === "hyperdht" || credentials === null) return connection;
+  return { ...connection, credentials };
+}
+
+function readyMobileBoot(
+  directory: MobileHostDirectory,
+  host: MobileHost,
+  connection: PreparedMobileConnection,
+): Extract<MobileBootResult, { readonly kind: "ready" }> {
+  window.__t4PreparedMobileConnection = connection;
+  delete window.__t4MobileBackend;
   delete window.__t4MobilePeerInvite;
+  return { kind: "ready", host, directory, connection };
 }
 
 export async function persistNativeMobileCredentials(credentials: {
@@ -514,12 +583,13 @@ export async function persistNativeMobileCredentials(credentials: {
   readonly deviceToken: string;
 }): Promise<void> {
   if (nativeMobilePlatform() === null) return;
+  const connection = currentPreparedMobileConnection();
+  if (connection === null) throw new Error("The active mobile host is unavailable");
+  if (connection.kind === "hyperdht") return;
   const plugin = secureStorage();
   if (plugin === null) throw new Error("Android secure storage is unavailable");
-  const backend = readStoredMobileBackend();
-  if (backend === null) throw new Error("The active mobile host is unavailable");
   await plugin.setCredentials({
-    hostKey: backend.origin,
+    hostKey: connection.credentialScopeKey,
     deviceId: credentials.deviceId,
     deviceToken: validateDeviceToken(credentials.deviceToken, "deviceToken"),
   });
@@ -567,7 +637,12 @@ export async function removeNativeMobileBackend(
     }
     throw error;
   }
-  if (window.__t4MobileBackend?.origin === origin) delete window.__t4MobileBackend;
+  if (
+    window.__t4PreparedMobileConnection?.kind === "tailscale" &&
+    window.__t4PreparedMobileConnection.credentialScopeKey === origin
+  ) {
+    delete window.__t4PreparedMobileConnection;
+  }
 }
 
 export async function probeMobileBackend(

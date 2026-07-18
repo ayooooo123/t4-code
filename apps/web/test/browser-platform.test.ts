@@ -5,6 +5,7 @@ import { describe, expect, it, afterEach } from "vite-plus/test";
 import { resolveRendererPlatform } from "../src/platform/bridge.ts";
 import { createBrowserShellPort, detectBackend } from "../src/platform/browser-shell-port.ts";
 import { BrowserWebSocketTransport } from "../src/platform/browser-transport.ts";
+import { CapacitorPeerTransport } from "../src/platform/peer-transport.ts";
 
 const originalDocument = globalThis.document;
 const originalWindow = globalThis.window;
@@ -87,11 +88,18 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4MobileBackend: {
+        __t4PreparedMobileConnection: {
+          hostId: "host_AAAAAAAAAAA",
+          transportId: "tail_AAAAAAAAAAA",
+          kind: "tailscale",
+          origin: "https://host.tailnet.ts.net:8445",
           wsUrl: "wss://host.tailnet.ts.net:8445/v1/ws",
           label: "T4 on host",
-          deviceId: "android-device",
-          deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          credentialScopeKey: "https://host.tailnet.ts.net:8445",
+          credentials: {
+            deviceId: "android-device",
+            deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          },
         },
         location: { search: "" },
       },
@@ -102,6 +110,94 @@ describe("browser platform boundary", () => {
       deviceId: "android-device",
       deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     });
+  });
+
+  it("ignores obsolete mobile globals", () => {
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4MobileBackend: { wsUrl: "wss://old.invalid/v1/ws", label: "Old" },
+        __t4MobilePeerInvite: "t4peer://v1/old/old",
+        location: { search: "" },
+      },
+    });
+    expect(detectBackend()).toBeNull();
+    expect(createBrowserShellPort()).toBeNull();
+  });
+
+  it("uses only the explicitly prepared transport without treating the logical host ID as OMP identity", async () => {
+    const fakeClient = {
+      state: "idle",
+      connect: async () => undefined,
+      close: async () => undefined,
+      onFrame: () => () => undefined,
+      onState: () => () => undefined,
+      onError: () => () => undefined,
+    };
+    let tailOptions: OmpClientOptions | undefined;
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4PreparedMobileConnection: {
+          hostId: "host_LOGICALAAAAA", label: "Tail desktop", transportId: "tail_AAAAAAAAAAA",
+          kind: "tailscale", origin: "https://tail.tailnet.ts.net:8445",
+          wsUrl: "wss://tail.tailnet.ts.net:8445/v1/ws",
+          credentialScopeKey: "https://tail.tailnet.ts.net:8445",
+        },
+        location: { search: "" },
+      },
+    });
+    const tailShell = createBrowserShellPort({
+      clientFactory: (options) => { tailOptions = options; return fakeClient as unknown as OmpClient; },
+    });
+    await tailShell?.connect({ targetId: "remote" });
+    expect(tailOptions).toBeDefined();
+    expect(tailOptions).not.toHaveProperty("expectedHostId");
+    expect(tailOptions?.client).not.toHaveProperty("hostId");
+    class OpeningWebSocket {
+      static readonly OPEN = 1;
+      readyState = OpeningWebSocket.OPEN;
+      binaryType = "blob";
+      private readonly listeners = new Map<string, Set<EventListener>>();
+      constructor() { queueMicrotask(() => this.dispatch("open")); }
+      addEventListener(type: string, listener: EventListener): void {
+        const listeners = this.listeners.get(type) ?? new Set<EventListener>();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+      }
+      removeEventListener(type: string, listener: EventListener): void { this.listeners.get(type)?.delete(listener); }
+      dispatch(type: string): void { for (const listener of this.listeners.get(type) ?? []) listener({ type } as Event); }
+      close(): void { this.readyState = 3; }
+      send(): void {}
+    }
+    Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: OpeningWebSocket });
+    const tailTransport = await tailOptions?.transport();
+    expect(tailTransport).toBeInstanceOf(BrowserWebSocketTransport);
+    tailTransport?.close();
+
+    let peerOptions: OmpClientOptions | undefined;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4PreparedMobileConnection: {
+          hostId: "host_LOGICALBBBBB", label: "Peer desktop", transportId: "peer_AAAAAAAAAAA",
+          kind: "hyperdht",
+          invite: "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        },
+        location: { search: "" },
+      },
+    });
+    const peerShell = createBrowserShellPort({
+      clientFactory: (options) => { peerOptions = options; return fakeClient as unknown as OmpClient; },
+    });
+    await peerShell?.connect({ targetId: "remote" });
+    expect(peerOptions).toBeDefined();
+    expect(peerOptions).not.toHaveProperty("expectedHostId");
+    expect(peerOptions?.client).not.toHaveProperty("hostId");
+    await expect(peerOptions?.transport()).rejects.toThrow(/native private connection is unavailable/u);
+    expect(CapacitorPeerTransport.name).toBe("CapacitorPeerTransport");
   });
 
   it("exposes one remote target and no local service lifecycle", async () => {

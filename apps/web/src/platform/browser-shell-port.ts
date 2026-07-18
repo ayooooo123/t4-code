@@ -65,8 +65,8 @@ import {
   type BrowserConnectionLifecycleOptions,
 } from "./browser-connection-lifecycle.ts";
 import {
+  currentPreparedMobileConnection,
   currentNativeMobileBackend,
-  currentNativeMobilePeerInvite,
   nativeMobilePlatform,
   persistNativeMobileCredentials,
 } from "./native-mobile.ts";
@@ -211,10 +211,11 @@ export interface BrowserShellPortOptions {
 export function createBrowserShellPort(
   options: BrowserShellPortOptions = {},
 ): DesktopShellPort | null {
-  const peerInvite = currentNativeMobilePeerInvite();
+  const preparedConnection = currentPreparedMobileConnection();
+  const peerInvite = preparedConnection?.kind === "hyperdht" ? preparedConnection.invite : null;
   const config = peerInvite === null
     ? detectBackend()
-    : { wsUrl: "wss://private.invalid", label: "T4 private host" };
+    : { wsUrl: "wss://private.invalid", label: preparedConnection?.label ?? "T4 private host" };
   if (config === null) return null;
   const backendConfig = config;
 

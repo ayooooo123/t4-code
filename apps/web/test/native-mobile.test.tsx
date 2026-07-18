@@ -16,6 +16,7 @@ import {
   removeNativeMobileBackend,
   selectStoredMobileBackend,
   type StoredMobileBackendDirectory,
+  type StoredMobileConnection,
   writeStoredMobileBackend,
   writeStoredPeerBackend,
   writeFirstRunPeerBackend,
@@ -80,6 +81,18 @@ const TEST_TAILNET_DIRECTORY = {
   activeOrigin: TEST_TAILNET.origin,
   backends: [TEST_TAILNET],
 };
+
+function expectReadyConnection(
+  result: Awaited<ReturnType<typeof prepareNativeMobileBackend>>,
+  backend: StoredMobileConnection,
+): void {
+  expect(result).toMatchObject({
+    kind: "ready",
+    connection: backend.version === 2
+      ? { kind: "hyperdht", invite: backend.invite }
+      : { kind: "tailscale", origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label },
+  });
+}
 
 afterEach(() => {
   Object.defineProperty(globalThis, "document", { configurable: true, value: originalDocument });
@@ -333,15 +346,17 @@ describe("native mobile connection", () => {
       },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
     expect(reads).toEqual([{ hostKey: backend.origin, migrateLegacy: true }]);
     expect(clears).toEqual([]);
-    expect(window.__t4MobileBackend).toEqual({
+    expect(window.__t4PreparedMobileConnection).toMatchObject({
       origin: backend.origin,
       wsUrl: backend.wsUrl,
       label: backend.label,
-      deviceId: "android-device",
-      deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      credentials: {
+        deviceId: "android-device",
+        deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
     });
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
     expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBeNull();
@@ -368,16 +383,18 @@ describe("native mobile connection", () => {
     const originalSet = storage.setItem.bind(storage);
     storage.setItem = (key, value) => { events.push(`set:${key}`); originalSet(key, value); };
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
     expect(events[0]).toBe(`secure:${backend.origin}:true`);
     expect(events).toContain(`set:${MOBILE_HOST_DIRECTORY_STORAGE_KEY}`);
     expect(events).not.toContain("clear");
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).not.toBeNull();
-    expect(window.__t4MobileBackend).toMatchObject({
+    expect(window.__t4PreparedMobileConnection).toMatchObject({
       origin: backend.origin,
-      deviceId: "android-device",
-      deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      credentials: {
+        deviceId: "android-device",
+        deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
     });
   });
 
@@ -401,10 +418,10 @@ describe("native mobile connection", () => {
       clearCredentials: (options: unknown) => { clears.push(options); return Promise.resolve(); },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: active });
+    expectReadyConnection(await prepareNativeMobileBackend(), active);
     expect(reads).toEqual([{ hostKey: legacy.origin, migrateLegacy: true }]);
     expect(clears).toEqual([]);
-    expect(window.__t4MobileBackend).toEqual({ origin: active.origin, wsUrl: active.wsUrl, label: active.label });
+    expect(window.__t4PreparedMobileConnection).toMatchObject({ origin: active.origin, wsUrl: active.wsUrl, label: active.label });
   });
 
   it("boots a pending HyperDHT candidate without secure storage while preserving every source byte for retry", async () => {
@@ -417,7 +434,7 @@ describe("native mobile connection", () => {
     storage.setItem("t4-code:mobile-backend:v1", legacyRaw);
     installNativeWindow(storage);
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: peer });
+    expectReadyConnection(await prepareNativeMobileBackend(), peer);
     expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
@@ -441,9 +458,8 @@ describe("native mobile connection", () => {
         clearCredentials: () => { clears += 1; return Promise.resolve(); },
       });
 
-      await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: TEST_PEER });
-      expect(window.__t4MobileBackend).toBeUndefined();
-      expect(window.__t4MobilePeerInvite).toBe(TEST_PEER.invite);
+      expectReadyConnection(await prepareNativeMobileBackend(), TEST_PEER);
+      expect(window.__t4PreparedMobileConnection).toMatchObject({ kind: "hyperdht", invite: TEST_PEER.invite });
       expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
       expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
       expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
@@ -469,10 +485,9 @@ describe("native mobile connection", () => {
       clearCredentials: () => Promise.resolve(),
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: TEST_PEER });
+    expectReadyConnection(await prepareNativeMobileBackend(), TEST_PEER);
     expect(reads).toEqual([{ hostKey: legacy.origin, migrateLegacy: true }]);
-    expect(window.__t4MobileBackend).toBeUndefined();
-    expect(window.__t4MobilePeerInvite).toBe(TEST_PEER.invite);
+    expect(window.__t4PreparedMobileConnection).toMatchObject({ kind: "hyperdht", invite: TEST_PEER.invite });
     expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBeNull();
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).not.toBeNull();
@@ -494,8 +509,8 @@ describe("native mobile connection", () => {
         clearCredentials: () => { clears += 1; return Promise.resolve(); },
       });
 
-      await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
-      expect(window.__t4MobileBackend).toEqual({ origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label });
+      expectReadyConnection(await prepareNativeMobileBackend(), backend);
+      expect(window.__t4PreparedMobileConnection).toMatchObject({ origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label });
       expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
       expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
       expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
@@ -528,8 +543,8 @@ describe("native mobile connection", () => {
       clearCredentials: () => { clears += 1; return Promise.resolve(); },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
-    expect(window.__t4MobileBackend).toEqual({ origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label });
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
+    expect(window.__t4PreparedMobileConnection).toMatchObject({ origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label });
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(raw);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
     expect(clears).toBe(0);
@@ -559,11 +574,154 @@ describe("native mobile connection", () => {
       clearCredentials: () => { secureCalls += 1; return Promise.resolve(); },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
-    expect(secureCalls).toBe(0);
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
+    expect(secureCalls).toBe(1);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
     expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
+  });
+
+  it("prepares only the first preferred v3 Tailscale method and hydrates its scoped credentials", async () => {
+    const storage = new MemoryStorage();
+    const tailnet = parseTailnetBackend("https://preferred.tailnet.ts.net:8445");
+    const directory = {
+      version: 3,
+      activeHostId: "host_AAAAAAAAAAA",
+      hosts: [{
+        id: "host_AAAAAAAAAAA",
+        label: "Preferred desktop",
+        transports: [
+          { id: "peer_AAAAAAAAAAA", kind: "hyperdht", invite: TEST_PEER.invite, desktopFingerprint: "AAAAAAAA" },
+          { id: "tail_AAAAAAAAAAA", kind: "tailscale", origin: tailnet.origin, wsUrl: tailnet.wsUrl, displayAddress: tailnet.origin, credentialScopeKey: tailnet.origin },
+        ],
+        preferredTransportIds: ["tail_AAAAAAAAAAA", "peer_AAAAAAAAAAA"],
+        lastConnection: null,
+      }],
+    } as const;
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, JSON.stringify(directory));
+    const reads: unknown[] = [];
+    installNativeWindow(storage, {
+      getCredentials: (options: unknown) => {
+        reads.push(options);
+        return Promise.resolve({ credentials: { deviceId: "android-device", deviceToken: TEST_KEY } });
+      },
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: () => Promise.resolve(),
+    });
+
+    const result = await prepareNativeMobileBackend();
+    expect(result).toMatchObject({
+      kind: "ready",
+      host: { id: "host_AAAAAAAAAAA" },
+      directory: { version: 3, activeHostId: "host_AAAAAAAAAAA" },
+      connection: {
+        hostId: "host_AAAAAAAAAAA",
+        label: "Preferred desktop",
+        transportId: "tail_AAAAAAAAAAA",
+        kind: "tailscale",
+        wsUrl: tailnet.wsUrl,
+        credentialScopeKey: tailnet.origin,
+        credentials: { deviceId: "android-device", deviceToken: TEST_KEY },
+      },
+    });
+    expect(reads).toEqual([{ hostKey: tailnet.origin, migrateLegacy: false }]);
+    expect(window.__t4PreparedMobileConnection).toEqual(
+      result.kind === "ready" ? result.connection : undefined,
+    );
+    expect(window.__t4MobileBackend).toBeUndefined();
+    expect(window.__t4MobilePeerInvite).toBeUndefined();
+  });
+
+  it("prepares only the first preferred HyperDHT method without reading secure storage", async () => {
+    const storage = new MemoryStorage();
+    const tailnet = parseTailnetBackend("https://unused.tailnet.ts.net:8445");
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      activeHostId: "host_BBBBBBBBBBB",
+      hosts: [{
+        id: "host_BBBBBBBBBBB",
+        label: "Private desktop",
+        transports: [
+          { id: "tail_BBBBBBBBBBB", kind: "tailscale", origin: tailnet.origin, wsUrl: tailnet.wsUrl, displayAddress: tailnet.origin, credentialScopeKey: tailnet.origin },
+          { id: "peer_BBBBBBBBBBB", kind: "hyperdht", invite: TEST_PEER.invite, desktopFingerprint: "AAAAAAAA" },
+        ],
+        preferredTransportIds: ["peer_BBBBBBBBBBB", "tail_BBBBBBBBBBB"],
+        lastConnection: null,
+      }],
+    }));
+    let secureCalls = 0;
+    installNativeWindow(storage, {
+      getCredentials: () => { secureCalls += 1; return Promise.resolve({ credentials: null }); },
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: () => { secureCalls += 1; return Promise.resolve(); },
+    });
+
+    const result = await prepareNativeMobileBackend();
+    expect(result).toMatchObject({
+      kind: "ready",
+      connection: {
+        hostId: "host_BBBBBBBBBBB",
+        transportId: "peer_BBBBBBBBBBB",
+        kind: "hyperdht",
+        invite: TEST_PEER.invite,
+      },
+    });
+    expect(secureCalls).toBe(0);
+  });
+
+  it("clears only the selected v3 Tailscale credential scope after an unreadable secure record", async () => {
+    const storage = new MemoryStorage();
+    const backend = parseTailnetBackend("https://damaged.tailnet.ts.net:8445");
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, JSON.stringify({
+      version: 3, activeHostId: "host_CCCCCCCCCCC",
+      hosts: [{
+        id: "host_CCCCCCCCCCC", label: backend.label,
+        transports: [{ id: "tail_CCCCCCCCCCC", kind: "tailscale", origin: backend.origin, wsUrl: backend.wsUrl, displayAddress: backend.origin, credentialScopeKey: backend.origin }],
+        preferredTransportIds: ["tail_CCCCCCCCCCC"], lastConnection: null,
+      }],
+    }));
+    const clears: unknown[] = [];
+    installNativeWindow(storage, {
+      getCredentials: () => Promise.reject(new Error("secure record unreadable")),
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: (options: unknown) => { clears.push(options); return Promise.resolve(); },
+    });
+
+    const result = await prepareNativeMobileBackend();
+    expectReadyConnection(result, backend);
+    expect(clears).toEqual([{ hostKey: backend.origin }]);
+    if (result.kind === "ready" && result.connection.kind === "tailscale") {
+      expect(result.connection.credentials).toBeUndefined();
+    }
+  });
+
+  it("requires secure storage only when the selected v3 method is Tailscale", async () => {
+    const tailscaleStorage = new MemoryStorage();
+    const backend = parseTailnetBackend("https://plugin.tailnet.ts.net:8445");
+    tailscaleStorage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, JSON.stringify({
+      version: 3, activeHostId: "host_DDDDDDDDDDD",
+      hosts: [{
+        id: "host_DDDDDDDDDDD", label: backend.label,
+        transports: [{ id: "tail_DDDDDDDDDDD", kind: "tailscale", origin: backend.origin, wsUrl: backend.wsUrl, displayAddress: backend.origin, credentialScopeKey: backend.origin }],
+        preferredTransportIds: ["tail_DDDDDDDDDDD"], lastConnection: null,
+      }],
+    }));
+    installNativeWindow(tailscaleStorage);
+    await expect(prepareNativeMobileBackend()).resolves.toMatchObject({
+      kind: "setup", mode: "repair", repairAction: "unavailable",
+    });
+
+    const peerStorage = new MemoryStorage();
+    peerStorage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, JSON.stringify({
+      version: 3, activeHostId: "host_EEEEEEEEEEE",
+      hosts: [{
+        id: "host_EEEEEEEEEEE", label: TEST_PEER.label,
+        transports: [{ id: "peer_EEEEEEEEEEE", kind: "hyperdht", invite: TEST_PEER.invite, desktopFingerprint: "AAAAAAAA" }],
+        preferredTransportIds: ["peer_EEEEEEEEEEE"], lastConnection: null,
+      }],
+    }));
+    installNativeWindow(peerStorage);
+    expectReadyConnection(await prepareNativeMobileBackend(), TEST_PEER);
   });
 
   it("treats existing v3 plus matching legacy as authoritative without secure calls or cleanup", async () => {
@@ -589,8 +747,8 @@ describe("native mobile connection", () => {
       clearCredentials: () => { secureCalls += 1; return Promise.resolve(); },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
-    expect(secureCalls).toBe(0);
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
+    expect(secureCalls).toBe(1);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
     expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
@@ -612,9 +770,13 @@ describe("native mobile connection", () => {
     storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, v3Raw);
     storage.setItem(MOBILE_BACKEND_STORAGE_KEY, v2Raw);
     storage.operations.length = 0;
-    installNativeWindow(storage);
+    installNativeWindow(storage, {
+      getCredentials: () => Promise.resolve({ credentials: null }),
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: () => Promise.resolve(),
+    });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
     expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
     expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
@@ -653,7 +815,7 @@ describe("native mobile connection", () => {
       },
     });
 
-    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expectReadyConnection(await prepareNativeMobileBackend(), backend);
     expect(reads).toEqual([{ hostKey: backend.origin, migrateLegacy: false }]);
   });
 
@@ -703,7 +865,10 @@ describe("native mobile connection", () => {
       configurable: true,
       value: {
         localStorage: storage,
-        __t4MobileBackend: { origin: bunker.origin, wsUrl: bunker.wsUrl, label: bunker.label },
+        __t4PreparedMobileConnection: {
+          hostId: "host_AAAAAAAAAAA", label: bunker.label, transportId: "tail_AAAAAAAAAAA",
+          kind: "tailscale", origin: bunker.origin, wsUrl: bunker.wsUrl, credentialScopeKey: bunker.origin,
+        },
         Capacitor: {
           isNativePlatform: () => true,
           getPlatform: () => "android",
@@ -747,7 +912,34 @@ describe("native mobile connection", () => {
       activeOrigin: bunker.origin,
       backends: [bunker],
     });
-    expect(window.__t4MobileBackend?.origin).toBe(bunker.origin);
+    expect(window.__t4PreparedMobileConnection).toMatchObject({ origin: bunker.origin });
+  });
+
+  it("does not persist OMP credentials for a selected HyperDHT method", async () => {
+    const storage = new MemoryStorage();
+    let writes = 0;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: storage,
+        __t4PreparedMobileConnection: {
+          hostId: "host_AAAAAAAAAAA", label: TEST_PEER.label, transportId: "peer_AAAAAAAAAAA",
+          kind: "hyperdht", invite: TEST_PEER.invite,
+        },
+        Capacitor: {
+          isNativePlatform: () => true,
+          getPlatform: () => "android",
+          Plugins: { T4SecureStorage: {
+            getCredentials: () => Promise.resolve({ credentials: null }),
+            setCredentials: () => { writes += 1; return Promise.resolve(); },
+            clearCredentials: () => Promise.resolve(),
+          } },
+        },
+      },
+    });
+
+    await persistNativeMobileCredentials({ deviceId: "unused", deviceToken: TEST_KEY });
+    expect(writes).toBe(0);
   });
 
   it("restores the complete host directory when secure credential removal fails", async () => {
@@ -761,7 +953,10 @@ describe("native mobile connection", () => {
       configurable: true,
       value: {
         localStorage: storage,
-        __t4MobileBackend: { origin: laptop.origin, wsUrl: laptop.wsUrl, label: laptop.label },
+        __t4PreparedMobileConnection: {
+          hostId: "host_AAAAAAAAAAA", label: laptop.label, transportId: "tail_AAAAAAAAAAA",
+          kind: "tailscale", origin: laptop.origin, wsUrl: laptop.wsUrl, credentialScopeKey: laptop.origin,
+        },
         Capacitor: {
           isNativePlatform: () => true,
           getPlatform: () => "android",
@@ -792,7 +987,7 @@ describe("native mobile connection", () => {
       activeOrigin: laptop.origin,
       backends: [bunker, laptop],
     });
-    expect(window.__t4MobileBackend?.origin).toBe(laptop.origin);
+    expect(window.__t4PreparedMobileConnection).toMatchObject({ origin: laptop.origin });
   });
 
   it("removing the active host selects a retained host, then removing the last enters setup", async () => {
@@ -806,7 +1001,10 @@ describe("native mobile connection", () => {
       configurable: true,
       value: {
         localStorage: storage,
-        __t4MobileBackend: { origin: laptop.origin, wsUrl: laptop.wsUrl, label: laptop.label },
+        __t4PreparedMobileConnection: {
+          hostId: "host_AAAAAAAAAAA", label: laptop.label, transportId: "tail_AAAAAAAAAAA",
+          kind: "tailscale", origin: laptop.origin, wsUrl: laptop.wsUrl, credentialScopeKey: laptop.origin,
+        },
         Capacitor: {
           isNativePlatform: () => true,
           getPlatform: () => "android",
@@ -826,7 +1024,7 @@ describe("native mobile connection", () => {
 
     await removeNativeMobileBackend(laptop.origin, storage);
     expect(readStoredMobileBackend(storage)).toEqual(bunker);
-    expect(window.__t4MobileBackend).toBeUndefined();
+    expect(window.__t4PreparedMobileConnection).toBeUndefined();
     await removeNativeMobileBackend(bunker.origin, storage);
     expect(readStoredMobileBackendDirectory(storage)).toBeNull();
     expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBeNull();
