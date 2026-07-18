@@ -5,6 +5,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   PROTOCOL_VERSION,
   decodeClientFrame,
+  decodeSessionListResult,
+  decodeSessions,
   decodeServerFrame,
   type AppFrame,
 } from "../src/index.ts";
@@ -18,6 +20,19 @@ function fixture(name: string): unknown {
 
 function decodeServerFixture(name: string): AppFrame {
   return decodeServerFrame(fixture(name));
+}
+
+function rawSession(liveState?: unknown): Record<string, unknown> {
+  return {
+    hostId: "host-a",
+    sessionId: "session-a",
+    project: { projectId: "project-a" },
+    revision: "rev-1",
+    title: "Session",
+    status: "active",
+    updatedAt: "2026-07-16T12:00:00Z",
+    ...(liveState === undefined ? {} : { liveState }),
+  };
 }
 
 describe("@omp/protocol app-wire facade", () => {
@@ -72,6 +87,125 @@ describe("@omp/protocol app-wire facade", () => {
           },
         },
       ],
+    });
+  });
+
+  it("preserves present unknown session control as a read-only marker", () => {
+    const decoded = decodeServerFrame(
+      JSON.stringify({
+        v: "omp-app/1",
+        type: "sessions",
+        hostId: "host-a",
+        cursor: { epoch: "epoch-1", seq: 1 },
+        sessions: [
+          rawSession({ sessionControl: { mode: "future-mode" } }),
+          rawSession({
+            sessionControl: { mode: "observer", lockStatus: "live", transcript: "snapshot" },
+          }),
+          rawSession(null),
+          rawSession(),
+        ],
+      }),
+    );
+
+    if (decoded.type !== "sessions") throw new Error("expected sessions frame");
+    expect(decoded.sessions[0]?.liveState?.sessionControl).toEqual({ mode: "unknown" });
+    expect(decoded.sessions[1]?.liveState?.sessionControl).toEqual({
+      mode: "observer",
+      lockStatus: "live",
+      transcript: "snapshot",
+    });
+    expect(decoded.sessions[2]?.liveState?.sessionControl).toEqual({ mode: "unknown" });
+    expect(decoded.sessions[3]?.liveState?.sessionControl).toBeUndefined();
+
+    expect(
+      decodeSessions({
+        v: "omp-app/1",
+        type: "sessions",
+        cursor: { epoch: "epoch-1", seq: 2 },
+        sessions: [
+          rawSession({
+            sessionControl: { mode: "reconciling", transcript: "live", future: true },
+          }),
+        ],
+      }),
+    ).toMatchObject({
+      sessions: [{ liveState: { sessionControl: { mode: "unknown" } } }],
+    });
+
+    expect(
+      decodeSessionListResult({
+        cursor: { epoch: "epoch-1", seq: 3 },
+        sessions: [rawSession({ sessionControl: null })],
+      }),
+    ).toMatchObject({
+      sessions: [{ liveState: { sessionControl: { mode: "unknown" } } }],
+    });
+
+    expect(
+      decodeSessions({
+        v: "omp-app/1",
+        type: "sessions",
+        cursor: { epoch: "epoch-1", seq: 4 },
+        sessions: [{ ...rawSession(), liveState: undefined }],
+      }),
+    ).toMatchObject({
+      sessions: [{ liveState: { sessionControl: { mode: "unknown" } } }],
+    });
+  });
+
+  it("preserves unknown control markers in deltas and typed command results", () => {
+    const future = rawSession({ sessionControl: { mode: "future-mode", version: 2 } });
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "session.delta",
+        hostId: "host-a",
+        sessionId: "session-a",
+        cursor: { epoch: "epoch-1", seq: 4 },
+        revision: "rev-2",
+        upsert: future,
+      }),
+    ).toMatchObject({
+      type: "session.delta",
+      upsert: { liveState: { sessionControl: { mode: "unknown" } } },
+    });
+
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "response",
+        requestId: "request-list",
+        hostId: "host-a",
+        ok: true,
+        command: "session.list",
+        result: {
+          cursor: { epoch: "epoch-1", seq: 5 },
+          sessions: [future],
+        },
+      }),
+    ).toMatchObject({
+      type: "response",
+      result: {
+        sessions: [{ liveState: { sessionControl: { mode: "unknown" } } }],
+      },
+    });
+
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "response",
+        requestId: "request-create",
+        hostId: "host-a",
+        ok: true,
+        command: "session.create",
+        result: { session: future },
+      }),
+    ).toMatchObject({
+      type: "response",
+      result: {
+        session: { liveState: { sessionControl: { mode: "unknown" } } },
+      },
     });
   });
 });

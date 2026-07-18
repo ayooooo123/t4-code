@@ -1,20 +1,39 @@
-## Session profile chooser
+## Follow a terminal session
 
-T4 Code v0.1.21 makes profile ownership explicit when you create a session. The visible **New** action becomes **New ▾** when several local OMP profile targets are configured. Its chooser lists the current and other connected profiles, configured profiles that are offline as **Not connected**, and an **Open Hosts** shortcut to start them. The profile you pick owns the session; with one eligible target, **New** creates directly there. Nothing switches silently.
+Sessions running as a plain `omp` TUI on the host now appear in T4 Code v0.1.22, marked **Active elsewhere**. While the TUI owns the session, T4 follows its durable transcript: complete records, including saved images, appear as they land on disk. Every write control is disabled with the reason instead of failing later.
 
-## Android saved hosts
+![An OMP TUI session followed in T4 Code: the transcript fills in read-only under an "Active in another app" banner, /continue-in-t4 runs in the terminal, T4 takes over, and the composer accepts input again.](https://raw.githubusercontent.com/LycaonLLC/t4-code/v0.1.22/docs/assets/t4-code-tui-handoff.gif)
 
-The Android app now manages saved hosts instead of remembering a single address. It keeps up to 16 saved Tailnet gateway addresses, stored as plain HTTPS origins with no secrets inside. Switch, add, and remove are separate actions.
+Ownership copy never guesses:
 
-Adding a host probes the address first and saves only on success. Back or Escape cancels a probe in flight, and a probe that finishes after you cancel cannot save. Removing a host deletes exactly that entry and rolls back its metadata; pairing credentials stay scoped to each host in the Android Keystore, so removing one host never touches another's credentials. Existing installs migrate their saved address into the list automatically.
+- A confirmed live lock is the only state called **Active in another app**.
+- A lock that has gone quiet reads as **Waiting to take over**; T4 promotes on its own once the session settles.
+- A malformed or unrecognized lock keeps the session read-only as "ownership unclear". T4 never names an owner it cannot confirm.
 
-Each saved host is one remote appserver serving one OMP profile. Android does not list multiple profiles behind a single saved address; running several profiles side by side remains a desktop feature, one local appserver per profile.
+While another app owns the session, stopping the turn and session management stay with that app; T4 says so on each disabled control. If following is not available yet, T4 shows the last saved copy and catches up on its own.
+
+## Continue in T4
+
+Run `/continue-in-t4` in the OMP TUI, or just exit it. The TUI tears down normally, and T4 takes over in two confirmed steps:
+
+1. The host reports the session lock gone. A writable takeover happens only when the lock is freshly missing; a live owner is never displaced.
+2. T4 reconciles the complete transcript, line by line, against what the host has on disk.
+
+Input returns only after both steps pass. Nothing is typed into a session another app still owns, and no transcript line is lost in the handoff.
+
+## Reconnect that does not give up
+
+Retryable transport failures now stay in the reconnect loop indefinitely, with backoff capped at 10 seconds. A network drop, a laptop sleep, or a host restart ends in a reconnected session instead of a dead one. Anything the host did not confirm stays marked unconfirmed the whole time.
+
+## Mobile rail fix
+
+On narrow screens, live output from the session you are already reading no longer closes the session rail you just reopened. Opening a different session still closes the rail, as before.
 
 ## Runtime provenance
 
-T4 Code v0.1.21 vendors app-wire 0.5.7 from integration commit [ee1b794f](https://github.com/lyc-aon/oh-my-pi/commit/ee1b794f1d0638b3d6797c5220e5eafe69d693db), source tree `421e29e6ed9203113345906e2d24c042949d0f61`. The client contract remains `omp-app/1`.
+T4 Code v0.1.22 vendors app-wire 0.5.8 from integration commit [33615123](https://github.com/lyc-aon/oh-my-pi/commit/33615123ff986fc9cadf645463b4fed17e8b9f35), source tree `e36475dc81dd4c3703eb207ae466f85947b33525`. The client contract remains `omp-app/1`.
 
-The matching OMP 17.0.0 runtime is built from the same commit [ee1b794f](https://github.com/lyc-aon/oh-my-pi/commit/ee1b794f1d0638b3d6797c5220e5eafe69d693db) and tagged [t4code-17.0.0-appserver-4](https://github.com/lyc-aon/oh-my-pi/tree/t4code-17.0.0-appserver-4). This revision scopes each appserver to its OMP profile, adds host-scoped usage and broker-status commands, reports semantic thinking and fast state, and bounds project catalog resolution. Fork CI requires the release commit to descend from the exact official base.
+The matching OMP 17.0.0 runtime is built from commit [f909a289](https://github.com/lyc-aon/oh-my-pi/commit/f909a2895bc1a352d1d3c27c45d59622bc1c0a36) and tagged [t4code-17.0.0-appserver-6](https://github.com/lyc-aon/oh-my-pi/tree/t4code-17.0.0-appserver-6). This revision adds lock-aware external session observation, complete line-by-line transcript reconciliation, missing-lock-only session promotion, the cooperative `/continue-in-t4` TUI handoff, and deterministic session file ordering. Terminal-session following requires this runtime; older appserver builds keep working without it. Fork CI requires the release commit to descend from the exact official base.
 
 The integration is based on the official upstream [v17.0.0 tag](https://github.com/can1357/oh-my-pi/tree/v17.0.0), commit [d5cd24f3](https://github.com/can1357/oh-my-pi/commit/d5cd24f39a951bfbd50dc8f50bcf095d59694d6c). Official upstream OMP v17.0.0 has no `appserver` command and cannot host T4 Code.
 

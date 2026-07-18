@@ -191,7 +191,7 @@ function confirmationFor(command: CommandFrame): ServerFrame {
   };
 }
 async function readyClient(transport: FakeTransport, options: Partial<ConstructorParameters<typeof OmpClient>[0]> = {}): Promise<OmpClient> {
-  const client = new OmpClient({ transport: () => transport, hostId: HOST, reconnect: { baseMs: 5, maxMs: 20, attemptCap: 2 }, ...options });
+  const client = new OmpClient({ transport: () => transport, hostId: HOST, reconnect: { baseMs: 5, maxMs: 20 }, ...options });
   await client.connect();
   return client;
 }
@@ -447,7 +447,7 @@ describe("OmpClient protocol state machine", () => {
       timers: clock,
       clock,
       random: () => 0,
-      reconnect: { baseMs: 2, maxMs: 2, attemptCap: 2 },
+      reconnect: { baseMs: 2, maxMs: 2 },
       requestedFeatures: ["resume", "prompt.images", "transcript.images"],
       compatibilityRequestedFeatures: ["resume"],
     });
@@ -488,7 +488,7 @@ describe("OmpClient protocol state machine", () => {
       timers: clock,
       clock,
       random: () => 0,
-      reconnect: { baseMs: 2, maxMs: 2, attemptCap: 8 },
+      reconnect: { baseMs: 2, maxMs: 2 },
       requestedFeatures: ["resume", "prompt.images", "transcript.images"],
       compatibilityRequestedFeatures: ["resume"],
     });
@@ -710,7 +710,7 @@ describe("OmpClient protocol state machine", () => {
   it("handles heartbeat pong and timeout", async () => {
     const clock = new FakeClock();
     const transport = new FakeTransport({ welcome: welcome() });
-    const client = await readyClient(transport, { clock, timers: clock, heartbeat: { intervalMs: 10, timeoutMs: 5 }, reconnect: { attemptCap: 0 } });
+    const client = await readyClient(transport, { clock, timers: clock, heartbeat: { intervalMs: 10, timeoutMs: 5 }, reconnect: { baseMs: 0, maxMs: 0 } });
     clock.advanceBy(10);
     const ping = transport.lastClientFrame();
     expect(ping.type).toBe("ping");
@@ -718,7 +718,7 @@ describe("OmpClient protocol state machine", () => {
     expect(client.state).toBe("ready");
     clock.advanceBy(10);
     clock.advanceBy(5);
-    expect(client.state).toBe("fatal");
+    expect(client.state).toBe("connecting");
     await client.close();
   });
 
@@ -727,7 +727,7 @@ describe("OmpClient protocol state machine", () => {
     const first = new FakeTransport({ welcome: welcome() });
     const second = new FakeTransport({ welcome: welcome({ resumed: true }) });
     const transports = [first, second];
-    const client = new OmpClient({ transport: () => transports.shift() ?? new FakeTransport(), hostId: HOST, timers: clock, clock, random: () => 0, reconnect: { baseMs: 10, maxMs: 15, attemptCap: 2 } });
+    const client = new OmpClient({ transport: () => transports.shift() ?? new FakeTransport(), hostId: HOST, timers: clock, clock, random: () => 0, reconnect: { baseMs: 10, maxMs: 15 } });
     await client.connect();
     first.emit({ v: V, type: "bye", code: "retryable", reason: "try again", retryable: true });
     expect(clock.pending()).toBeGreaterThan(0);
@@ -822,12 +822,14 @@ describe("OmpClient protocol state machine", () => {
     await expect(client.command({ hostId: HOST, command: "host.list" })).rejects.toMatchObject({ code: "invalid_state" });
     await client.close();
     await expect(first).rejects.toMatchObject({ code: "closed" });
-    const startup = new OmpClient({ transport: async () => { throw new Error("startup"); }, hostId: HOST, reconnect: { attemptCap: 0 } });
+    const startup = new OmpClient({ transport: async () => { throw new Error("startup"); }, hostId: HOST, reconnect: { baseMs: 0, maxMs: 0 } });
     const startupErrors: string[] = [];
     const stopStartupErrors = startup.onError((error) => startupErrors.push(error.message));
-    await expect(startup.connect()).rejects.toMatchObject({ code: "transport" });
-    expect(startupErrors).toContain("transport error");
-    expect(startup.state).toBe("fatal");
+    const startupConnect = startup.connect();
+    await flushMicrotasks();
+    expect(startup.state).toBe("reconnect-wait");
+    await startup.close();
+    await expect(startupConnect).rejects.toMatchObject({ code: "closed" });
     stopStartupErrors();
     expect(startup.resources()).toEqual({ timers: 0, socket: false, socketHandlers: 0, pending: 0, cursorSaves: 0, listeners: 0 });
   });
@@ -849,7 +851,7 @@ describe("OmpClient protocol state machine", () => {
       timers: clock,
       clock,
       random: () => 0,
-      reconnect: { baseMs: 2, maxMs: 2, attemptCap: 2 },
+      reconnect: { baseMs: 2, maxMs: 2 },
     });
 
     const firstConnect = client.connect();
@@ -907,7 +909,7 @@ describe("OmpClient live fixture websocket", () => {
       hostId: "host-stream",
       cursorStore: store,
       heartbeat: { intervalMs: 100_000, timeoutMs: 100 },
-      reconnect: { baseMs: 0, maxMs: 0, attemptCap: 2 },
+      reconnect: { baseMs: 0, maxMs: 0 },
     });
     const frames: PublicServerFrame[] = [];
     client.onFrame((frame) => frames.push(frame));

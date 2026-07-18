@@ -22,7 +22,7 @@ import { useEffect, useState } from "react";
 import type { WorkspaceProject, WorkspaceSession } from "../lib/workspace-data.ts";
 import { PaneContent } from "../features/panes/PaneContent.tsx";
 import { TerminalDrawer } from "../features/terminal/TerminalDrawer.tsx";
-import { FreshnessBadge, SessionMain } from "../features/transcript/SessionMain.tsx";
+import { FreshnessBadge, SessionMain, SessionOwnershipBadge } from "../features/transcript/SessionMain.tsx";
 import { RIGHT_PANE_DOCK_QUERY, useMediaQuery } from "../hooks/useMediaQuery.ts";
 import { useWorkspace, workspaceStore } from "../state/store-instance.ts";
 import {
@@ -204,6 +204,7 @@ export function SessionScreen({
         )}
         <span className="shrink-0">
           <FreshnessBadge session={session} />
+          <SessionOwnershipBadge session={session} />
         </span>
         <span className="min-w-0 flex-1" />
         {!archived && (

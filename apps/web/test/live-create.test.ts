@@ -13,16 +13,22 @@ const address = { targetId: "target-1", hostId: "host-1", projectId: "project-1"
 function controller() {
   const frames: Array<(event: { frame: unknown }) => void> = [];
   const snapshot: {
+    connections: Map<string, string>;
     targetHosts: Map<string, string>;
     projection: {
       sessionIndex: Map<
         string,
         { hostId: string; sessionId: string; project: { projectId: string } }
       >;
+      sessionIndexMetadata: Map<string, { truncated: boolean; totalCount: number }>;
     };
   } = {
+    connections: new Map([[address.targetId, "connected"]]),
     targetHosts: new Map([[address.targetId, address.hostId]]),
-    projection: { sessionIndex: new Map() },
+    projection: {
+      sessionIndex: new Map(),
+      sessionIndexMetadata: new Map([[address.hostId, { truncated: false, totalCount: 0 }]]),
+    },
   };
   const commands: Array<{ command: string; requestId: string; args: Record<string, unknown> }> = [];
   let unsubscribed = 0;

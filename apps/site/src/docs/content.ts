@@ -124,7 +124,7 @@ const install: DocTopic = {
     },
     {
       kind: "p",
-      text: `T4 Code v${RELEASE_VERSION} was verified with OMP ${OMP_RUNTIME_VERSION} integration tag [\`${OMP_RUNTIME_TAG}\`](${OMP_RUNTIME_URL}), commit \`${OMP_RUNTIME_COMMIT}\`. That public integration is based on the [official upstream v${OMP_RUNTIME_VERSION} tag](${OMP_UPSTREAM_URL}) at commit [\`${OMP_UPSTREAM_COMMIT.slice(0, 8)}\`](${OMP_URL}/commit/${OMP_UPSTREAM_COMMIT}). The build scopes each app server to its OMP profile, answers host-scoped \`usage.read\` and \`broker.status\` queries with redacted results, reports each model's real thinking levels and fast support, and keeps rename, archive, restore, and permanent delete under OMP authority. T4 Code vendors \`@oh-my-pi/app-wire\` ${APP_WIRE_VERSION}.`,
+      text: `T4 Code v${RELEASE_VERSION} was verified with OMP ${OMP_RUNTIME_VERSION} integration tag [\`${OMP_RUNTIME_TAG}\`](${OMP_RUNTIME_URL}), commit \`${OMP_RUNTIME_COMMIT}\`. That public integration is based on the [official upstream v${OMP_RUNTIME_VERSION} tag](${OMP_UPSTREAM_URL}) at commit [\`${OMP_UPSTREAM_COMMIT.slice(0, 8)}\`](${OMP_URL}/commit/${OMP_UPSTREAM_COMMIT}). The build lets T4 Code follow sessions an \`omp\` TUI is running, reconciles the complete transcript before any takeover, and hands sessions over with \`/continue-in-t4\`, on top of profile-scoped app servers, host-scoped \`usage.read\` and \`broker.status\` queries with redacted results, and each model's real thinking levels and fast support. T4 Code vendors \`@oh-my-pi/app-wire\` ${APP_WIRE_VERSION}.`,
     },
     {
       kind: "note",
@@ -241,10 +241,23 @@ const localSessions: DocTopic = {
       kind: "p",
       text: "Your draft message, scroll position, and open panels survive switching away and back.",
     },
+    { kind: "h2", id: "local-sessions-terminal", text: "Sessions started in the terminal" },
+    {
+      kind: "p",
+      text: "A session running as a plain `omp` TUI on the host appears in T4 Code marked **Active elsewhere**. While the TUI owns it, T4 follows the session's durable transcript: complete records, including saved images, appear as they land on disk. Every write control is disabled with the reason. To continue in T4, run `/continue-in-t4` in the TUI, or just exit it.",
+    },
+    {
+      kind: "p",
+      text: "The takeover is deliberate. The host must report the session lock gone — a live owner is never displaced — and T4 reconciles the complete transcript before the composer accepts input again. Nothing is typed into a session another app still owns.",
+    },
+    {
+      kind: "note",
+      text: "Ownership copy never guesses. Only a confirmed live lock is called active in another app. A lock that has gone quiet reads as waiting to take over, and a malformed or unrecognized lock keeps the session read-only as ownership unclear. Following a terminal session needs the verified OMP integration build; see [Requirements](#install-requirements).",
+    },
     { kind: "h2", id: "local-sessions-disconnects", text: "Disconnects" },
     {
       kind: "p",
-      text: "If the connection drops, T4 Code says so instead of pretending. Anything the host did not confirm is marked that way, and you can reconnect or keep reading what you already have.",
+      text: "If the connection drops, T4 Code says so instead of pretending. Retryable failures keep reconnecting on their own for as long as it takes, and anything the host did not confirm is marked that way. You can keep reading what you already have the whole time.",
     },
   ],
 };
@@ -272,7 +285,7 @@ const remotePairing: DocTopic = {
     { kind: "h2", id: "remote-pairing-reconnect", text: "Reconnecting" },
     {
       kind: "p",
-      text: "When a remote connection drops, T4 Code retries on its own: up to 12 attempts with growing delays, capped at 10 seconds between tries. Settings you were editing stay staged locally until the host confirms them; nothing is sent blind during a drop.",
+      text: "When a remote connection drops, T4 Code retries on its own for as long as it takes: growing delays, capped at 10 seconds between tries. A network drop, a laptop sleep, or a host restart ends in a reconnected session. Settings you were editing stay staged locally until the host confirms them; nothing is sent blind during a drop.",
     },
     { kind: "h2", id: "remote-pairing-tailnet", text: "Phone access over a tailnet" },
     {

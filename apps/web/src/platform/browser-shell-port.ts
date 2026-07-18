@@ -228,6 +228,8 @@ export function createBrowserShellPort(
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
   let activePeerTransport: CapacitorPeerTransport | undefined;
+  let transport: OmpTransport | undefined;
+  const pendingOpens = new Set<OmpTransport>();
   let welcome: WelcomeFrame | undefined;
   let stopLifecycle: Unsubscribe | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
@@ -274,18 +276,29 @@ export function createBrowserShellPort(
     };
     return { ...frame, error };
   }
-
   function buildClient(): OmpClient {
     const transportFactory = async (): Promise<OmpTransport> => {
       const next = peerInvite === null
         ? new BrowserWebSocketTransport({ url: backendConfig.wsUrl })
         : new CapacitorPeerTransport(peerInvite);
-      await next.open();
-      if (next instanceof CapacitorPeerTransport) {
-        activePeerTransport = next;
-        next.onClose(() => { if (activePeerTransport === next) activePeerTransport = undefined; });
+      transport = next;
+      pendingOpens.add(next);
+      try {
+        await next.open();
+        if (transport !== next) {
+          next.close();
+          throw new Error("browser transport superseded");
+        }
+        if (next instanceof CapacitorPeerTransport) {
+          activePeerTransport = next;
+          next.onClose(() => {
+            if (activePeerTransport === next) activePeerTransport = undefined;
+          });
+        }
+        return next;
+      } finally {
+        pendingOpens.delete(next);
       }
-      return next;
     };
 
     const c = (options.clientFactory ?? createOmpClient)({
@@ -300,11 +313,11 @@ export function createBrowserShellPort(
       },
       client: {
         name: "T4 Code",
-        version: "0.1.21",
+        version: "0.1.22",
         build: mobilePlatform ?? "browser",
         platform: mobilePlatform ?? (platform === "darwin" ? "darwin" : "linux"),
       },
-      reconnect: { attemptCap: 12, baseMs: 250, maxMs: 10_000 },
+      reconnect: { baseMs: 250, maxMs: 10_000 },
     });
 
     c.onFrame((frame) => {
@@ -375,6 +388,7 @@ export function createBrowserShellPort(
     },
 
     async disconnect(_request: TargetRequest): Promise<DisconnectResult> {
+      for (const pending of pendingOpens) pending.close();
       if (client !== undefined) {
         await client.close();
         client = undefined;

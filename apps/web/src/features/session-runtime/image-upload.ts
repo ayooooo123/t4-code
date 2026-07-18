@@ -42,6 +42,12 @@ export interface ImagePromptUploadOptions {
   ) => Promise<ImageUploadCommandResult>;
   readonly sendPrompt: (images: readonly Readonly<{ imageId: string }>[]) => Promise<PromptOutcome>;
   readonly rejectionReason: (error: CommandResultError | undefined) => string;
+  /**
+   * Rechecked immediately before every mutating upload dispatch (begin and
+   * chunk; best-effort discard cleanup stays allowed). Non-null gates the
+   * whole prompt with its reason — session ownership or freshness changed.
+   */
+  readonly writeGate?: () => { readonly kind: "rejected"; readonly reason: string } | null;
 }
 
 interface PreparedImage {
@@ -241,6 +247,8 @@ async function uploadOne(
   // resident/in flight for this target at a time.
   const prepared = await prepareImage(attachment);
   let begin: ImageUploadCommandResult;
+  const beginGate = options.writeGate?.() ?? null;
+  if (beginGate !== null) throw new ImageUploadFailure(beginGate.reason);
   try {
     begin = await options.command("session.image.begin", {
       mimeType: prepared.mimeType,
@@ -257,6 +265,8 @@ async function uploadOne(
     const end = Math.min(offset + IMAGE_UPLOAD_CHUNK_BYTES, prepared.bytes.byteLength);
     const content = canonicalBase64(prepared.bytes.subarray(offset, end));
     let chunk: ImageUploadCommandResult;
+    const chunkGate = options.writeGate?.() ?? null;
+    if (chunkGate !== null) throw new ImageUploadFailure(chunkGate.reason);
     try {
       chunk = await options.command("session.image.chunk", { imageId, offset, content });
     } catch {
@@ -313,6 +323,10 @@ export async function runImagePromptUpload(
     if (options.attachments.length === 0 || options.attachments.length > PROMPT_IMAGE_MAX_COUNT) {
       return { kind: "rejected", reason: IMAGE_UPLOAD_PREPARATION_REASON };
     }
+    // The per-target pipeline is a wait: ownership/freshness may have moved
+    // while an earlier upload held the lane. Recheck before any bytes leave.
+    const gated = options.writeGate?.() ?? null;
+    if (gated !== null) return gated;
     const begunImageIds: string[] = [];
     let promptAttempted = false;
     try {

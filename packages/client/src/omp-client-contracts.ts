@@ -69,7 +69,7 @@ export interface OmpClientOptions {
   requiredFeatures?: readonly string[]; capabilities?: readonly string[];
   authentication?: () => { deviceId: string; deviceToken: string } | undefined;
   cursorStore?: CursorStore; projection?: ProjectionStore; clock?: Clock; timers?: TimerScheduler; ids?: IdFactory;
-  random?: () => number; reconnect?: { baseMs?: number; maxMs?: number; attemptCap?: number };
+  random?: () => number; reconnect?: { baseMs?: number; maxMs?: number };
   heartbeat?: { intervalMs?: number; timeoutMs?: number }; handshakeTimeoutMs?: number; commandTimeoutMs?: number;
   /** Maximum inbound-idle time before a foreground wake replaces a possibly stale socket. */
   wakeStaleAfterMs?: number;

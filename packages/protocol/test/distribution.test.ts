@@ -131,13 +131,13 @@ describe("vendored app-wire distribution", () => {
   it("pins the frozen source, protocol, corpus, and tarball checksums", () => {
     expect(manifest).toMatchObject({
       package: "@oh-my-pi/app-wire",
-      version: "0.5.7",
+      version: "0.5.8",
       sourceRepository: "https://github.com/lyc-aon/oh-my-pi",
-      sourceCommit: "ee1b794f1d0638b3d6797c5220e5eafe69d693db",
-      sourceTreeHash: "421e29e6ed9203113345906e2d24c042949d0f61",
-      tarball: "oh-my-pi-app-wire-0.5.7.tgz",
+      sourceCommit: "33615123ff986fc9cadf645463b4fed17e8b9f35",
+      sourceTreeHash: "e36475dc81dd4c3703eb207ae466f85947b33525",
+      tarball: "oh-my-pi-app-wire-0.5.8.tgz",
       appProtocol: "omp-app/1",
-      goldenCorpusSha256: "e92d3d7a4848ab6ea6403cc1c1faa6912f8fdc75d2a6abf663ece0154a6eb7fa",
+      goldenCorpusSha256: "150c061d7428d10cf91b879461c25438c61e4eab327fb5900d7ab7a97ec04d5d",
     });
     expect(manifest.createdAt).toMatch(/^2026-07-16T\d{2}:\d{2}:\d{2}Z$/u);
     expect(sha256(tarballPath)).toBe(manifest.tarballSha256);
@@ -167,9 +167,9 @@ describe("vendored app-wire distribution", () => {
     const lockfile = readFileSync(join(repoRoot, "pnpm-lock.yaml"), "utf8");
     expect(`${protocolPackage}\n${lockfile}`).not.toContain("/home/");
     expect(protocolPackage).toMatch(
-      /"@oh-my-pi\/app-wire": "file:\.\.\/\.\.\/vendor\/app-wire\/oh-my-pi-app-wire-0\.5\.7\.tgz"/u,
+      /"@oh-my-pi\/app-wire": "file:\.\.\/\.\.\/vendor\/app-wire\/oh-my-pi-app-wire-0\.5\.8\.tgz"/u,
     );
-    expect(lockfile).toMatch(/version: file:vendor\/app-wire\/oh-my-pi-app-wire-0\.5\.7\.tgz/u);
+    expect(lockfile).toMatch(/version: file:vendor\/app-wire\/oh-my-pi-app-wire-0\.5\.8\.tgz/u);
     expect(`${protocolPackage}\n${lockfile}`).not.toMatch(/file:\/\//u);
   });
 });

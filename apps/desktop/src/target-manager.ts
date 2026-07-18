@@ -53,6 +53,9 @@ interface Runtime {
   readonly requestedCapabilities: readonly string[];
   paired: boolean;
 }
+interface ConnectAttempt {
+  readonly result: Promise<"connecting" | "connected">;
+}
 function sameCapabilities(left: readonly string[], right: readonly string[]): boolean {
   if (left.length !== right.length) return false;
   return left.every((capability, index) => capability === right[index]);
@@ -91,6 +94,7 @@ export class DesktopTargetManager {
   private readonly deviceId: string;
   private readonly deviceName: string;
   private readonly capabilities: readonly DeviceCapability[];
+  private readonly connectAttempts = new Map<string, { readonly generation: number; readonly result: Promise<"connecting" | "connected"> }>();
   private readonly registryQueue = { tail: Promise.resolve() };
   private readonly targetQueues = new Map<string, { tail: Promise<void> }>();
   private readonly runtimes = new Map<string, Runtime>();
@@ -165,7 +169,8 @@ export class DesktopTargetManager {
     });
   }
   async connect(targetId = "local"): Promise<"connecting" | "connected"> {
-    return enqueueTarget(this.targetQueues, targetId, async () => this.connectNow(targetId));
+    const attempt = await enqueueTarget(this.targetQueues, targetId, async () => this.connectNow(targetId));
+    return attempt.result;
   }
   async disconnect(targetId = "local"): Promise<void> {
     return enqueueTarget(this.targetQueues, targetId, async () => {
@@ -180,7 +185,8 @@ export class DesktopTargetManager {
         const current = this.runtimes.get(targetId);
         if (current !== undefined && !sameCapabilities(current.requestedCapabilities, remote.requestedCapabilities)) {
           await this.closeRuntime(targetId);
-          await this.connectNow(targetId);
+          const attempt = await this.connectNow(targetId);
+          await attempt.result;
         }
       }
       const runtime = this.runtimes.get(targetId);
@@ -313,16 +319,22 @@ export class DesktopTargetManager {
     if (target === null) throw new Error("target not found");
     return validateRemoteTarget(target);
   }
-  private async connectNow(targetId: string): Promise<"connecting" | "connected"> {
+  private async connectNow(targetId: string): Promise<ConnectAttempt> {
     if (this.closed) throw new Error("target manager is closed");
     const local = await this.localProfile(targetId);
     const remote = local === undefined ? await this.remoteTarget(targetId) : undefined;
     const requestedCapabilities = Object.freeze([...(local !== undefined ? this.capabilities : remote!.requestedCapabilities)]);
     const existing = this.runtimes.get(targetId);
-    if (existing?.client.state === "ready" && sameCapabilities(existing.requestedCapabilities, requestedCapabilities)) {
-      const welcome = this.latestWelcomes.get(targetId);
-      if (welcome !== undefined) this.events.onFrame(targetId, welcome);
-      return "connected";
+    if (existing !== undefined && sameCapabilities(existing.requestedCapabilities, requestedCapabilities)) {
+      if (existing.client.state === "ready") {
+        const welcome = this.latestWelcomes.get(targetId);
+        if (welcome !== undefined) this.events.onFrame(targetId, welcome);
+        return { result: Promise.resolve("connected") };
+      }
+      if (existing.client.state === "connecting" || existing.client.state === "handshaking" || existing.client.state === "pairing" || existing.client.state === "reconnect-wait") {
+        const pending = this.connectAttempts.get(targetId);
+        return { result: pending?.generation === existing.generation ? pending.result : Promise.resolve("connecting") };
+      }
     }
     await this.closeRuntime(targetId);
     const generation = (this.generations.get(targetId) ?? 0) + 1;
@@ -363,8 +375,8 @@ export class DesktopTargetManager {
       capabilities: requestedCapabilities,
       requestedFeatures: REQUESTED_FEATURES,
       compatibilityRequestedFeatures: COMPATIBILITY_FEATURES,
-      client: { name: "T4 Code", version: "0.1.21", build: "desktop", platform: process.platform },
-      reconnect: { attemptCap: 12, baseMs: 250, maxMs: 10_000 },
+      client: { name: "T4 Code", version: "0.1.22", build: "desktop", platform: process.platform },
+      reconnect: { baseMs: 250, maxMs: 10_000 },
     };
     const client = createOmpClient(clientOptions);
     const runtime: Runtime = { generation, client, requestedCapabilities, paired: local !== undefined || hasCredential };
@@ -386,18 +398,31 @@ export class DesktopTargetManager {
       this.events.onError({ targetId, code: safe.code, message: safe.message });
     });
     this.publishState(targetId, "connecting");
-    try {
-      await client.connect();
-    } catch (error) {
-      const safe = safeError(error);
-      this.events.onError({ targetId, code: safe.code, message: safe.message });
-      throw error;
-    }
-    return client.state === "ready" ? "connected" : "connecting";
+    const result = client.connect()
+      .then(() => client.state === "ready" ? "connected" as const : "connecting" as const)
+      .catch((error: unknown) => {
+        if (this.generations.get(targetId) === generation) {
+          const safe = safeError(error);
+          this.events.onError({ targetId, code: safe.code, message: safe.message });
+        }
+        throw error;
+      });
+    void result.catch(() => undefined);
+    this.connectAttempts.set(targetId, { generation, result });
+    void result.then(
+      () => {
+        if (this.connectAttempts.get(targetId)?.generation === generation) this.connectAttempts.delete(targetId);
+      },
+      () => {
+        if (this.connectAttempts.get(targetId)?.generation === generation) this.connectAttempts.delete(targetId);
+      },
+    );
+    return { result };
   }
   private async closeRuntime(targetId: string): Promise<void> {
     const generation = (this.generations.get(targetId) ?? 0) + 1;
     this.generations.set(targetId, generation);
+    this.connectAttempts.delete(targetId);
     const runtime = this.runtimes.get(targetId);
     this.runtimes.delete(targetId);
     this.latestWelcomes.delete(targetId);

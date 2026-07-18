@@ -231,6 +231,29 @@ function hostMetadata(capabilities: readonly string[], features: readonly string
   };
 }
 
+/**
+ * Dispatch-time write freshness requires a complete host inventory that
+ * contains this session's indexed ref; graft both onto fake projections.
+ */
+function withInventory(projection: ProjectionSnapshot): ProjectionSnapshot {
+  const key = `${HOST}\u0000${SESSION}`;
+  const sessionIndex = new Map(projection.sessionIndex);
+  if (!sessionIndex.has(key)) {
+    sessionIndex.set(key, {
+      hostId: HOST,
+      sessionId: SESSION,
+      project: { projectId: "project-1" },
+      revision: "rev-3",
+      title: "Session",
+      status: "active",
+      updatedAt: "2026-07-11T10:00:00Z",
+    } as never);
+  }
+  const sessionIndexMetadata = new Map(projection.sessionIndexMetadata);
+  sessionIndexMetadata.set(HOST, { truncated: false, totalCount: sessionIndex.size } as never);
+  return { ...projection, sessionIndex, sessionIndexMetadata };
+}
+
 class FakeRuntime implements LiveInspectorRuntime {
   commands: CommandIntent[] = [];
   targets: string[] = [];
@@ -254,7 +277,7 @@ class FakeRuntime implements LiveInspectorRuntime {
       ]),
       catalogs: options.catalog === undefined ? new Map() : new Map([[HOST, options.catalog]]),
       settings: new Map(),
-      projection: createProjectionSnapshot(),
+      projection: withInventory(createProjectionSnapshot()),
       runtimeErrors: [],
     };
   }
@@ -287,8 +310,11 @@ class FakeRuntime implements LiveInspectorRuntime {
     return result;
   }
 
-  setProjection(projection: ProjectionSnapshot): void {
-    this.snapshotValue = { ...this.snapshotValue, projection };
+  setProjection(projection: ProjectionSnapshot, options: { inventory?: boolean } = {}): void {
+    this.snapshotValue = {
+      ...this.snapshotValue,
+      projection: options.inventory === false ? projection : withInventory(projection),
+    };
     this.emit();
   }
 
@@ -700,6 +726,25 @@ describe("live pane actions", () => {
     });
   });
 
+  it("cached session inventory disables pane writes with a syncing reason", () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.setProjection(
+      project([
+        snapshotFrame("rev-3"),
+        agentFrame("agent-1"),
+        reviewFrame("review-1", { path: "src/app.ts", findings: [] }),
+      ]),
+      { inventory: false },
+    );
+    const store = createLiveInspectorStore(fake, VIEW_ID);
+    const expected = {
+      enabled: false,
+      reason: "This session is still syncing from the host. Try again in a moment.",
+    };
+    expect(store.getState().actions.agentCancel).toEqual(expected);
+    expect(store.getState().actions.reviewApply).toEqual(expected);
+  });
+
   it("steer, wake, and discard have no wire command: disabled, honest, silent", async () => {
     const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
     fake.setProjection(project([snapshotFrame("rev-1"), agentFrame("agent-1")]));
@@ -786,7 +831,10 @@ describe("live pane actions", () => {
 
   it("review apply waits for a known session revision", () => {
     const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
-    fake.setProjection(project([reviewFrame("review-1", { path: "src/app.ts", findings: [] })]));
+    // No grafted inventory: this session's indexed revision stays unknown.
+    fake.setProjection(project([reviewFrame("review-1", { path: "src/app.ts", findings: [] })]), {
+      inventory: false,
+    });
     const store = createLiveInspectorStore(fake, VIEW_ID);
     const apply = store.getState().actions.reviewApply;
     expect(apply.enabled).toBe(false);

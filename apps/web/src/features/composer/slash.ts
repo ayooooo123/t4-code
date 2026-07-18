@@ -22,6 +22,12 @@ export interface SlashCommand {
 export interface SlashCatalogContext {
   readonly link: "live" | "cached" | "offline";
   readonly turnActive: boolean;
+  /**
+   * View-wide read-only policy (observer/reconciling); gates every command
+   * with an honest reason while the palette stays visible. Cached/offline
+   * reasons still win.
+   */
+  readonly readOnlyReason?: string | null;
 }
 
 /**
@@ -58,6 +64,7 @@ export function slashCommandsFromCatalog(
     );
     const disabledReason =
       offlineReason ??
+      context.readOnlyReason ??
       (item.supported === false
         ? (item.reason ?? "Not available on this host")
         : missingCapability !== undefined

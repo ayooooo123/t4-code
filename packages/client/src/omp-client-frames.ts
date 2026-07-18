@@ -52,8 +52,15 @@ export function sendClientHello(
   decodeOutgoing: (input: Record<string, unknown>) => ClientFrame | undefined,
   fatal: () => void,
   protocolFailure: () => void,
+  transportFailure: (error: unknown) => void,
 ): void {
-  const savedCursors: SavedCursor[] = records.slice(0, 128).map((record) => ({ hostId: hostId(record.hostId), sessionId: sessionId(record.sessionId), cursor: record.cursor }));
+  let savedCursors: SavedCursor[];
+  try {
+    savedCursors = records.slice(0, 128).map((record) => ({ hostId: hostId(record.hostId), sessionId: sessionId(record.sessionId), cursor: record.cursor }));
+  } catch {
+    protocolFailure();
+    return;
+  }
   let authentication: { deviceId: string; deviceToken: string } | undefined;
   try {
     const provided = options.authentication?.();
@@ -62,20 +69,34 @@ export function sendClientHello(
       authentication = { deviceId: provided.deviceId, deviceToken: provided.deviceToken };
     }
   } catch { fatal(); return; }
-  const hello = decodeOutgoing({
-    v: PROTOCOL_VERSION,
-    type: "hello",
-    protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
-    client: options.client ?? { name: "t4-code", version: "0.1.21", build: "client", platform: "electron" },
-    requestedFeatures: [...(options.requestedFeatures ?? ["resume"])],
-    savedCursors,
-    ...(options.capabilities === undefined ? {} : { capabilities: { client: [...options.capabilities] } }),
-    ...(authentication === undefined ? {} : { authentication }),
-  });
-  if (hello === undefined || hello.type !== "hello") { protocolFailure(); return; }
+  let hello: ClientFrame | undefined;
   try {
-    const encoded = JSON.stringify(hello);
+    hello = decodeOutgoing({
+      v: PROTOCOL_VERSION,
+      type: "hello",
+      protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+      client: options.client ?? { name: "t4-code", version: "0.1.22", build: "client", platform: "electron" },
+      requestedFeatures: [...(options.requestedFeatures ?? ["resume"])],
+      savedCursors,
+      ...(options.capabilities === undefined ? {} : { capabilities: { client: [...options.capabilities] } }),
+      ...(authentication === undefined ? {} : { authentication }),
+    });
+  } catch {
+    protocolFailure();
+    return;
+  }
+  if (hello === undefined || hello.type !== "hello") { protocolFailure(); return; }
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(hello);
     decodeClientFrame(encoded);
+  } catch {
+    protocolFailure();
+    return;
+  }
+  try {
     send(encoded);
-  } catch { protocolFailure(); }
+  } catch (error) {
+    transportFailure(error);
+  }
 }

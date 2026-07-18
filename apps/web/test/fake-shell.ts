@@ -146,6 +146,9 @@ export class FakeShell implements DesktopShellPort {
         ? { error: behavior.error }
         : {}),
       ...(request.intent.command === "prompt.lease.acquire" ? { leaseId: "prompt-lease-fixture" } : {}),
+      ...(request.intent.command === "controller.lease.acquire"
+        ? { leaseId: "controller-lease-fixture", expiresAt: "2999-01-01T00:00:00.000Z" }
+        : {}),
     } as CommandResult;
   }
   async confirm(request: ConfirmRequest): Promise<ConfirmResult> {

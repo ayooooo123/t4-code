@@ -19,6 +19,11 @@ import type { CommandIntent, CommandResult } from "@t4-code/protocol/desktop-ipc
 
 import { resolveLiveSession } from "../../platform/live-workspace.ts";
 import {
+  presentSessionControl,
+  readSessionControl,
+} from "../session-runtime/session-observer.ts";
+import { sessionWriteLink } from "../session-runtime/session-inventory.ts";
+import {
   createInspectorStore,
   installInspectorStoreFactory,
   resolveDir,
@@ -58,6 +63,10 @@ export interface LiveInspectorRuntime {
 }
 
 const ENABLED: PaneActionAvailability = Object.freeze({ enabled: true, reason: null });
+const SYNCING_WRITE: PaneActionAvailability = Object.freeze({
+  enabled: false,
+  reason: "This session is still syncing from the host. Try again in a moment.",
+});
 
 // Actions the wire has no command for. Disabled with the honest reason —
 // never a silent no-op that pretends the host heard something.
@@ -125,17 +134,22 @@ export function deriveActionAvailability(
   snapshot: DesktopRuntimeSnapshot,
   targetId: string,
   hostId: string,
+  sessionId: string,
   revisionKnown: boolean,
 ): InspectorActionAvailability {
+  const agentCancel = commandAvailability(snapshot, targetId, hostId, "agent.cancel");
   const apply = commandAvailability(snapshot, targetId, hostId, "review.apply");
+  const reviewApply =
+    apply.enabled && !revisionKnown
+      ? { enabled: false, reason: "Waiting for this session's latest state." }
+      : apply;
+  const writeGate =
+    sessionWriteLink(snapshot, targetId, hostId, sessionId) === "live" ? null : SYNCING_WRITE;
   return {
     agentSteer: NO_STEER,
-    agentCancel: commandAvailability(snapshot, targetId, hostId, "agent.cancel"),
+    agentCancel: writeGate !== null && agentCancel.enabled ? writeGate : agentCancel,
     agentWake: NO_WAKE,
-    reviewApply:
-      apply.enabled && !revisionKnown
-        ? { enabled: false, reason: "Waiting for this session's latest state." }
-        : apply,
+    reviewApply: writeGate !== null && reviewApply.enabled ? writeGate : reviewApply,
     reviewDiscard: NO_DISCARD,
   };
 }
@@ -226,6 +240,22 @@ export function createLiveInspectorStore(
     return snapshot.projection.sessionIndex.get(projectionKey)?.revision;
   };
 
+  /**
+   * Current strict ownership truth; rechecked immediately before every pane
+   * write dispatch (`commandAvailability` already vetoes a dead connection).
+   * Non-null means another app owns the session, this one is still taking
+   * it over, or the shape is unproven — never dispatch.
+   */
+  const sessionControlNow = (snapshot: DesktopRuntimeSnapshot) =>
+    readSessionControl(
+      warmSession(snapshot)?.ref ?? snapshot.projection.sessionIndex.get(projectionKey),
+    );
+
+  /** Dispatch-time freshness + ownership recheck for pane writes. */
+  const writableNow = (snapshot: DesktopRuntimeSnapshot): boolean =>
+    sessionWriteLink(snapshot, address.targetId, address.hostId, address.sessionId) === "live" &&
+    sessionControlNow(snapshot) === null;
+
   const sendCommand = (
     command: string,
     args: Record<string, unknown>,
@@ -251,6 +281,7 @@ export function createLiveInspectorStore(
       ) {
         return;
       }
+      if (!writableNow(snapshot)) return;
       void sendCommand("agent.cancel", { agentId: scope.agentId }, true).catch(() => {
         // Outcome unknown: never resent. The next agent frame carries truth.
       });
@@ -263,6 +294,7 @@ export function createLiveInspectorStore(
       ) {
         return;
       }
+      if (!writableNow(snapshot)) return;
       const reviewId = reviewIdByPath.get(path);
       const revisionValue = expectedRevision();
       if (reviewId === undefined || revisionValue === undefined) return;
@@ -360,12 +392,28 @@ export function createLiveInspectorStore(
 
   const sync = (snapshot: DesktopRuntimeSnapshot): void => {
     const warm = warmSession(snapshot);
-    const nextAvailability = deriveActionAvailability(
+    let nextAvailability = deriveActionAvailability(
       snapshot,
       address.targetId,
       address.hostId,
+      address.sessionId,
       expectedRevision() !== undefined,
     );
+    // While another app owns this session (or this one is taking it over),
+    // pane writes gate with the same honest reason the composer shows.
+    // Already-disabled actions keep their more specific reason.
+    const control = sessionControlNow(snapshot);
+    if (control !== null) {
+      const gate: PaneActionAvailability = {
+        enabled: false,
+        reason: presentSessionControl(control).controlReason,
+      };
+      nextAvailability = {
+        ...nextAvailability,
+        agentCancel: nextAvailability.agentCancel.enabled ? gate : nextAvailability.agentCancel,
+        reviewApply: nextAvailability.reviewApply.enabled ? gate : nextAvailability.reviewApply,
+      };
+    }
     if (availability === null || !sameAvailability(availability, nextAvailability)) {
       availability = nextAvailability;
       store.getState().setActionAvailability(nextAvailability);

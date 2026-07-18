@@ -21,8 +21,25 @@ import {
 } from "@t4-code/protocol";
 
 import type { LiveSessionAddress } from "../../platform/live-workspace.ts";
+import { sessionWriteLink } from "../session-runtime/session-inventory.ts";
+import {
+  presentSessionControl,
+  readSessionControl,
+} from "../session-runtime/session-observer.ts";
 import type { PtyError } from "./pty.ts";
 import { WIRE_MAX_COLS, WIRE_MAX_ROWS } from "./wire.ts";
+
+/** Strict CURRENT ownership truth for one session; null means writable. */
+export function sessionControlGateReason(
+  snapshot: DesktopRuntimeSnapshot,
+  address: Pick<LiveSessionAddress, "hostId" | "sessionId">,
+): string | null {
+  const key = `${address.hostId}\u0000${address.sessionId}`;
+  const control = readSessionControl(
+    snapshot.projection.sessions.get(key)?.ref ?? snapshot.projection.sessionIndex.get(key),
+  );
+  return control === null ? null : presentSessionControl(control).controlReason;
+}
 
 export const TERM_OPEN_COMMAND = "term.open";
 const TERMINAL_IO_FEATURE = "terminal.io";
@@ -30,6 +47,7 @@ const TERMINAL_IO_FEATURE = "terminal.io";
 /** Messages are fixed, plain-language strings — never raw host output. */
 export const MESSAGES = {
   notReady: "This session isn't ready for a shell yet. Try again in a moment.",
+  syncing: "This session is still syncing from the host. Try again in a moment.",
   rejected: "The host didn't accept the shell request. Try again.",
   contested: "Something else is driving this session right now. Try again in a moment.",
   openTimeout: "The host didn't answer in time. Try again.",
@@ -39,7 +57,6 @@ export const MESSAGES = {
   badResult: "The host answered with something this app couldn't use.",
   connectionLost: "The connection dropped. The shell may still be running on the host.",
 } as const;
-
 export type LiveTerminalAvailability =
   | { readonly available: true }
   | {
@@ -97,6 +114,18 @@ export function resolveLiveTerminalAvailability(
       );
     }
   }
+  // Full freshness before ownership: a cached link (unbound target,
+  // incomplete inventory, or a stale warm copy) cannot prove current
+  // session truth, so no shell may open, restore, or restart against it.
+  if (
+    sessionWriteLink(snapshot, address.targetId, address.hostId, address.sessionId) !== "live"
+  ) {
+    return unavailable("transport", MESSAGES.syncing);
+  }
+  // Ownership last among the honest reasons: while another app owns the
+  // session (or the shape is unproven), fail closed with the exact copy.
+  const controlReason = sessionControlGateReason(snapshot, address);
+  if (controlReason !== null) return unavailable("permission", controlReason);
   return { available: true };
 }
 

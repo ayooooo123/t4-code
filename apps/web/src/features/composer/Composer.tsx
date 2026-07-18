@@ -20,6 +20,10 @@ import {
   thinkingLabel,
   type ComposerControlsSnapshot,
 } from "../session-runtime/session-controls.ts";
+import {
+  CACHED_WRITE_REASON,
+  OFFLINE_WRITE_REASON,
+} from "../session-runtime/session-observer.ts";
 import { useWorkspace, workspaceStore } from "../../state/store-instance.ts";
 import { selectSessionView } from "../../state/workspace-store.ts";
 import {
@@ -130,13 +134,14 @@ export function Composer({
   const [menuDismissed, setMenuDismissed] = useState(false);
 
   const disabled = !canPrompt || readOnlyReason !== null;
+  // Freshness copy always wins: a cached/offline surface explains itself
+  // before any view-level read-only (observer/reconciling) policy speaks.
   const disabledReason =
-    readOnlyReason ??
     (link === "cached"
-      ? "This is the last synced copy. Writing resumes when the connection returns."
+      ? CACHED_WRITE_REASON
       : link === "offline"
-        ? "The host is unreachable. Your transcript stays readable; input returns with the host."
-        : null);
+        ? OFFLINE_WRITE_REASON
+        : null) ?? readOnlyReason;
 
   // Slash menu state derives from the draft + caret.
   const slashQuery = disabled ? null : activeSlashQuery(draft, caret);
@@ -243,7 +248,7 @@ export function Composer({
     const text = draft.trim();
     if (text === "" && attachments.length === 0) return;
     if (attachments.length > 0 && !controls.attachmentsSupported) {
-      setRejections([IMAGE_PROMPTS_UNSUPPORTED_REASON]);
+      setRejections([controls.attachmentsUnsupportedReason ?? IMAGE_PROMPTS_UNSUPPORTED_REASON]);
       return;
     }
     if (revisingPlanId !== null) {
@@ -276,6 +281,7 @@ export function Composer({
     draft,
     attachments,
     controls.attachmentsSupported,
+    controls.attachmentsUnsupportedReason,
     turnActive,
     revisingPlanId,
     onCancelRevise,
@@ -292,9 +298,13 @@ export function Composer({
     runSubmission({ kind: "followUp", text }, { text: draft, attachmentIds: [] });
   }, [draft, attachments.length, runSubmission]);
 
+  // While observed/reconciling the gate carries its own reason; the generic
+  // host copy only applies when the host truly lacks image prompts.
+  const attachmentsUnavailableReason =
+    controls.attachmentsUnsupportedReason ?? IMAGE_PROMPTS_UNSUPPORTED_REASON;
   const reportUnsupportedImages = useCallback(() => {
-    setRejections([IMAGE_PROMPTS_UNSUPPORTED_REASON]);
-  }, []);
+    setRejections([attachmentsUnavailableReason]);
+  }, [attachmentsUnavailableReason, setRejections]);
 
   const intake = useCallback(
     (candidates: readonly AttachmentCandidate[]) => {
@@ -540,7 +550,8 @@ export function Composer({
               <TooltipPopup side="top">
                 {controls.attachmentsSupported
                   ? "Attach PNG, JPEG, WebP, or GIF images"
-                  : "This host does not support image prompts yet"}
+                  : (controls.attachmentsUnsupportedReason ??
+                    "This host does not support image prompts yet")}
               </TooltipPopup>
             </Tooltip>
             <ContextMeter usedTokens={contextUsedTokens} windowTokens={contextWindowTokens} />

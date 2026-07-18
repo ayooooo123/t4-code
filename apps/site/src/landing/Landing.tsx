@@ -170,6 +170,29 @@ export function Landing() {
           </div>
         </section>
 
+        <section className="section" aria-labelledby="handoff-title">
+          <div className="container">
+            <h2 id="handoff-title">Start in the terminal, continue in T4</h2>
+            <p className="section-lede">
+              {renderInline(
+                `New in v${RELEASE_VERSION}: a session running as a plain \`omp\` TUI on the host shows up in T4 Code read-only, following along as complete transcript records land on disk. Run \`/continue-in-t4\` in the terminal (or just exit it) and T4 takes over. Input returns only once the transcript is confirmed complete; a live owner is never displaced, and unclear ownership stays read-only instead of guessing.`,
+              )}
+            </p>
+            <figure className="shot">
+              <img
+                src="/screenshots/t4-code-tui-handoff.gif"
+                alt="An OMP TUI session followed in T4 Code: the transcript fills in read-only under an 'Active in another app' banner, /continue-in-t4 runs in the terminal, T4 takes over, and the composer accepts input again."
+                width="800"
+                height="567"
+                loading="lazy"
+              />
+              <figcaption>
+                Following a terminal session live, then taking over with /continue-in-t4.
+              </figcaption>
+            </figure>
+          </div>
+        </section>
+
         <section className="section" aria-labelledby="install-title">
           <div className="container">
             <h2 id="install-title">Install</h2>

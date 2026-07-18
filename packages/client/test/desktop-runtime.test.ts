@@ -73,6 +73,7 @@ class FakeShell implements DesktopShellPort {
   hangRelease = false;
   promptExpiresAt: string | number = "2030-01-01T00:00:00.000Z";
   promptAcquireGate: Promise<void> | undefined;
+  controllerAcquireGate: Promise<void> | undefined;
   bootstrapCalls = 0;
   connectCalls = 0;
   emitWelcomeOnBootstrap: RendererServerFrameEvent | undefined;
@@ -93,6 +94,7 @@ class FakeShell implements DesktopShellPort {
         Object.defineProperty(error, "code", { value: this.rejectLeaseCode, enumerable: true });
         throw error;
       }
+      if (request.intent.command === "controller.lease.acquire" && this.controllerAcquireGate !== undefined) await this.controllerAcquireGate;
       if (request.intent.command === "controller.lease.release" && this.hangRelease) return new Promise<CommandResult & Record<string, unknown>>(() => undefined);
       const base = { targetId: request.targetId, requestId: `${request.targetId}-lease-request`, commandId: `${request.targetId}-lease-command`, accepted: true };
       if (request.intent.command === "controller.lease.release") return base;
@@ -503,6 +505,37 @@ describe("desktop runtime projection", () => {
     expect(shell.commands.filter((command) => command.intent.command === "controller.lease.acquire")).toHaveLength(1);
     expect(shell.commands.at(-1)?.intent).toMatchObject({ hostId: hostId("host-remote"), sessionId: sessionId("session-a"), command: "controller.lease.acquire", expectedRevision: revision("revision-a"), args: { ownerId: "owner-a" } });
   });
+  it("releases a controller lease granted after disconnect and blocks stale dispatch", async () => {
+    const { shell, runtime } = await leaseRuntime(["controller.lease"]);
+    let resolveAcquire!: () => void;
+    shell.controllerAcquireGate = new Promise<void>((resolve) => { resolveAcquire = resolve; });
+    const pending = runtime.commandWithControllerLease("remote", leaseIntent({ message: "stale" }));
+    await Promise.resolve();
+    expect(shell.commands.filter((command) => command.intent.command === "controller.lease.acquire")).toHaveLength(1);
+    shell.emitState({ targetId: "remote", state: "disconnected" });
+    shell.emitState({ targetId: "remote", state: "connected" });
+    resolveAcquire();
+    await expect(pending).rejects.toMatchObject({ code: "stale" });
+    await Promise.resolve();
+    expect(shell.commands.filter((command) => command.intent.command === "session.prompt")).toHaveLength(0);
+    expect(shell.commands.filter((command) => command.intent.command === "controller.lease.release")).toHaveLength(1);
+    expect(runtime.controllerLeaseFor("remote", "host-remote", "session-a", "revision-a")).toBeUndefined();
+  });
+  it("releases a controller lease granted after stop without caching it", async () => {
+    const { shell, runtime } = await leaseRuntime(["controller.lease"]);
+    let resolveAcquire!: () => void;
+    shell.controllerAcquireGate = new Promise<void>((resolve) => { resolveAcquire = resolve; });
+    const pending = runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a");
+    await Promise.resolve();
+    expect(shell.commands.filter((command) => command.intent.command === "controller.lease.acquire")).toHaveLength(1);
+    await runtime.stop();
+    resolveAcquire();
+    await pending;
+    await Promise.resolve();
+    expect(shell.commands.filter((command) => command.intent.command === "controller.lease.release")).toHaveLength(1);
+    expect(runtime.controllerLeaseFor("remote", "host-remote", "session-a", "revision-a")).toBeUndefined();
+    await expect(runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a")).rejects.toMatchObject({ code: "stopped" });
+  });
   it("isolates targets, sessions, and revisions and invalidates on disconnect and epoch change", async () => {
     const { shell, runtime } = await leaseRuntime(["controller.lease"]);
     await runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a");
@@ -646,11 +679,13 @@ describe("desktop runtime projection", () => {
     await Promise.resolve();
     expect(shell.commands.filter((item) => item.intent.command === "prompt.lease.acquire")).toHaveLength(1);
     shell.emitState({ targetId: "remote", state: "disconnected" });
+    shell.emitState({ targetId: "remote", state: "connected" });
     gate.resolve();
-    await command;
+    await expect(command).rejects.toMatchObject({ code: "stale" });
     await Promise.resolve();
     await Promise.resolve();
     expect(shell.commands.filter((item) => item.intent.command === "prompt.lease.release")).toHaveLength(1);
+    expect(shell.commands.filter((item) => item.intent.command === "session.prompt")).toHaveLength(0);
   });
   it("surfaces prompt lease rejection without replaying acquisition", async () => {
     const { shell, runtime } = await leaseRuntime(["prompt.lease"]);

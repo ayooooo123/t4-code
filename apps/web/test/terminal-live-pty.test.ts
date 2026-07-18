@@ -51,6 +51,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import type { LiveSessionAddress } from "../src/platform/live-workspace.ts";
 import { resolveLiveSession, sessionViewId } from "../src/platform/live-workspace.ts";
+import { presentSessionControl } from "../src/features/session-runtime/session-observer.ts";
 import {
   createLivePtySessionFactory,
   resolveLiveTerminalAvailability,
@@ -139,6 +140,29 @@ function sessionSnapshotFrame(revisionValue = "rev-1"): SessionSnapshotFrame {
     entries: [],
   };
 }
+
+/** Full sessions inventory frame carrying ownership truth for SESSION. */
+function sessionsFrame(seq: number, liveState: Record<string, unknown>): Record<string, unknown> {
+  return {
+    v: PROTOCOL_VERSION,
+    type: "sessions",
+    cursor: { epoch: "epoch-1", seq },
+    sessions: [
+      {
+        hostId: HOST,
+        sessionId: SESSION,
+        project: { projectId: "project-1" },
+        revision: "rev-1",
+        title: "Session",
+        status: "active",
+        updatedAt: "2026-07-11T10:00:00Z",
+        liveState,
+      },
+    ],
+  };
+}
+
+const OBSERVER_CONTROL = { mode: "observer", lockStatus: "live", transcript: "live" } as const;
 
 function openResponseFrame(
   requestIdValue: string,
@@ -402,6 +426,9 @@ async function harness(options: HarnessOptions = {}): Promise<Harness> {
     });
   }
   shell.emitFrame({ targetId: TARGET, frame: sessionSnapshotFrame() });
+  // A complete host inventory containing this session: dispatch-time write
+  // freshness requires the indexed ref, not just a bound target.
+  shell.emitFrame({ targetId: TARGET, frame: sessionsFrame(1, { isStreaming: false }) });
   await settle();
   const bridge = createLivePtySessionFactory(
     controller,
@@ -938,5 +965,91 @@ describe("fixture bridge stays untouched", () => {
     const session = bridge.open(openRequest({ terminalId: "tab-fixture" }));
     expect(session).toBeInstanceOf(FixturePtySession);
     expect(() => bridge.open(openRequest({ terminalId: "agent-1" }))).toThrow(/read-only/);
+  });
+});
+
+describe("session ownership gating", () => {
+  const observedReason = presentSessionControl(OBSERVER_CONTROL).controlReason;
+
+  it("refuses to open a shell while another app owns the session", async () => {
+    const h = await harness();
+    h.shell.emitFrame({
+      targetId: TARGET,
+      frame: sessionsFrame(2, { sessionControl: OBSERVER_CONTROL }),
+    });
+    await settle();
+    expect(h.bridge.availability()).toEqual({
+      available: false,
+      kind: "permission",
+      reason: observedReason,
+    });
+    const session = h.bridge.open(openRequest());
+    const events = watch(session);
+    await settle();
+    expect(events.errors).toEqual([{ kind: "permission-denied", message: observedReason }]);
+    expect(h.shell.termOpenRequests()).toHaveLength(0);
+  });
+
+  it("keeps an unrecognized future control shape read-only for shells", async () => {
+    const h = await harness();
+    h.shell.emitFrame({
+      targetId: TARGET,
+      frame: sessionsFrame(2, { sessionControl: { mode: "someday-mode" } }),
+    });
+    await settle();
+    const availability = h.bridge.availability();
+    expect(availability.available).toBe(false);
+    expect(h.bridge.open(openRequest())).toBeDefined();
+    await settle();
+    expect(h.shell.termOpenRequests()).toHaveLength(0);
+  });
+
+  it("gates input dispatch the moment ownership moves mid-session", async () => {
+    const h = await harness();
+    const { session, events } = await openLive(h);
+    h.shell.emitFrame({
+      targetId: TARGET,
+      frame: sessionsFrame(2, { sessionControl: OBSERVER_CONTROL }),
+    });
+    await settle();
+    expect(session.write("echo hi\n")).toBe(true);
+    await settle();
+    expect(h.shell.inputs).toHaveLength(0);
+    expect(events.errors).toEqual([{ kind: "shell-error", message: observedReason }]);
+  });
+
+  it("drops resize and close dispatch while another app owns the session", async () => {
+    const h = await harness();
+    const { session, events } = await openLive(h);
+    h.shell.emitFrame({
+      targetId: TARGET,
+      frame: sessionsFrame(2, { sessionControl: OBSERVER_CONTROL }),
+    });
+    await settle();
+    session.resize(120, 40);
+    await settle();
+    expect(h.shell.resizes).toHaveLength(0);
+    session.kill();
+    await settle();
+    expect(h.shell.closes).toHaveLength(0);
+    expect(events.errors).toEqual([]);
+  });
+
+  it("keeps input, resize, and close flowing once the field clears", async () => {
+    const h = await harness();
+    const { session } = await openLive(h);
+    h.shell.emitFrame({
+      targetId: TARGET,
+      frame: sessionsFrame(2, { sessionControl: OBSERVER_CONTROL }),
+    });
+    await settle();
+    h.shell.emitFrame({ targetId: TARGET, frame: sessionsFrame(3, { isStreaming: false }) });
+    await settle();
+    expect(session.write("echo back\n")).toBe(true);
+    await settle();
+    expect(h.shell.inputs).toHaveLength(1);
+    session.kill();
+    await settle();
+    expect(h.shell.closes).toHaveLength(1);
   });
 });

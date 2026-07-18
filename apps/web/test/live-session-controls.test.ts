@@ -124,6 +124,28 @@ async function startedRuntime(options?: {
       entries: [...(options?.snapshotEntries ?? [])],
     },
   });
+  // Complete session inventory: dispatch-time freshness requires this
+  // session's indexed ref, not just a bound target.
+  shell.emitFrame({
+    targetId: "local",
+    frame: {
+      v: V,
+      type: "sessions",
+      cursor: { epoch: "session-index-1", seq: 1 },
+      sessions: [
+        {
+          hostId: hostId(HOST),
+          sessionId: sessionId(SESSION),
+          project: { projectId: projectId("project-1") },
+          revision: revision("rev-1"),
+          title: "Session",
+          status: "idle",
+          updatedAt: "2026-07-11T10:00:00Z",
+          liveState: { isStreaming: false },
+        },
+      ],
+    },
+  });
   if (options?.skipCatalog !== true) {
     shell.emitFrame({
       targetId: "local",

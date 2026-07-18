@@ -26,6 +26,7 @@ const MIME_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".gif": "image/gif",
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".woff": "font/woff",
@@ -129,11 +130,14 @@ test("offers the Android APK without hiding desktop downloads", async ({ page })
   await expect(androidDownload).toBeVisible();
   await expect(androidDownload).toHaveAttribute(
     "href",
-    "https://github.com/LycaonLLC/t4-code/releases/download/v0.1.21/T4-Code-0.1.21-android.apk",
+    "https://github.com/LycaonLLC/t4-code/releases/download/v0.1.22/T4-Code-0.1.22-android.apk",
   );
   await expect(page.getByRole("link", { name: "Download for Linux" }).first()).toBeVisible();
   await expect(page.getByRole("link", { name: "macOS build" }).first()).toBeVisible();
   await expect(page.getByText("TestFlight coming soon", { exact: true }).first()).toBeVisible();
+  const handoff = page.locator('img[src="/screenshots/t4-code-tui-handoff.gif"]');
+  await handoff.scrollIntoViewIfNeeded();
+  await expect(handoff).toHaveJSProperty("naturalWidth", 800);
 
   const geometry = await page.evaluate(() => ({
     clientWidth: document.documentElement.clientWidth,

@@ -19,6 +19,14 @@ import {
   TurnErrorBanner,
 } from "../composer/panels.tsx";
 import type { SessionIntent } from "../session-runtime/intents.ts";
+import {
+  initialControlAnnouncerState,
+  presentSessionControl,
+  presentSessionControlKind,
+  reduceControlAnnouncement,
+  type ControlAnnouncerState,
+  type SessionControlState,
+} from "../session-runtime/session-observer.ts";
 import { useSessionRuntime } from "../session-runtime/useSessionRuntime.ts";
 import {
   computeStableRows,
@@ -59,6 +67,41 @@ export function FreshnessBadge({ session }: { readonly session: WorkspaceSession
     );
   }
   return null;
+}
+
+/** Subheader ownership badge; mirrors FreshnessBadge, which wins when set. */
+export function SessionOwnershipBadge({ session }: { readonly session: WorkspaceSession }) {
+  if (session.freshness !== "live" || session.control === undefined) return null;
+  if (session.control === "reconciling") {
+    return (
+      <Tooltip>
+        <TooltipTrigger render={<Badge variant="outline">Taking over</Badge>} />
+        <TooltipPopup side="bottom">
+          Input returns once the transcript is confirmed complete.
+        </TooltipPopup>
+      </Tooltip>
+    );
+  }
+  if (session.control === "observer") {
+    return (
+      <Tooltip>
+        <TooltipTrigger render={<Badge variant="outline">Active elsewhere</Badge>} />
+        <TooltipPopup side="bottom">
+          Another app is running this session. You can read along here — run /continue-in-t4 there
+          to move it, or just exit it.
+        </TooltipPopup>
+      </Tooltip>
+    );
+  }
+  // Waiting (quiet owner) or unclear (malformed/unrecognized control): the
+  // badge never claims another app is active — reuse the shared copy source.
+  const presentation = presentSessionControlKind(session.control);
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<Badge variant="outline">{presentation.railLabel}</Badge>} />
+      <TooltipPopup side="bottom">{presentation.composerReason}</TooltipPopup>
+    </Tooltip>
+  );
 }
 
 /** Stable-row derivation hook: unchanged rows keep their references. */
@@ -108,6 +151,46 @@ function SessionActivityAnnouncer({ activity }: { readonly activity: SessionActi
       aria-live="polite"
       className="sr-only"
       data-session-activity-announcer
+      role="status"
+    >
+      {announcement}
+    </p>
+  );
+}
+
+/**
+ * Polite announcements for ownership transitions: entering observer or
+ * reconciling states, and input returning when the field clears. Separate
+ * from the activity announcer so "Working" and "Read-only" never race in
+ * one region. "Input is back" is announced only when a previously observed
+ * or reconciling session reaches a confirmed live AND writable state; a
+ * drop to cached/offline holds the pending transition silently and lets
+ * the freshness copy speak.
+ */
+function SessionControlAnnouncer({
+  control,
+  link,
+  writable,
+}: {
+  readonly control: SessionControlState | null;
+  readonly link: "live" | "cached" | "offline";
+  readonly writable: boolean;
+}) {
+  const stateRef = useRef<ControlAnnouncerState>(initialControlAnnouncerState(control));
+  const [announcement, setAnnouncement] = useState(stateRef.current.lastAnnouncement);
+
+  useEffect(() => {
+    const next = reduceControlAnnouncement(stateRef.current, { control, link, writable });
+    stateRef.current = next.state;
+    if (next.announcement !== null) setAnnouncement(next.announcement);
+  }, [control, link, writable]);
+
+  return (
+    <p
+      aria-atomic="true"
+      aria-live="polite"
+      className="sr-only"
+      data-session-control-announcer
       role="status"
     >
       {announcement}
@@ -178,6 +261,9 @@ export function SessionMain({ session }: SessionMainProps) {
   }, []);
 
   const catchingUp = projection.phase === "resyncing" || projection.phase === "paused";
+  const sessionControl = archived ? null : snapshot.sessionControl;
+  const controlPresentation =
+    sessionControl === null ? null : presentSessionControl(sessionControl);
   const sessionActivity: SessionActivity =
     snapshot.link === "live" && !catchingUp && snapshot.sessionActive
       ? projection.contextMaintenance === null
@@ -187,7 +273,7 @@ export function SessionMain({ session }: SessionMainProps) {
   const showAttention = shouldShowAttention(
     attention,
     revisingPlanId,
-    archived || snapshot.link !== "live" || catchingUp,
+    archived || snapshot.link !== "live" || catchingUp || sessionControl !== null,
   );
 
   const retryIntent = useMemo(() => {
@@ -200,6 +286,12 @@ export function SessionMain({ session }: SessionMainProps) {
   return (
     <div className="relative flex h-full min-h-0 flex-col">
       <SessionActivityAnnouncer activity={sessionActivity} key={session.id} />
+      <SessionControlAnnouncer
+        control={sessionControl}
+        key={`${session.id}:control`}
+        link={snapshot.link}
+        writable={!archived && snapshot.canPrompt}
+      />
       {catchingUp && (
         <div
           className="flex h-7 shrink-0 items-center justify-center gap-2 border-border/60 border-b bg-secondary text-muted-foreground text-xs"
@@ -207,6 +299,22 @@ export function SessionMain({ session }: SessionMainProps) {
         >
           <span aria-hidden="true" className="size-1.5 rounded-full bg-status-working-dot" />
           Catching up — refreshing this transcript from a snapshot
+        </div>
+      )}
+      {controlPresentation !== null && (
+        <div
+          className="flex min-h-9 shrink-0 items-center justify-center gap-2 border-border/60 border-b bg-secondary px-3 text-center text-muted-foreground text-xs"
+          data-session-control-banner={sessionControl?.mode}
+          role="status"
+        >
+          {controlPresentation.bannerBusy && (
+            <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-status-working-dot" />
+          )}
+          <span>
+            <span className="font-medium text-foreground">{controlPresentation.bannerTitle}</span>
+            {" · "}
+            {controlPresentation.bannerDetail}
+          </span>
         </div>
       )}
       {archived && (
@@ -274,6 +382,7 @@ export function SessionMain({ session }: SessionMainProps) {
               onCancelRevise={() => setRevisingPlanId(null)}
               onIntent={onIntent}
               queuedFollowUps={snapshot.queuedFollowUps}
+              readOnlyReason={controlPresentation?.composerReason ?? null}
               revisingPlanId={revisingPlanId}
               sessionId={session.id}
               slashCommands={snapshot.slashCommands}

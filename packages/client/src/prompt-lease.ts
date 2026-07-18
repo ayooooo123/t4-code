@@ -105,6 +105,25 @@ export class PromptLeaseStore {
     }
   }
 
+  /** Cached lease id for one session, if a valid entry exists right now. */
+  leaseIdFor(targetId: string, hostId: string, sessionId: string, generation: number): string | undefined {
+    return this.entries.get(sessionKey(targetId, hostId, sessionId, generation))?.lease?.leaseId;
+  }
+
+  /**
+   * Best-effort release of one session's cached lease after a pre-dispatch
+   * gate failure. A preexisting lease (matching `unlessLeaseId`) survives —
+   * only a newly acquired lease is torn down.
+   */
+  invalidateSession(targetId: string, hostId: string, sessionId: string, generation: number, unlessLeaseId?: string): void {
+    const key = sessionKey(targetId, hostId, sessionId, generation);
+    const entry = this.entries.get(key);
+    if (entry === undefined) return;
+    if (unlessLeaseId !== undefined && entry.lease?.leaseId === unlessLeaseId) return;
+    this.entries.delete(key);
+    void this.releaseEntry(entry);
+  }
+
   async close(): Promise<void> {
     const entries = [...this.entries.values()];
     this.entries.clear();

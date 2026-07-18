@@ -41,6 +41,7 @@ import {
   isRelativeCwd,
   parseTerminalIdFrom,
   resolveLiveTerminalAvailability,
+  sessionControlGateReason,
   shellFieldAdvertised,
   termOpenCatalogItem,
   type LiveTerminalAvailability,
@@ -53,6 +54,8 @@ export {
   resolveLiveTerminalAvailability,
 } from "./live-pty-policy.ts";
 export { type LivePtyBridgeOptions, type LivePtyBridge, type OpenCorrelation } from "./live-pty-policy.ts";
+import { sessionWriteLink } from "../session-runtime/session-inventory.ts";
+import { WriteGateError } from "../session-runtime/session-observer.ts";
 import {
   createTerminalFrameRouter,
   type TerminalWireIdentity,
@@ -157,6 +160,26 @@ class LivePtySession implements PtySession {
     return snapshot.connections.get(this.context.address.targetId) === "connected";
   }
 
+  /**
+   * Fail-closed recheck run immediately before every terminal dispatch
+   * (input, resize, close): full link freshness first (offline connection,
+   * unbound target, incomplete inventory, or a stale warm copy), then the
+   * strict session-ownership reader. Null means this dispatch may leave.
+   */
+  private dispatchGate(): PtyError | null {
+    const snapshot = this.context.snapshot();
+    const { targetId, hostId, sessionId } = this.context.address;
+    const link = sessionWriteLink(snapshot, targetId, hostId, sessionId);
+    if (link === "offline") {
+      return { kind: "shell-error", message: MESSAGES.connectionLost };
+    }
+    if (link === "cached") {
+      return { kind: "shell-error", message: MESSAGES.syncing };
+    }
+    const reason = sessionControlGateReason(snapshot, this.context.address);
+    return reason === null ? null : { kind: "shell-error", message: reason };
+  }
+
   private async openNow(request: PtyOpenRequest): Promise<void> {
     // Let the store attach its listeners before anything can fire.
     await Promise.resolve();
@@ -194,6 +217,12 @@ class LivePtySession implements PtySession {
           expectedRevision: revisionValue,
           args,
         },
+        undefined,
+        () => {
+          // Re-read after the controller-lease acquisition wait.
+          const raced = this.dispatchGate();
+          if (raced !== null) throw new WriteGateError(raced.message);
+        },
       );
       if (!commandResult.accepted) {
         this.context.endOpen(this, null);
@@ -203,6 +232,10 @@ class LivePtySession implements PtySession {
       accepted = { requestId: String(commandResult.requestId) };
     } catch (error) {
       this.context.endOpen(this, null);
+      if (error instanceof WriteGateError) {
+        this.fail({ kind: "shell-error", message: error.reason });
+        return;
+      }
       // A lease refusal happens before the command is sent — that is a
       // clean, retryable rejection, not an unknown outcome.
       const contested =
@@ -311,8 +344,20 @@ class LivePtySession implements PtySession {
     this.inputChain = this.inputChain.then(async () => {
       try {
         if (this.phase === "open") {
+          const gate = this.dispatchGate();
+          if (gate !== null) {
+            this.fail(gate);
+            return;
+          }
           if (!(await this.ensureLease()) || this.phase !== "open" || this.serverTerminalId !== terminalId) {
             this.fail({ kind: "shell-error", message: MESSAGES.contested });
+            return;
+          }
+          // Re-read after the lease acquisition wait, immediately before
+          // the input frame leaves.
+          const raced = this.dispatchGate();
+          if (raced !== null) {
+            this.fail(raced);
             return;
           }
           try {
@@ -355,7 +400,11 @@ class LivePtySession implements PtySession {
         const next = this.pendingResize;
         this.pendingResize = null;
         try {
+          // Ownership can move between user resizes; a gated resize simply
+          // drops — the next writable resize carries fresh truth.
+          if (this.dispatchGate() !== null) return;
           if (!(await this.ensureLease()) || this.phase !== "open" || this.serverTerminalId === null) return;
+          if (this.dispatchGate() !== null) return;
           await this.context.controller.terminalResize({
             ...this.sessionScope(),
             terminalId: this.serverTerminalId,
@@ -392,7 +441,9 @@ class LivePtySession implements PtySession {
 
   private async sendClose(reason: string): Promise<void> {
     const terminalId = this.serverTerminalId;
-    if (terminalId === null || !(await this.ensureLease()) || this.phase !== "closed" || this.serverTerminalId !== terminalId) return;
+    if (terminalId === null || this.dispatchGate() !== null) return;
+    if (!(await this.ensureLease()) || this.phase !== "closed" || this.serverTerminalId !== terminalId) return;
+    if (this.dispatchGate() !== null) return;
     try {
       await this.context.controller.terminalClose({
         ...this.sessionScope(),

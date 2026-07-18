@@ -78,6 +78,8 @@ export interface ComposerControlsSnapshot {
   readonly mode: SessionMode | null;
   /** The host negotiated the bounded `prompt.images` upload protocol. */
   readonly attachmentsSupported: boolean;
+  /** Why attaching gates right now; null falls back to the generic host copy. */
+  readonly attachmentsUnsupportedReason: string | null;
   /** Which control has a command in flight; the UI holds, never lies. */
   readonly pendingControl: PendingControl | null;
   /** Bounded message from the last failed control command. */
@@ -502,6 +504,7 @@ export function deriveComposerControls(input: DeriveControlsInput): ComposerCont
     mode: null,
     attachmentsSupported:
       granted.includes("sessions.prompt") && granted.includes("prompt.images"),
+    attachmentsUnsupportedReason: null,
     pendingControl,
     controlError,
   };
