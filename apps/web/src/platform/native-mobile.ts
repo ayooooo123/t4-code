@@ -445,7 +445,8 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
       const result = await plugin.getCredentials({ hostKey: backend.origin, migrateLegacy: false });
       if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
     } catch {
-      await plugin.clearCredentials({ hostKey: backend.origin }).catch(() => undefined);
+      applyProjectedNativeConnection(backend, null);
+      return { kind: "ready", backend };
     }
   }
 

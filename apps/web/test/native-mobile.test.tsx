@@ -423,6 +423,58 @@ describe("native mobile connection", () => {
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
   });
 
+  it("migrates peer-active legacy credentials at the legacy scope and discards them from the peer projection", async () => {
+    const storage = new MemoryStorage();
+    const legacy = parseTailnetBackend("https://legacy.tailnet.ts.net:8445");
+    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(TEST_PEER));
+    storage.setItem("t4-code:mobile-backend:v1", JSON.stringify(legacy));
+    const reads: unknown[] = [];
+    installNativeWindow(storage, {
+      getCredentials: (options: unknown) => {
+        reads.push(options);
+        return Promise.resolve({ credentials: {
+          deviceId: "legacy-device",
+          deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        } });
+      },
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: () => Promise.resolve(),
+    });
+
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend: TEST_PEER });
+    expect(reads).toEqual([{ hostKey: legacy.origin, migrateLegacy: true }]);
+    expect(window.__t4MobileBackend).toBeUndefined();
+    expect(window.__t4MobilePeerInvite).toBe(TEST_PEER.invite);
+    expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBeNull();
+    expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
+    expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).not.toBeNull();
+  });
+
+  it.each(["rejection", "invalid"] as const)(
+    "preserves exact v2-only Tailscale bytes and never clears after plugin %s",
+    async (failure) => {
+      const storage = new MemoryStorage();
+      const backend = parseTailnetBackend("https://active.tailnet.ts.net:8445");
+      const v2Raw = JSON.stringify({ version: 2, activeOrigin: backend.origin, backends: [backend] });
+      storage.setItem(MOBILE_BACKEND_STORAGE_KEY, v2Raw);
+      let clears = 0;
+      installNativeWindow(storage, {
+        getCredentials: () => failure === "rejection"
+          ? Promise.reject(new Error("private plugin failure"))
+          : Promise.resolve({ credentials: { deviceId: "", deviceToken: "invalid" } }),
+        setCredentials: () => Promise.resolve(),
+        clearCredentials: () => { clears += 1; return Promise.resolve(); },
+      });
+
+      await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+      expect(window.__t4MobileBackend).toEqual({ origin: backend.origin, wsUrl: backend.wsUrl, label: backend.label });
+      expect(storage.getItem("t4-code:mobile-backend:v1")).toBeNull();
+      expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
+      expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBeNull();
+      expect(clears).toBe(0);
+    },
+  );
+
   it("returns controlled repair for pending Tailscale when secure storage is absent without changing bytes", async () => {
     const storage = new MemoryStorage();
     const backend = parseTailnetBackend("https://legacy.tailnet.ts.net:8445");
@@ -483,6 +535,60 @@ describe("native mobile connection", () => {
     expect(secureCalls).toBe(0);
     expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
     expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
+    expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
+  });
+
+  it("treats existing v3 plus matching legacy as authoritative without secure calls or cleanup", async () => {
+    const storage = new TrackingMemoryStorage();
+    const backend = parseTailnetBackend("https://matching.tailnet.ts.net:8445");
+    const v3Raw = JSON.stringify({
+      version: 3,
+      activeHostId: "host_AAAAAAAAAAA",
+      hosts: [{
+        id: "host_AAAAAAAAAAA", label: backend.label,
+        transports: [{ id: "tail_AAAAAAAAAAA", kind: "tailscale", origin: backend.origin, wsUrl: backend.wsUrl, displayAddress: backend.origin, credentialScopeKey: backend.origin }],
+        preferredTransportIds: ["tail_AAAAAAAAAAA"], lastConnection: null,
+      }],
+    });
+    const legacyRaw = JSON.stringify(backend);
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, v3Raw);
+    storage.setItem("t4-code:mobile-backend:v1", legacyRaw);
+    storage.operations.length = 0;
+    let secureCalls = 0;
+    installNativeWindow(storage, {
+      getCredentials: () => { secureCalls += 1; return Promise.resolve({ credentials: null }); },
+      setCredentials: () => Promise.resolve(),
+      clearCredentials: () => { secureCalls += 1; return Promise.resolve(); },
+    });
+
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expect(secureCalls).toBe(0);
+    expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
+    expect(storage.getItem("t4-code:mobile-backend:v1")).toBe(legacyRaw);
+    expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
+  });
+
+  it("treats existing v3 plus remaining v2 as authoritative after partial cleanup", async () => {
+    const storage = new TrackingMemoryStorage();
+    const backend = parseTailnetBackend("https://partial.tailnet.ts.net:8445");
+    const v3Raw = JSON.stringify({
+      version: 3,
+      activeHostId: "host_AAAAAAAAAAA",
+      hosts: [{
+        id: "host_AAAAAAAAAAA", label: backend.label,
+        transports: [{ id: "tail_AAAAAAAAAAA", kind: "tailscale", origin: backend.origin, wsUrl: backend.wsUrl, displayAddress: backend.origin, credentialScopeKey: backend.origin }],
+        preferredTransportIds: ["tail_AAAAAAAAAAA"], lastConnection: null,
+      }],
+    });
+    const v2Raw = JSON.stringify({ version: 2, activeOrigin: backend.origin, backends: [backend] });
+    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, v3Raw);
+    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, v2Raw);
+    storage.operations.length = 0;
+    installNativeWindow(storage);
+
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expect(storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY)).toBe(v3Raw);
+    expect(storage.getItem(MOBILE_BACKEND_STORAGE_KEY)).toBe(v2Raw);
     expect(storage.operations.every((operation) => !operation.startsWith("remove:"))).toBe(true);
   });
 
