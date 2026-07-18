@@ -4,8 +4,10 @@ import { createServer as createNetServer, type Server, type Socket } from "node:
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
+import { RemoteWebSocketTransport } from "../src/remote-runtime/transport.ts";
 import { resolveUnixSocketPath, UnixWebSocketTransport } from "../src/transport.ts";
 
 const describeUnix = process.platform === "linux" || process.platform === "darwin" ? describe : (_name: string, _fn: () => void): void => {};
@@ -73,6 +75,32 @@ describeUnix("Unix socket ownership and resolution", () => {
       chmodSync(backingPath, 0o600);
       symlinkSync(backingName, publicPath);
       await transport.open();
+    } finally {
+      transport.close();
+      await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an OMP snapshot frame larger than one MiB", async () => {
+    const directory = fixtureDirectory();
+    const socketPath = join(directory, "large-snapshot.sock");
+    const httpServer = createHttpServer();
+    const webSocketServer = new WebSocketServer({ server: httpServer });
+    const payload = "x".repeat(1_048_576 + 1_024);
+    webSocketServer.on("connection", (socket) => socket.send(payload));
+    const transport = new UnixWebSocketTransport({ socketPath, validatePath: false });
+    const received = new Promise<string>((resolve, reject) => {
+      transport.onMessage((data) => resolve(typeof data === "string" ? data : Buffer.from(data).toString()));
+      transport.onError(() => reject(new Error("transport rejected the snapshot frame")));
+      transport.onClose(() => reject(new Error("transport closed before delivering the snapshot frame")));
+    });
+    try {
+      httpServer.listen(socketPath);
+      await once(httpServer, "listening");
+      await transport.open();
+      expect(await received).toHaveLength(payload.length);
     } finally {
       transport.close();
       await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
@@ -171,6 +199,43 @@ describeUnix("Unix socket ownership and resolution", () => {
     } finally {
       await closeServer(server);
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("remote WebSocket transport", () => {
+  it("accepts an OMP snapshot frame larger than one MiB", async () => {
+    const httpServer = createHttpServer();
+    const webSocketServer = new WebSocketServer({ server: httpServer });
+    const payload = "x".repeat(1_048_576 + 1_024);
+    webSocketServer.on("connection", (socket) => socket.send(payload));
+    httpServer.listen(0, "127.0.0.1");
+    await once(httpServer, "listening");
+    const port = (httpServer.address() as AddressInfo).port;
+    const transport = new RemoteWebSocketTransport({
+      target: {
+        targetId: "test-remote",
+        label: "Test remote",
+        mode: "direct",
+        address: "127.0.0.1",
+        port,
+        requestedCapabilities: [],
+        grantedCapabilities: [],
+        status: "unknown",
+      },
+    });
+    const received = new Promise<string>((resolve, reject) => {
+      transport.onMessage((data) => resolve(typeof data === "string" ? data : Buffer.from(data).toString()));
+      transport.onError(() => reject(new Error("transport rejected the snapshot frame")));
+      transport.onClose(() => reject(new Error("transport closed before delivering the snapshot frame")));
+    });
+    try {
+      await transport.open();
+      expect(await received).toHaveLength(payload.length);
+    } finally {
+      transport.close();
+      await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     }
   });
 });

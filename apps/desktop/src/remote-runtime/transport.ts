@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import type { OmpTransport } from "@t4-code/client";
+import { MAX_INBOUND_BYTES, type OmpTransport } from "@t4-code/client";
 import type { RemoteTargetRecord } from "./registry.ts";
 
 export interface RemoteWebSocketTransportOptions {
@@ -9,7 +9,7 @@ export interface RemoteWebSocketTransportOptions {
   readonly maxQueuedBytes?: number;
 }
 
-const MAX_PAYLOAD = 1_048_576;
+const MAX_OUTBOUND_PAYLOAD_BYTES = 1_048_576;
 
 function endpoint(target: RemoteTargetRecord): string {
   if (target.mode === "serve") {
@@ -41,14 +41,14 @@ export class RemoteWebSocketTransport implements OmpTransport {
     this.url = endpoint(options.target);
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     this.idleTimeoutMs = options.idleTimeoutMs ?? 60_000;
-    this.maxQueuedBytes = options.maxQueuedBytes ?? MAX_PAYLOAD;
+    this.maxQueuedBytes = options.maxQueuedBytes ?? MAX_OUTBOUND_PAYLOAD_BYTES;
   }
 
   open(): Promise<void> {
     if (this.closed) return Promise.reject(new Error("remote transport is closed"));
     const generation = ++this.generation;
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-    const socket = new WebSocket(this.url, { perMessageDeflate: false, maxPayload: MAX_PAYLOAD, handshakeTimeout: this.handshakeTimeoutMs });
+    const socket = new WebSocket(this.url, { perMessageDeflate: false, maxPayload: MAX_INBOUND_BYTES, handshakeTimeout: this.handshakeTimeoutMs });
     this.socket = socket;
     const timer = setTimeout(() => {
       if (generation === this.generation && socket.readyState === WebSocket.CONNECTING) socket.terminate();
@@ -95,7 +95,7 @@ export class RemoteWebSocketTransport implements OmpTransport {
 
   send(data: string): void {
     const bytes = Buffer.byteLength(data, "utf8");
-    if (bytes > MAX_PAYLOAD || this.queuedBytes + bytes > this.maxQueuedBytes) throw new Error("remote transport send queue is full");
+    if (bytes > MAX_OUTBOUND_PAYLOAD_BYTES || this.queuedBytes + bytes > this.maxQueuedBytes) throw new Error("remote transport send queue is full");
     const socket = this.socket;
     if (socket?.readyState === WebSocket.OPEN) { socket.send(data); return; }
     if (this.closed) throw new Error("remote transport is closed");
