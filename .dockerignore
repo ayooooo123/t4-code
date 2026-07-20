@@ -1,6 +1,8 @@
 .git
 .gitignore
 .cluster-ci
+.cluster-ci/registry-auth
+**/.cluster-ci/registry-auth
 artifacts
 **/artifacts
 node_modules

@@ -20,12 +20,26 @@ import {
   validateDefaultOffRender,
 } from "./readonly-cluster-proof.mjs";
 import { HARBOR_REGISTRY_ALIASES, normalizeRegistryAuth } from "./normalize-registry-auth.mjs";
+import { provenanceVerificationMode, verifyProvenance, verifySpdx, vulnerabilityCounts } from "./assemble-image-manifest.mjs";
+import { trustedProofUrl } from "./assemble-proof.mjs";
+import { clusterWebSocketUrl } from "./capture-redacted-frames.mjs";
 
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const FILE_SHA = "b".repeat(64);
 const OBSERVED_AT = "2026-07-20T12:34:56.000Z";
 const repoRoot = resolve(import.meta.dirname, "../..");
+const OBSERVATION_HOSTS = {
+  woodpecker: "woodpecker-ci-dev.tailb18de3.ts.net",
+  prometheus: "interview-responder-prometheus.tailb18de3.ts.net",
+  loki: "interview-responder-loki.tailb18de3.ts.net",
+  grafana: "grafana.tailb18de3.ts.net",
+};
+const CONTRACT_SCENARIOS = new Set(["wire-reconnect-idempotency", "gui-auth-isolation", "desktop-viewport", "mobile-viewport"]);
+const CLUSTER_VALIDATION = {
+  now: Date.parse(OBSERVED_AT),
+  ciMapping: { repositoryId: "71", ref: "refs/heads/agent/t4-cluster-operator", commit: COMMIT },
+};
 
 function fileEvidence(path) {
   return { path: `artifacts/cluster-proof/${path}`, sha256: FILE_SHA };
@@ -46,7 +60,7 @@ function validProof() {
         repositoryId: 71,
         pipelineId: 401,
         pipelineNumber: 99,
-        url: "https://woodpecker.example.test/repos/71/pipeline/99",
+        url: "https://woodpecker-ci-dev.tailb18de3.ts.net/repos/71/pipeline/99",
       },
     },
     images: IMAGE_COMPONENTS.map((component) => {
@@ -58,7 +72,7 @@ function validProof() {
         digest: DIGEST,
         reference: `${repository}@${DIGEST}`,
         sbom: fileEvidence(`images/${component}.spdx.json`),
-        provenance: fileEvidence(`images/${component}.provenance.json`),
+        provenance: { ...fileEvidence(`images/${component}.provenance.json`), mode: "buildkit-content", signatureVerified: false },
         vulnerability: {
           ...fileEvidence(`images/${component}.trivy.json`),
           scanner: "trivy",
@@ -70,6 +84,7 @@ function validProof() {
     scenarios: PROOF_SCENARIOS.map((id) => ({
       id,
       status: "passed",
+      evidenceType: CONTRACT_SCENARIOS.has(id) ? "contract" : "live",
       observedAt: OBSERVED_AT,
       assertions: [`${id}.observable-contract`],
       evidence: [fileEvidence(`scenarios/${id}.json`)],
@@ -77,40 +92,51 @@ function validProof() {
     observations: OBSERVATION_SYSTEMS.map((system, index) => ({
       system,
       observedAt: OBSERVED_AT,
-      url: `https://${system}.example.test/evidence/${index + 1}`,
+      url: system === "kubernetes" ? null : `https://${OBSERVATION_HOSTS[system]}/`,
       ids: [`${system}-${index + 1}`],
       evidence: fileEvidence(`observations/${system}.json`),
     })),
     artifacts: {
       frames: [
-        { ...fileEvidence("frames/omp-app.json"), redacted: true },
+        { ...fileEvidence("frames/omp-app.json"), redacted: true, evidenceType: "live" },
       ],
       screenshots: [
-        { ...fileEvidence("screenshots/desktop.png"), redacted: true, viewport: "desktop" },
-        { ...fileEvidence("screenshots/mobile.png"), redacted: true, viewport: "mobile" },
-      ],
-      videos: [
-        { ...fileEvidence("videos/desktop.webm"), redacted: true, viewport: "desktop" },
-        { ...fileEvidence("videos/mobile.webm"), redacted: true, viewport: "mobile" },
+        { ...fileEvidence("screenshots/desktop.png"), redacted: true, evidenceType: "contract", viewport: "desktop" },
+        { ...fileEvidence("screenshots/mobile.png"), redacted: true, evidenceType: "contract", viewport: "mobile" },
       ],
     },
   };
 }
 
 function liveClusterResponses() {
+  const workloadImage = `harbor.tailb18de3.ts.net/linkedin-bot/workload@${DIGEST}`;
+  const labels = (component) => ({
+    "app.kubernetes.io/name": "t4-cluster",
+    "app.kubernetes.io/part-of": "t4-cluster",
+    "app.kubernetes.io/component": component,
+  });
+  const workloadPod = (name, component, container) => ({
+    metadata: { name, labels: labels(component) },
+    spec: { nodeName: "k3s-worker-01" },
+    status: {
+      phase: "Running",
+      conditions: [{ type: "Ready", status: "True" }],
+      containerStatuses: [{ name: container, image: workloadImage, imageID: `containerd://${workloadImage}`, ready: true }],
+    },
+  });
   return {
     deployments: {
       items: [
         {
-          metadata: { name: "t4-cluster-controller" },
+          metadata: { name: "t4-cluster-controller", generation: 4, labels: labels("controller") },
           spec: {
             replicas: 2,
-            strategy: { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 0 } },
+            strategy: { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 1 } },
           },
           status: { observedGeneration: 4, availableReplicas: 2 },
         },
         {
-          metadata: { name: "t4-cluster-server" },
+          metadata: { name: "t4-cluster-server", generation: 6, labels: labels("server") },
           spec: {
             replicas: 3,
             strategy: { type: "RollingUpdate", rollingUpdate: { maxUnavailable: 0 } },
@@ -119,16 +145,13 @@ function liveClusterResponses() {
         },
       ],
     },
-    leases: {
-      items: [
-        {
-          metadata: { name: "t4-cluster-controller" },
-          spec: { holderIdentity: "controller-7cbbc8-x7v2k", renewTime: OBSERVED_AT },
-        },
-      ],
+    lease: {
+      metadata: { name: "t4-cluster-operator.cluster.t4.dev" },
+      spec: { holderIdentity: "t4-cluster-controller-7cbbc8-x7v2k", renewTime: OBSERVED_AT },
     },
     customresourcedefinitions: {
       items: ["t4clusterhosts", "t4workspaces", "t4sessions"].map((plural) => ({
+        metadata: { name: `${plural}.cluster.t4.dev` },
         spec: {
           group: "cluster.t4.dev",
           scope: "Namespaced",
@@ -138,34 +161,39 @@ function liveClusterResponses() {
       })),
     },
     t4clusterhosts: {
-      items: [{ metadata: { name: "development" }, status: { observedGeneration: 2 } }],
+      items: [{ metadata: { name: "development", generation: 2 }, status: { observedGeneration: 2 } }],
     },
     t4workspaces: {
       items: [
         {
-          metadata: { name: "proof-workspace" },
+          metadata: { name: "proof-workspace", generation: 3 },
           spec: { retentionPolicy: "Retain" },
-          status: {
-            observedGeneration: 3,
-            pvcRef: { name: "proof-workspace" },
-            phase: "Ready",
-          },
+          status: { observedGeneration: 3, pvcName: "proof-workspace-data", phase: "Ready" },
         },
       ],
     },
     t4sessions: {
       items: [
         {
-          metadata: { name: "proof-session" },
-          spec: { workspaceRef: "proof-workspace" },
-          status: { observedGeneration: 5, phase: "Running" },
+          metadata: { name: "proof-session", generation: 5 },
+          spec: {
+            workspaceRef: "proof-workspace",
+            ci: { repositoryId: "71", ref: "refs/heads/agent/t4-cluster-operator", commit: COMMIT },
+          },
+          status: { observedGeneration: 5, phase: "Running", podName: "t4-session-proof-session" },
         },
       ],
     },
     persistentvolumeclaims: {
       items: [
         {
-          metadata: { name: "proof-workspace" },
+          metadata: {
+            name: "proof-workspace-data",
+            labels: {
+              "app.kubernetes.io/part-of": "t4-cluster",
+              "cluster.t4.dev/workspace": "proof-workspace",
+            },
+          },
           spec: { accessModes: ["ReadWriteMany"], storageClassName: "t4-workspaces-rwx" },
           status: { phase: "Bound", capacity: { storage: "20Gi" } },
         },
@@ -173,18 +201,32 @@ function liveClusterResponses() {
     },
     pods: {
       items: [
+        workloadPod("t4-cluster-controller-a", "controller", "controller"),
+        workloadPod("t4-cluster-server-a", "server", "server"),
+        workloadPod("t4-cluster-server-b", "server", "server"),
         {
-          metadata: { name: "t4-session-proof-session", labels: { "cluster.t4.dev/session": "proof-session" } },
+          metadata: {
+            name: "t4-session-proof-session",
+            labels: {
+              "app.kubernetes.io/name": "t4-session-runtime",
+              "app.kubernetes.io/part-of": "t4-cluster",
+              "cluster.t4.dev/session": "t4-session-proof-session",
+            },
+          },
           spec: { nodeName: "k3s-worker-01" },
-          status: { phase: "Running" },
+          status: {
+            phase: "Running",
+            conditions: [{ type: "Ready", status: "True" }],
+            containerStatuses: [{ name: "session-runtime", image: workloadImage, imageID: `containerd://${workloadImage}`, ready: true }],
+          },
         },
       ],
     },
     services: {
       items: [
         {
-          metadata: { name: "t4-cluster-server" },
-          spec: { ports: [{ name: "omp-app", port: 8080 }, { name: "admin", port: 9090 }] },
+          metadata: { name: "t4-cluster-server", labels: labels("server") },
+          spec: { ports: [{ name: "websocket", port: 8080 }, { name: "admin", port: 9090 }] },
         },
       ],
     },
@@ -237,6 +279,11 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.deepEqual(steps["build-controller"].depends_on, ["harbor-auth"]);
   assert.deepEqual(steps["live-cluster-observations"].depends_on, ["cleanup-image-registry-auth"]);
   assert.deepEqual(steps["publish-live-proof"].depends_on, ["harbor-auth-live-proof"]);
+  assert.deepEqual(steps["image-publication-manifest"].depends_on, ["provenance-session-runtime"]);
+  assert.deepEqual(steps["promote-images"].depends_on, ["image-publication-manifest"]);
+  assert.deepEqual(steps["publish-image-evidence"].depends_on, ["promote-images"]);
+  assert.equal(steps["image-publication-manifest"].environment.HARBOR_REGISTRY, "harbor.tailb18de3.ts.net");
+  assert.match(pipeline.clone.git.image, /@sha256:[0-9a-f]{64}$/u);
 
   const orderedBuilds = ["build-controller", "build-cluster-server", "build-session-runtime"];
   for (const [index, name] of orderedBuilds.entries()) {
@@ -249,14 +296,56 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.match(steps["build-cluster-server"].commands[0], /t4-cluster-server/u);
   assert.match(steps["build-session-runtime"].commands[0], /t4-session-runtime/u);
 
-  for (const script of ["build-image.sh", "capture-image-evidence.sh", "publish-artifact.sh"]) {
+  for (const [name, step] of Object.entries(steps)) {
+    assert.match(step.image, /@sha256:[0-9a-f]{64}$/u, `${name} image must be immutable`);
+    if (step.environment?.HARBOR_REGISTRY) {
+      assert.equal(step.environment.HARBOR_REGISTRY, "harbor.tailb18de3.ts.net");
+    }
+    for (const condition of step.when ?? []) {
+      if (condition.event === "manual") {
+        assert.deepEqual(condition.branch, ["main", "agent/t4-cluster-operator"]);
+      }
+    }
+  }
+  assert.deepEqual(steps["cleanup-image-registry-auth"].when[0].status, ["success", "failure"]);
+  assert.deepEqual(steps["cleanup-live-registry-auth"].when[0].status, ["success", "failure"]);
+  assert.deepEqual(steps["live-frame-proof"].commands, ["node scripts/cluster-ci/capture-redacted-frames.mjs"]);
+  assert.deepEqual(steps["live-proof-assembly"].depends_on, ["live-frame-proof"]);
+  const frameCaptureSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/capture-redacted-frames.mjs"), "utf8");
+  assert.doesNotMatch(frameCaptureSource, /client.?secret|deviceId|access.?token/iu);
+  for (const capability of ["sessions.read", "ci.trigger", "preview.read", "preview.control", "preview.input"]) {
+    assert.match(frameCaptureSource, new RegExp(capability.replace(".", "\\."), "u"));
+  }
+  assert.match(frameCaptureSource, /\/v1\/ws/u);
+
+  const buildSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/build-image.sh"), "utf8");
+  assert.match(buildSource, /platform=linux\/amd64,linux\/arm64/u);
+  assert.match(buildSource, /quarantine/u);
+  const provenanceSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/capture-image-evidence.sh"), "utf8");
+  assert.match(provenanceSource, /cosign verify-attestation/u);
+  assert.match(provenanceSource, /cosign download attestation/u);
+  assert.match(provenanceSource, /must be configured together/u);
+  assert.doesNotMatch(provenanceSource, /INSECURE|plain-http/iu);
+  const dockerignore = await readFile(resolve(repoRoot, ".dockerignore"), "utf8");
+  assert.match(dockerignore, /^\.cluster-ci\/registry-auth$/mu);
+  assert.deepEqual(provenanceVerificationMode({}), { mode: "buildkit-content", signatureVerified: false });
+  assert.deepEqual(
+    provenanceVerificationMode({ T4_COSIGN_CERTIFICATE_IDENTITY: "builder", T4_COSIGN_CERTIFICATE_OIDC_ISSUER: "https://issuer.example" }),
+    { mode: "cosign-keyless", signatureVerified: true },
+  );
+  assert.throws(
+    () => provenanceVerificationMode({ T4_COSIGN_CERTIFICATE_IDENTITY: "builder" }),
+    /configured together/u,
+  );
+
+  for (const script of ["build-image.sh", "capture-image-evidence.sh", "promote-images.sh", "publish-artifact.sh"]) {
     const source = await readFile(resolve(repoRoot, "scripts/cluster-ci", script), "utf8");
     assert.doesNotMatch(source, /HARBOR_(?:USERNAME|PASSWORD)/u);
     assert.match(source, /DOCKER_CONFIG/u);
   }
 });
 
-test("registry auth is restricted to the fixed internal and tailnet Harbor aliases", () => {
+test("registry auth is restricted to the exact HTTPS tailnet Harbor aliases", () => {
   const auth = "dXNlcjpwYXNz";
   const normalized = normalizeRegistryAuth({
     auths: {
@@ -279,7 +368,7 @@ test("proof schema is strict and enumerates every bounded evidence domain", asyn
   assert.deepEqual(schema.$defs.observation.properties.system.enum, OBSERVATION_SYSTEMS);
   assert.deepEqual(schema.$defs.image.properties.component.enum, IMAGE_COMPONENTS);
   assert.equal(schema.$defs.artifacts.properties.frames.maxItems, 32);
-  assert.equal(schema.$defs.artifacts.properties.videos.maxItems, 8);
+  assert.equal("videos" in schema.$defs.artifacts.properties, false);
 });
 
 test("proof validation accepts exact run/image/scenario identity and rejects fabricated gaps", () => {
@@ -301,6 +390,18 @@ test("proof validation accepts exact run/image/scenario identity and rejects fab
   const unredacted = structuredClone(proof);
   unredacted.artifacts.frames[0].redacted = false;
   assert.throws(() => validateProofManifest(unredacted), /redacted/u);
+
+  const fabricatedLiveScreenshot = structuredClone(proof);
+  fabricatedLiveScreenshot.artifacts.screenshots[0].evidenceType = "live";
+  assert.throws(() => validateProofManifest(fabricatedLiveScreenshot), /contract evidence/u);
+
+  const fabricatedLiveScenario = structuredClone(proof);
+  fabricatedLiveScenario.scenarios.find(({ id }) => id === "desktop-viewport").evidenceType = "live";
+  assert.throws(() => validateProofManifest(fabricatedLiveScenario), /must be contract/u);
+
+  const unauthenticatedSignerClaim = structuredClone(proof);
+  unauthenticatedSignerClaim.images[0].provenance.mode = "cosign-keyless";
+  assert.throws(() => validateProofManifest(unauthenticatedSignerClaim), /signature verification/u);
 
   const extra = structuredClone(proof);
   extra.source.token = "must-not-survive";
@@ -327,6 +428,10 @@ test("frame redaction strips authority-sensitive content and bounds retained sta
     cursor: 11,
     revision: 7,
     authorization: "Bearer secret",
+    auth: "private-auth",
+    bearer: "private-bearer",
+    apiKey: "private-api-key",
+    privateKey: "private-key",
     token: "secret-token",
     prompt: "private prompt",
     transcript: [{ text: "private output" }],
@@ -338,6 +443,10 @@ test("frame redaction strips authority-sensitive content and bounds retained sta
     cursor: 11,
     revision: 7,
     authorization: "[REDACTED]",
+    auth: "[REDACTED]",
+    bearer: "[REDACTED]",
+    apiKey: "[REDACTED]",
+    privateKey: "[REDACTED]",
     token: "[REDACTED]",
     prompt: "[REDACTED]",
     transcript: "[REDACTED]",
@@ -360,24 +469,153 @@ test("read-only collection executes only bounded Kubernetes GETs", async () => {
     },
   });
   assert.equal(calls.length, 9);
-  assert.equal(validateClusterSnapshot(snapshot), snapshot);
+  assert.equal(validateClusterSnapshot(snapshot, CLUSTER_VALIDATION), snapshot);
 });
 
-test("live snapshot validation enforces HA, Lease, CRD, RWX, placement, and service ports", () => {
+test("live snapshot validation rejects stale or loosely matched cluster truth", () => {
   const responses = liveClusterResponses();
-  assert.equal(validateClusterSnapshot(responses), responses);
+  assert.equal(validateClusterSnapshot(responses, CLUSTER_VALIDATION), responses);
 
   const noLeader = structuredClone(responses);
-  noLeader.leases.items[0].spec.holderIdentity = "";
-  assert.throws(() => validateClusterSnapshot(noLeader), /leader Lease/u);
+  noLeader.lease.spec.holderIdentity = "";
+  assert.throws(() => validateClusterSnapshot(noLeader, CLUSTER_VALIDATION), /leader Lease/u);
+
+  const staleLeader = structuredClone(responses);
+  staleLeader.lease.spec.renewTime = "2026-07-20T12:33:00.000Z";
+  assert.throws(() => validateClusterSnapshot(staleLeader, CLUSTER_VALIDATION), /freshly held/u);
+
+  const wrongLeaseName = structuredClone(responses);
+  wrongLeaseName.lease.metadata.name = "t4-cluster-controller";
+  assert.throws(() => validateClusterSnapshot(wrongLeaseName, CLUSTER_VALIDATION), /t4-cluster-operator\.cluster\.t4\.dev/u);
+
+  const staleGeneration = structuredClone(responses);
+  staleGeneration.t4sessions.items[0].status.observedGeneration = 4;
+  assert.throws(() => validateClusterSnapshot(staleGeneration, CLUSTER_VALIDATION), /metadata\.generation exactly/u);
+
+  const wrongControllerRollout = structuredClone(responses);
+  wrongControllerRollout.deployments.items[0].spec.strategy.rollingUpdate.maxUnavailable = 0;
+  assert.throws(() => validateClusterSnapshot(wrongControllerRollout, CLUSTER_VALIDATION), /exact HA rollout/u);
+
+  const legacyPvcField = structuredClone(responses);
+  legacyPvcField.t4workspaces.items[0].status.pvcRef = { name: "proof-workspace-data" };
+  delete legacyPvcField.t4workspaces.items[0].status.pvcName;
+  assert.throws(() => validateClusterSnapshot(legacyPvcField, CLUSTER_VALIDATION), /status\.pvcName/u);
 
   const wrongStorage = structuredClone(responses);
   wrongStorage.persistentvolumeclaims.items[0].spec.accessModes = ["ReadWriteOnce"];
-  assert.throws(() => validateClusterSnapshot(wrongStorage), /ReadWriteMany/u);
+  assert.throws(() => validateClusterSnapshot(wrongStorage, CLUSTER_VALIDATION), /ReadWriteMany/u);
+
+  const notReady = structuredClone(responses);
+  notReady.pods.items[3].status.conditions[0].status = "False";
+  assert.throws(() => validateClusterSnapshot(notReady, CLUSTER_VALIDATION), /Running and Ready/u);
+
+  const mutableContainer = structuredClone(responses);
+  mutableContainer.pods.items[3].status.containerStatuses[0].imageID = "containerd://mutable:latest";
+  assert.throws(() => validateClusterSnapshot(mutableContainer, CLUSTER_VALIDATION), /current digest/u);
+
+  const mismatchedContainerDigest = structuredClone(responses);
+  mismatchedContainerDigest.pods.items[3].status.containerStatuses[0].imageID = `containerd://harbor.tailb18de3.ts.net/linkedin-bot/workload@sha256:${"c".repeat(64)}`;
+  assert.throws(() => validateClusterSnapshot(mismatchedContainerDigest, CLUSTER_VALIDATION), /declared current digest/u);
+
+  const wrongCiCommit = structuredClone(responses);
+  wrongCiCommit.t4sessions.items[0].spec.ci.commit = "f".repeat(40);
+  assert.throws(() => validateClusterSnapshot(wrongCiCommit, CLUSTER_VALIDATION), /CI mapping/u);
 
   const forbiddenPlacement = structuredClone(responses);
-  forbiddenPlacement.pods.items[0].spec.nodeName = "k3s-worker-03";
-  assert.throws(() => validateClusterSnapshot(forbiddenPlacement), /durable session placement/u);
+  forbiddenPlacement.pods.items[3].spec.nodeName = "k3s-worker-03";
+  assert.throws(() => validateClusterSnapshot(forbiddenPlacement, CLUSTER_VALIDATION), /durable session placement/u);
+
+  const wrongSessionLabel = structuredClone(responses);
+  wrongSessionLabel.pods.items[3].metadata.labels["cluster.t4.dev/session"] = "proof-session";
+  assert.throws(() => validateClusterSnapshot(wrongSessionLabel, CLUSTER_VALIDATION), /label cluster\.t4\.dev\/session/u);
+
+  const wrongPortName = structuredClone(responses);
+  wrongPortName.services.items[0].spec.ports[0].name = "omp-app";
+  assert.throws(() => validateClusterSnapshot(wrongPortName, CLUSTER_VALIDATION), /websocket\/admin ports/u);
+});
+
+test("SPDX, Trivy, and BuildKit content bind every image identity field", () => {
+  const repository = "harbor.tailb18de3.ts.net/linkedin-bot/quarantine/t4-cluster-operator";
+  const reference = `${repository}@${DIGEST}`;
+  const spdx = {
+    spdxVersion: "SPDX-2.3",
+    dataLicense: "CC0-1.0",
+    SPDXID: "SPDXRef-DOCUMENT",
+    name: reference,
+    documentNamespace: `https://anchore.com/syft/image/${DIGEST.slice(7)}`,
+    documentDescribes: ["SPDXRef-Image"],
+    packages: [{
+      SPDXID: "SPDXRef-Image",
+      name: "t4-cluster-operator",
+      externalRefs: [{
+        referenceCategory: "PACKAGE-MANAGER",
+        referenceType: "purl",
+        referenceLocator: `pkg:oci/t4-cluster-operator@${DIGEST}?repository_url=${encodeURIComponent(repository)}`,
+      }],
+    }],
+  };
+  assert.doesNotThrow(() => verifySpdx(spdx, { repository, digest: DIGEST, reference }));
+  assert.throws(() => verifySpdx({ spdxVersion: "SPDX-2.3" }, { repository, digest: DIGEST, reference }), /SPDX document identity/u);
+  const wrongSpdxDigest = structuredClone(spdx);
+  wrongSpdxDigest.packages[0].externalRefs[0].referenceLocator = "pkg:oci/t4-cluster-operator@sha256:deadbeef";
+  assert.throws(() => verifySpdx(wrongSpdxDigest, { repository, digest: DIGEST, reference }), /external reference/u);
+
+  const trivy = {
+    ArtifactName: reference,
+    ArtifactType: "container_image",
+    Metadata: { ImageID: DIGEST, RepoDigests: [reference] },
+    Results: [{ Target: "debian", Class: "os-pkgs", Type: "debian", Vulnerabilities: [] }],
+  };
+  assert.deepEqual(vulnerabilityCounts(trivy, { repository, digest: DIGEST, reference }), { critical: 0, high: 0 });
+  assert.throws(
+    () => vulnerabilityCounts({ ...trivy, Results: [] }, { repository, digest: DIGEST, reference }),
+    /results identity/u,
+  );
+  assert.throws(
+    () => vulnerabilityCounts({ ...trivy, ArtifactName: "wrong" }, { repository, digest: DIGEST, reference }),
+    /artifact\/results identity/u,
+  );
+
+  const statement = {
+    _type: "https://in-toto.io/Statement/v0.1",
+    predicateType: "https://slsa.dev/provenance/v0.2",
+    subject: [{ name: repository, digest: { sha256: DIGEST.slice(7) } }],
+    predicate: {
+      builder: { id: "https://mobyproject.org/buildkit@v1" },
+      buildType: "https://mobyproject.org/buildkit@v1",
+      invocation: { parameters: { source: "https://github.com/z-peterson/t4-code", commit: COMMIT } },
+      materials: [
+        { uri: `https://github.com/z-peterson/t4-code.git#${COMMIT}`, digest: { sha1: COMMIT } },
+        { uri: `pkg:docker/node@${DIGEST}`, digest: { sha256: DIGEST.slice(7) } },
+      ],
+    },
+  };
+  const envelope = (payload) => `${JSON.stringify({
+    payloadType: "application/vnd.in-toto+json",
+    payload: Buffer.from(JSON.stringify(payload)).toString("base64"),
+  })}\n`;
+  assert.doesNotThrow(() => verifyProvenance(envelope(statement), { repository, digest: DIGEST, commit: COMMIT }));
+  const wrongSource = structuredClone(statement);
+  wrongSource.predicate.materials[0].uri = `https://github.com/attacker/t4-code.git#${COMMIT}`;
+  assert.throws(() => verifyProvenance(envelope(wrongSource), { repository, digest: DIGEST, commit: COMMIT }), /trusted source/u);
+  assert.throws(() => verifyProvenance(envelope(statement), { repository, digest: DIGEST, commit: "f".repeat(40) }), /CI commit/u);
+});
+
+test("proof fetch and frame URLs reject every host or credential outside the exact allowlist", () => {
+  assert.equal(
+    trustedProofUrl("https://interview-responder-prometheus.tailb18de3.ts.net/evidence.json", "prometheus", ["interview-responder-prometheus.tailb18de3.ts.net"]),
+    "https://interview-responder-prometheus.tailb18de3.ts.net/evidence.json",
+  );
+  for (const value of [
+    "https://attacker.example/evidence.json",
+    "http://interview-responder-prometheus.tailb18de3.ts.net/evidence.json",
+    "https://user:password@interview-responder-prometheus.tailb18de3.ts.net/evidence.json",
+    "https://interview-responder-prometheus.tailb18de3.ts.net/evidence.json?token=value",
+  ]) {
+    assert.throws(() => trustedProofUrl(value, "prometheus", ["interview-responder-prometheus.tailb18de3.ts.net"]), /allowlist/u);
+  }
+  assert.equal(clusterWebSocketUrl("https://t4-dev.tailb18de3.ts.net/").href, "wss://t4-dev.tailb18de3.ts.net/v1/ws");
+  assert.throws(() => clusterWebSocketUrl("https://other.tailb18de3.ts.net/"), /credential-free HTTPS origin/u);
 });
 
 test("default-off proof evaluates rendered resources rather than chart source text", () => {

@@ -24,6 +24,10 @@ esac
 : "${CI_COMMIT_SHA:?CI_COMMIT_SHA is required}"
 : "${HARBOR_REGISTRY:?HARBOR_REGISTRY is required}"
 : "${HARBOR_PROJECT:?HARBOR_PROJECT is required}"
+if [ "$HARBOR_REGISTRY" != "harbor.tailb18de3.ts.net" ]; then
+  echo "HARBOR_REGISTRY must be the exact HTTPS tailnet Harbor host" >&2
+  exit 64
+fi
 auth_dir=${T4_REGISTRY_AUTH_DIR:-${CI_WORKSPACE:-$PWD}/.cluster-ci/registry-auth}
 test -r "$auth_dir/config.json"
 export DOCKER_CONFIG="$auth_dir"
@@ -37,17 +41,14 @@ case "$digest" in
     exit 65
     ;;
 esac
-reference="$HARBOR_REGISTRY/$HARBOR_PROJECT/$repository_suffix@$digest"
+reference="$HARBOR_REGISTRY/$HARBOR_PROJECT/quarantine/$repository_suffix@$digest"
 
 case "$mode" in
   sbom)
-    export SYFT_REGISTRY_INSECURE_SKIP_TLS_VERIFY=true
-    export SYFT_REGISTRY_INSECURE_USE_HTTP=true
     syft "registry:$reference" -o "spdx-json=$artifact_dir/$component.spdx.json"
     test -s "$artifact_dir/$component.spdx.json"
     ;;
   vulnerability)
-    export TRIVY_INSECURE=true
     trivy image \
       --format json \
       --output "$artifact_dir/$component.trivy.json" \
@@ -58,9 +59,24 @@ case "$mode" in
     test -s "$artifact_dir/$component.trivy.json"
     ;;
   provenance)
-    export COSIGN_DOCKER_MEDIA_TYPES=1
-    export COSIGN_ALLOW_INSECURE_REGISTRY=1
-    cosign download attestation "$reference" > "$artifact_dir/$component.provenance.jsonl"
+    identity=${T4_COSIGN_CERTIFICATE_IDENTITY:-}
+    issuer=${T4_COSIGN_CERTIFICATE_OIDC_ISSUER:-}
+    if [ -n "$identity" ] && [ -n "$issuer" ]; then
+      cosign verify-attestation \
+        --type slsaprovenance \
+        --certificate-identity "$identity" \
+        --certificate-oidc-issuer "$issuer" \
+        "$reference" > "$artifact_dir/$component.provenance.jsonl"
+      printf '%s\n' '{"mode":"cosign-keyless","signatureVerified":true}' > "$artifact_dir/$component.provenance-verification.json"
+    elif [ -z "$identity" ] && [ -z "$issuer" ]; then
+      cosign download attestation "$reference" > "$artifact_dir/$component.provenance.jsonl"
+      printf '%s\n' '{"mode":"buildkit-content","signatureVerified":false}' > "$artifact_dir/$component.provenance-verification.json"
+    else
+      echo "cosign certificate identity and OIDC issuer must be configured together" >&2
+      exit 64
+    fi
+    unset identity issuer
     test -s "$artifact_dir/$component.provenance.jsonl"
+    test -s "$artifact_dir/$component.provenance-verification.json"
     ;;
 esac

@@ -16,12 +16,16 @@ export const PROOF_SCENARIOS = Object.freeze([
 ]);
 export const OBSERVATION_SYSTEMS = Object.freeze([
   "woodpecker",
-  "flux",
   "kubernetes",
-  "tailscale",
   "prometheus",
   "loki",
   "grafana",
+]);
+const CONTRACT_SCENARIOS = new Set([
+  "wire-reconnect-idempotency",
+  "gui-auth-isolation",
+  "desktop-viewport",
+  "mobile-viewport",
 ]);
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/u;
@@ -30,11 +34,17 @@ const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/u;
 const REPOSITORY_PATTERN = /^[a-z0-9.-]+(?::[0-9]+)?\/[a-z0-9._/-]+$/u;
 const ARTIFACT_PATH_PATTERN = /^artifacts\/cluster-proof\/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u;
 const ASSERTION_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
-const SENSITIVE_KEY_PATTERN = /authorization|cookie|credential|password|prompt|secret|token|transcript/iu;
+const SENSITIVE_KEY_PATTERN = /api.?key|private.?key|authorization|auth|bearer|cookie|credential|password|prompt|secret|token|transcript/iu;
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_DEPTH = 12;
 const MAX_OBJECT_FIELDS = 128;
 const MAX_ARRAY_ITEMS = 256;
+const OBSERVATION_HOSTS = Object.freeze({
+  woodpecker: new Set(["woodpecker-ci-dev.tailb18de3.ts.net"]),
+  prometheus: new Set(["interview-responder-prometheus.tailb18de3.ts.net"]),
+  loki: new Set(["interview-responder-loki.tailb18de3.ts.net"]),
+  grafana: new Set(["grafana.tailb18de3.ts.net"]),
+});
 
 function fail(message) {
   throw new Error(`T4 cluster proof ${message}`);
@@ -106,6 +116,19 @@ function httpsUrl(value, label) {
   return value;
 }
 
+function observationUrl(value, system, label) {
+  if (system === "kubernetes") {
+    if (value !== null) fail(`${label} must be null because Kubernetes was captured through bounded kubectl GETs`);
+    return value;
+  }
+  httpsUrl(value, label);
+  const url = new URL(value);
+  if (url.port || !OBSERVATION_HOSTS[system]?.has(url.hostname)) {
+    fail(`${label} is outside the exact ${system} tailnet allowlist`);
+  }
+  return value;
+}
+
 function fileEvidence(value, label, extraFields = []) {
   const fields = ["path", "sha256", ...extraFields];
   exactFields(value, fields, label);
@@ -117,9 +140,10 @@ function fileEvidence(value, label, extraFields = []) {
 }
 
 function visualEvidence(value, label) {
-  const fields = ["path", "sha256", "redacted", ...(value.viewport === undefined ? [] : ["viewport"] )];
+  const fields = ["path", "sha256", "redacted", "evidenceType", ...(value.viewport === undefined ? [] : ["viewport"] )];
   fileEvidence(value, label, fields.slice(2));
   if (value.redacted !== true) fail(`${label} must be redacted`);
+  if (!["contract", "live"].includes(value.evidenceType)) fail(`${label}.evidenceType is invalid`);
   if (value.viewport !== undefined && !["desktop", "mobile"].includes(value.viewport)) {
     fail(`${label}.viewport is invalid`);
   }
@@ -163,7 +187,13 @@ export function validateImageEntries(images, sourceCommit) {
       fail(`${label}.reference must use the immutable digest`);
     }
     fileEvidence(image.sbom, `${label}.sbom`);
-    fileEvidence(image.provenance, `${label}.provenance`);
+    fileEvidence(image.provenance, `${label}.provenance`, ["mode", "signatureVerified"]);
+    if (
+      !["buildkit-content", "cosign-keyless"].includes(image.provenance.mode) ||
+      image.provenance.signatureVerified !== (image.provenance.mode === "cosign-keyless")
+    ) {
+      fail(`${label}.provenance signer verification claim is not truthful`);
+    }
     fileEvidence(image.vulnerability, `${label}.vulnerability`, ["scanner", "critical", "high"]);
     if (
       image.vulnerability.scanner !== "trivy" ||
@@ -180,9 +210,11 @@ function validateScenarioEntries(scenarios) {
   exactSet(scenarios, PROOF_SCENARIOS, "scenario");
   for (const [index, scenario] of scenarios.entries()) {
     const label = `scenarios[${index}]`;
-    exactFields(scenario, ["id", "status", "observedAt", "assertions", "evidence"], label);
+    exactFields(scenario, ["id", "status", "evidenceType", "observedAt", "assertions", "evidence"], label);
     if (!PROOF_SCENARIOS.includes(scenario.id)) fail(`${label}.id is invalid`);
     if (scenario.status !== "passed") fail(`${label} must be passed`);
+    const expectedType = CONTRACT_SCENARIOS.has(scenario.id) ? "contract" : "live";
+    if (scenario.evidenceType !== expectedType) fail(`${label}.evidenceType must be ${expectedType}`);
     timestamp(scenario.observedAt, `${label}.observedAt`);
     if (
       !Array.isArray(scenario.assertions) ||
@@ -210,7 +242,7 @@ function validateObservationEntries(observations) {
     exactFields(observation, ["system", "observedAt", "url", "ids", "evidence"], label);
     if (!OBSERVATION_SYSTEMS.includes(observation.system)) fail(`${label}.system is invalid`);
     timestamp(observation.observedAt, `${label}.observedAt`);
-    httpsUrl(observation.url, `${label}.url`);
+    observationUrl(observation.url, observation.system, `${label}.url`);
     if (
       !Array.isArray(observation.ids) ||
       observation.ids.length < 1 ||
@@ -226,24 +258,25 @@ function validateObservationEntries(observations) {
 }
 
 function validateArtifacts(artifacts) {
-  exactFields(artifacts, ["frames", "screenshots", "videos"], "artifacts");
+  exactFields(artifacts, ["frames", "screenshots"], "artifacts");
   const bounds = {
     frames: [1, 32],
     screenshots: [2, 32],
-    videos: [2, 8],
   };
   for (const [kind, [minimum, maximum]] of Object.entries(bounds)) {
     const entries = artifacts[kind];
     if (!Array.isArray(entries) || entries.length < minimum || entries.length > maximum) {
       fail(`artifacts.${kind} is outside its bound`);
     }
-    entries.forEach((entry, index) => visualEvidence(entry, `artifacts.${kind}[${index}]`));
+    const expectedType = kind === "frames" ? "live" : "contract";
+    entries.forEach((entry, index) => {
+      visualEvidence(entry, `artifacts.${kind}[${index}]`);
+      if (entry.evidenceType !== expectedType) fail(`artifacts.${kind} must be ${expectedType} evidence`);
+    });
   }
-  for (const kind of ["screenshots", "videos"]) {
-    const viewports = new Set(artifacts[kind].map(({ viewport }) => viewport));
-    if (!viewports.has("desktop") || !viewports.has("mobile")) {
-      fail(`artifacts.${kind} must include desktop and mobile evidence`);
-    }
+  const viewports = new Set(artifacts.screenshots.map(({ viewport }) => viewport));
+  if (!viewports.has("desktop") || !viewports.has("mobile")) {
+    fail("artifacts.screenshots must include desktop and mobile contract evidence");
   }
   return artifacts;
 }

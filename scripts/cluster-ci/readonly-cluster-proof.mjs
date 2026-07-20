@@ -3,13 +3,21 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_LEASE_AGE_MS = 30_000;
+const MAX_CLOCK_SKEW_MS = 5_000;
 const NAMESPACE_PATTERN = /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/u;
+const DIGEST_PATTERN = /@sha256:[0-9a-f]{64}$/u;
 const FORBIDDEN_SESSION_NODES = new Set(["k3s-worker-02", "k3s-worker-03"]);
 const WORKLOAD_KINDS = new Set(["CronJob", "DaemonSet", "Deployment", "Job", "Pod", "StatefulSet"]);
+const LEASE_NAME = "t4-cluster-operator.cluster.t4.dev";
+const DEPLOYMENTS = Object.freeze([
+  { name: "t4-cluster-controller", component: "controller", container: "controller", replicas: 2, maxUnavailable: 1, minimumAvailable: 1 },
+  { name: "t4-cluster-server", component: "server", container: "server", replicas: 3, maxUnavailable: 0, minimumAvailable: 2 },
+]);
 
 const REQUESTS = Object.freeze([
   ["deployments", ["get", "deployments", "-n", "$NAMESPACE", "-l", "app.kubernetes.io/part-of=t4-cluster", "-o", "json"]],
-  ["leases", ["get", "leases", "-n", "$NAMESPACE", "-l", "app.kubernetes.io/part-of=t4-cluster", "-o", "json"]],
+  ["lease", ["get", "lease", LEASE_NAME, "-n", "$NAMESPACE", "-o", "json"]],
   [
     "customresourcedefinitions",
     [
@@ -42,9 +50,9 @@ function list(snapshot, key) {
   return value.items;
 }
 
-function named(items, fragment, label) {
-  const matches = items.filter(({ metadata }) => metadata?.name?.includes(fragment));
-  if (matches.length !== 1) fail(`expected exactly one ${label}`);
+function exactNamed(items, name, label) {
+  const matches = items.filter(({ metadata }) => metadata?.name === name);
+  if (matches.length !== 1) fail(`expected exactly one ${label} named ${name}`);
   return matches[0];
 }
 
@@ -52,15 +60,55 @@ function positive(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-function deploymentContract(deployment, replicas, minimumAvailable, label) {
+function observed(resource, label) {
+  if (!positive(resource.metadata?.generation) || resource.status?.observedGeneration !== resource.metadata.generation) {
+    fail(`${label} status does not observe metadata.generation exactly`);
+  }
+}
+
+function label(resource, key, expected, resourceLabel) {
+  if (resource.metadata?.labels?.[key] !== expected) {
+    fail(`${resourceLabel} label ${key} is not exactly ${expected}`);
+  }
+}
+
+function readyPod(pod, labelText) {
   if (
-    deployment.spec?.replicas !== replicas ||
-    deployment.spec?.strategy?.type !== "RollingUpdate" ||
-    ![0, "0"].includes(deployment.spec?.strategy?.rollingUpdate?.maxUnavailable) ||
-    !positive(deployment.status?.observedGeneration) ||
-    (deployment.status?.availableReplicas ?? 0) < minimumAvailable
+    pod.status?.phase !== "Running" ||
+    !Array.isArray(pod.status?.conditions) ||
+    !pod.status.conditions.some(({ type, status }) => type === "Ready" && status === "True")
   ) {
-    fail(`${label} Deployment did not satisfy its HA rollout contract`);
+    fail(`${labelText} is not Running and Ready`);
+  }
+}
+
+function currentContainer(pod, name, labelText) {
+  const statuses = pod.status?.containerStatuses;
+  const matches = Array.isArray(statuses) ? statuses.filter((status) => status?.name === name) : [];
+  const imageDigest = matches[0]?.image?.match(/@(sha256:[0-9a-f]{64})$/u)?.[1];
+  if (
+    matches.length !== 1 ||
+    matches[0].ready !== true ||
+    !imageDigest ||
+    !DIGEST_PATTERN.test(matches[0].imageID ?? "") ||
+    !matches[0].imageID.endsWith(`@${imageDigest}`)
+  ) {
+    fail(`${labelText} has no exact ready ${name} container at its declared current digest`);
+  }
+  return matches[0];
+}
+
+function deploymentContract(deployment, contract) {
+  label(deployment, "app.kubernetes.io/part-of", "t4-cluster", `${contract.name} Deployment`);
+  label(deployment, "app.kubernetes.io/component", contract.component, `${contract.name} Deployment`);
+  observed(deployment, `${contract.name} Deployment`);
+  if (
+    deployment.spec?.replicas !== contract.replicas ||
+    deployment.spec?.strategy?.type !== "RollingUpdate" ||
+    ![contract.maxUnavailable, String(contract.maxUnavailable)].includes(deployment.spec?.strategy?.rollingUpdate?.maxUnavailable) ||
+    (deployment.status?.availableReplicas ?? 0) < contract.minimumAvailable
+  ) {
+    fail(`${contract.name} Deployment did not satisfy its exact HA rollout contract`);
   }
 }
 
@@ -91,93 +139,147 @@ export async function collectReadOnlyClusterSnapshot({ namespace, run = defaultR
   return snapshot;
 }
 
-export function validateClusterSnapshot(snapshot) {
-  const deployments = list(snapshot, "deployments");
-  deploymentContract(named(deployments, "controller", "controller Deployment"), 2, 1, "controller");
-  deploymentContract(named(deployments, "server", "cluster-server Deployment"), 3, 2, "cluster-server");
+function validateCiMapping(sessions, expected) {
+  const mappings = sessions.filter(({ spec }) => {
+    const ci = spec?.ci;
+    return (
+      ci &&
+      typeof ci.repositoryId === "string" && ci.repositoryId.length > 0 && ci.repositoryId.length <= 128 &&
+      typeof ci.ref === "string" && ci.ref.length > 0 && ci.ref.length <= 256 &&
+      typeof ci.commit === "string" && /^[0-9a-f]{40}$/u.test(ci.commit)
+    );
+  });
+  if (mappings.length < 1) fail("no live T4Session carries an exact CI mapping");
+  if (expected) {
+    const matches = mappings.filter(({ spec }) =>
+      spec.ci.repositoryId === expected.repositoryId &&
+      spec.ci.ref === expected.ref &&
+      spec.ci.commit === expected.commit,
+    );
+    if (matches.length !== 1) fail("live T4Session CI mapping does not exactly match this repository, ref, and commit");
+    return matches;
+  }
+  return mappings;
+}
 
-  const leases = list(snapshot, "leases");
-  const leaderLease = named(leases, "controller", "controller leader Lease");
+export function validateClusterSnapshot(snapshot, { now = Date.now(), ciMapping } = {}) {
+  const deployments = list(snapshot, "deployments");
+  for (const contract of DEPLOYMENTS) {
+    deploymentContract(exactNamed(deployments, contract.name, `${contract.component} Deployment`), contract);
+  }
+
+  const lease = snapshot?.lease;
+  const renewTime = Date.parse(lease?.spec?.renewTime ?? "");
   if (
-    typeof leaderLease.spec?.holderIdentity !== "string" ||
-    leaderLease.spec.holderIdentity.length < 1 ||
-    leaderLease.spec.holderIdentity.length > 253 ||
-    !Number.isFinite(Date.parse(leaderLease.spec?.renewTime ?? ""))
+    !lease ||
+    lease.metadata?.name !== LEASE_NAME ||
+    typeof lease.spec?.holderIdentity !== "string" ||
+    lease.spec.holderIdentity.length < 1 ||
+    lease.spec.holderIdentity.length > 253 ||
+    !Number.isFinite(renewTime) ||
+    renewTime > now + MAX_CLOCK_SKEW_MS ||
+    now - renewTime > MAX_LEASE_AGE_MS
   ) {
-    fail("controller leader Lease is not currently held");
+    fail(`controller leader Lease ${LEASE_NAME} is not freshly held`);
   }
 
   const crds = list(snapshot, "customresourcedefinitions");
-  const requiredCrds = new Set(["t4clusterhosts", "t4workspaces", "t4sessions"]);
-  for (const crd of crds) {
-    const version = crd.spec?.versions?.find(({ name }) => name === "v1alpha1");
+  for (const plural of ["t4clusterhosts", "t4workspaces", "t4sessions"]) {
+    const crd = exactNamed(crds, `${plural}.cluster.t4.dev`, `${plural} CRD`);
+    const versions = Array.isArray(crd.spec?.versions) ? crd.spec.versions : [];
+    const version = versions.find(({ name }) => name === "v1alpha1");
     if (
-      crd.spec?.group === "cluster.t4.dev" &&
-      crd.spec?.scope === "Namespaced" &&
-      version?.served === true &&
-      version?.storage === true
+      crd.spec?.group !== "cluster.t4.dev" ||
+      crd.spec?.scope !== "Namespaced" ||
+      crd.spec?.names?.plural !== plural ||
+      version?.served !== true ||
+      version?.storage !== true
     ) {
-      requiredCrds.delete(crd.spec?.names?.plural);
+      fail(`${plural} CRD does not satisfy the exact v1alpha1 contract`);
     }
   }
-  if (requiredCrds.size > 0) fail(`CRD contract is missing ${[...requiredCrds].join(",")}`);
 
   const hosts = list(snapshot, "t4clusterhosts");
-  if (hosts.length < 1 || !hosts.every((host) => positive(host.status?.observedGeneration))) {
-    fail("T4ClusterHost status has not observed the desired generation");
-  }
+  if (hosts.length < 1) fail("T4ClusterHost proof resource is absent");
+  hosts.forEach((host) => observed(host, `T4ClusterHost ${host.metadata?.name ?? "unknown"}`));
 
   const workspaces = list(snapshot, "t4workspaces");
   const sessions = list(snapshot, "t4sessions");
   const pvcs = list(snapshot, "persistentvolumeclaims");
+  const pods = list(snapshot, "pods");
   if (workspaces.length < 1 || sessions.length < 1 || pvcs.length < 1) {
     fail("workspace/session/storage proof resources are absent");
   }
   for (const workspace of workspaces) {
-    if (
-      !positive(workspace.status?.observedGeneration) ||
-      workspace.status?.phase !== "Ready" ||
-      !["Retain", "Delete"].includes(workspace.spec?.retentionPolicy)
-    ) {
-      fail(`workspace ${workspace.metadata?.name ?? "unknown"} is not reconciled Ready`);
+    const name = workspace.metadata?.name ?? "unknown";
+    observed(workspace, `workspace ${name}`);
+    if (workspace.status?.phase !== "Ready" || !["Retain", "Delete"].includes(workspace.spec?.retentionPolicy)) {
+      fail(`workspace ${name} is not reconciled Ready`);
     }
-    const pvcName = workspace.status?.pvcRef?.name;
-    const pvc = pvcs.find(({ metadata }) => metadata?.name === pvcName);
-    if (!pvc || pvc.status?.phase !== "Bound") fail(`workspace ${workspace.metadata?.name ?? "unknown"} PVC is not Bound`);
+    const pvcName = workspace.status?.pvcName;
+    if (typeof pvcName !== "string" || pvcName.length < 1 || pvcName.length > 63) {
+      fail(`workspace ${name} status.pvcName is invalid`);
+    }
+    const pvc = exactNamed(pvcs, pvcName, `workspace ${name} PVC`);
+    label(pvc, "app.kubernetes.io/part-of", "t4-cluster", `workspace ${name} PVC`);
+    label(pvc, "cluster.t4.dev/workspace", name, `workspace ${name} PVC`);
+    if (pvc.status?.phase !== "Bound") fail(`workspace ${name} PVC is not Bound`);
     if (
       !Array.isArray(pvc.spec?.accessModes) ||
       pvc.spec.accessModes.length !== 1 ||
       pvc.spec.accessModes[0] !== "ReadWriteMany"
     ) {
-      fail(`workspace ${workspace.metadata?.name ?? "unknown"} PVC is not ReadWriteMany`);
+      fail(`workspace ${name} PVC is not ReadWriteMany`);
     }
     if (typeof pvc.spec?.storageClassName !== "string" || pvc.spec.storageClassName.length === 0) {
-      fail(`workspace ${workspace.metadata?.name ?? "unknown"} PVC has no StorageClass`);
-    }
-  }
-  for (const session of sessions) {
-    if (!positive(session.status?.observedGeneration) || session.status?.phase !== "Running") {
-      fail(`session ${session.metadata?.name ?? "unknown"} is not reconciled Running`);
-    }
-    if (!workspaces.some(({ metadata }) => metadata?.name === session.spec?.workspaceRef)) {
-      fail(`session ${session.metadata?.name ?? "unknown"} references an unknown workspace`);
+      fail(`workspace ${name} PVC has no StorageClass`);
     }
   }
 
-  const pods = list(snapshot, "pods");
-  const sessionPods = pods.filter(({ metadata }) => metadata?.labels?.["cluster.t4.dev/session"]);
-  if (sessionPods.length < 1) fail("no durable session pod was observed");
-  for (const pod of sessionPods) {
-    if (pod.status?.phase !== "Running" || FORBIDDEN_SESSION_NODES.has(pod.spec?.nodeName)) {
-      fail(`durable session placement is invalid for ${pod.metadata?.name ?? "unknown"}`);
+  for (const session of sessions) {
+    const name = session.metadata?.name ?? "unknown";
+    observed(session, `session ${name}`);
+    if (session.status?.phase !== "Running") fail(`session ${name} is not reconciled Running`);
+    if (!workspaces.some(({ metadata }) => metadata?.name === session.spec?.workspaceRef)) {
+      fail(`session ${name} references an unknown workspace`);
+    }
+    const podName = session.status?.podName;
+    if (typeof podName !== "string" || podName.length < 1 || podName.length > 63) {
+      fail(`session ${name} status.podName is invalid`);
+    }
+    const pod = exactNamed(pods, podName, `session ${name} Pod`);
+    label(pod, "app.kubernetes.io/name", "t4-session-runtime", `session ${name} Pod`);
+    label(pod, "app.kubernetes.io/part-of", "t4-cluster", `session ${name} Pod`);
+    label(pod, "cluster.t4.dev/session", podName, `session ${name} Pod`);
+    readyPod(pod, `session ${name} Pod`);
+    currentContainer(pod, "session-runtime", `session ${name} Pod`);
+    if (FORBIDDEN_SESSION_NODES.has(pod.spec?.nodeName)) {
+      fail(`durable session placement is invalid for ${podName}`);
+    }
+  }
+  validateCiMapping(sessions, ciMapping);
+
+  for (const contract of DEPLOYMENTS) {
+    const matchingPods = pods.filter((pod) =>
+      pod.metadata?.labels?.["app.kubernetes.io/part-of"] === "t4-cluster" &&
+      pod.metadata?.labels?.["app.kubernetes.io/component"] === contract.component,
+    );
+    if (matchingPods.length < contract.minimumAvailable) {
+      fail(`${contract.name} has too few exactly labelled pods`);
+    }
+    for (const pod of matchingPods) {
+      readyPod(pod, `${contract.name} Pod ${pod.metadata?.name ?? "unknown"}`);
+      currentContainer(pod, contract.container, `${contract.name} Pod ${pod.metadata?.name ?? "unknown"}`);
     }
   }
 
   const services = list(snapshot, "services");
-  const serverService = named(services, "cluster-server", "cluster-server Service");
+  const serverService = exactNamed(services, "t4-cluster-server", "cluster-server Service");
+  label(serverService, "app.kubernetes.io/part-of", "t4-cluster", "cluster-server Service");
+  label(serverService, "app.kubernetes.io/component", "server", "cluster-server Service");
   const ports = new Map((serverService.spec?.ports ?? []).map(({ name, port }) => [name, port]));
-  if (ports.get("omp-app") !== 8080 || ports.get("admin") !== 9090) {
-    fail("cluster-server Service does not expose the fixed public/admin ports");
+  if (ports.get("websocket") !== 8080 || ports.get("admin") !== 9090 || ports.size !== 2) {
+    fail("cluster-server Service does not expose the exact websocket/admin ports");
   }
   return snapshot;
 }
@@ -191,28 +293,36 @@ export function validateDefaultOffRender(documents) {
   return { clusterOperatorEnabled: false, workloadCount: 0 };
 }
 
-export function summarizeClusterSnapshot(snapshot) {
-  validateClusterSnapshot(snapshot);
+export function summarizeClusterSnapshot(snapshot, options = {}) {
+  validateClusterSnapshot(snapshot, options);
   const deployments = list(snapshot, "deployments");
-  const lease = named(list(snapshot, "leases"), "controller", "controller leader Lease");
   const workspaces = list(snapshot, "t4workspaces");
   const sessions = list(snapshot, "t4sessions");
   const pvcs = list(snapshot, "persistentvolumeclaims");
   const allPods = list(snapshot, "pods");
-  const pods = allPods.filter(({ metadata }) => metadata?.labels?.["cluster.t4.dev/session"]);
+  const lease = snapshot.lease;
+  const capturedAt = new Date(options.now ?? Date.now()).toISOString();
   return {
     schemaVersion: "t4-cluster-readonly-snapshot/1",
-    observedAt: new Date().toISOString(),
+    observedAt: capturedAt,
     deployments: deployments.map(({ metadata, spec, status }) => ({
       name: metadata.name,
+      component: metadata.labels["app.kubernetes.io/component"],
       replicas: spec.replicas,
+      maxUnavailable: spec.strategy.rollingUpdate.maxUnavailable,
       availableReplicas: status.availableReplicas,
+      generation: metadata.generation,
       observedGeneration: status.observedGeneration,
     })),
     leader: { lease: lease.metadata.name, holderIdentity: lease.spec.holderIdentity, renewTime: lease.spec.renewTime },
-    crds: list(snapshot, "customresourcedefinitions").map(({ spec }) => `${spec.names.plural}.${spec.group}/v1alpha1`),
-    workspaces: workspaces.map(({ metadata, status }) => ({ name: metadata.name, phase: status.phase, pvc: status.pvcRef.name })),
-    sessions: sessions.map(({ metadata, status }) => ({ name: metadata.name, phase: status.phase })),
+    crds: list(snapshot, "customresourcedefinitions").map(({ metadata }) => metadata.name),
+    workspaces: workspaces.map(({ metadata, status }) => ({ name: metadata.name, phase: status.phase, pvc: status.pvcName })),
+    sessions: sessions.map(({ metadata, spec, status }) => ({
+      name: metadata.name,
+      phase: status.phase,
+      pod: status.podName,
+      ...(spec.ci ? { ci: { repositoryId: spec.ci.repositoryId, ref: spec.ci.ref, commit: spec.ci.commit } } : {}),
+    })),
     storage: pvcs.map(({ metadata, spec, status }) => ({
       name: metadata.name,
       storageClassName: spec.storageClassName,
@@ -220,10 +330,20 @@ export function summarizeClusterSnapshot(snapshot) {
       phase: status.phase,
       capacity: status.capacity?.storage ?? "unknown",
     })),
-    placements: pods.map(({ metadata, spec }) => ({ name: metadata.name, node: spec.nodeName })),
+    placements: allPods
+      .filter(({ metadata }) => metadata?.labels?.["cluster.t4.dev/session"])
+      .map(({ metadata, spec }) => ({ name: metadata.name, node: spec.nodeName })),
     images: allPods.flatMap(({ metadata, status }) =>
-      (status?.containerStatuses ?? []).map(({ name, image, imageID }) => ({
+      (status?.containerStatuses ?? []).map(({ name, image, imageID, ready }) => ({
         pod: metadata.name,
+        labels: {
+          name: metadata.labels?.["app.kubernetes.io/name"],
+          component: metadata.labels?.["app.kubernetes.io/component"],
+          session: metadata.labels?.["cluster.t4.dev/session"],
+          partOf: metadata.labels?.["app.kubernetes.io/part-of"],
+        },
+        phase: status.phase,
+        ready: ready === true,
         container: name,
         image,
         imageID,

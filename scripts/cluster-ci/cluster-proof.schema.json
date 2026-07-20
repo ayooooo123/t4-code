@@ -22,8 +22,8 @@
     },
     "observations": {
       "type": "array",
-      "minItems": 7,
-      "maxItems": 7,
+      "minItems": 5,
+      "maxItems": 5,
       "items": { "$ref": "#/$defs/observation" }
     },
     "artifacts": { "$ref": "#/$defs/artifacts" }
@@ -79,7 +79,7 @@
           "maxLength": 340
         },
         "sbom": { "$ref": "#/$defs/fileEvidence" },
-        "provenance": { "$ref": "#/$defs/fileEvidence" },
+        "provenance": { "$ref": "#/$defs/provenanceEvidence" },
         "vulnerability": {
           "type": "object",
           "additionalProperties": false,
@@ -103,10 +103,28 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "provenanceEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "mode", "signatureVerified"],
+      "properties": {
+        "path": { "$ref": "#/$defs/artifactPath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "mode": { "enum": ["buildkit-content", "cosign-keyless"] },
+        "signatureVerified": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "cosign-keyless" } } },
+          "then": { "properties": { "signatureVerified": { "const": true } } },
+          "else": { "properties": { "signatureVerified": { "const": false } } }
+        }
+      ]
+    },
     "scenario": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "status", "observedAt", "assertions", "evidence"],
+      "required": ["id", "status", "evidenceType", "observedAt", "assertions", "evidence"],
       "properties": {
         "id": {
           "enum": [
@@ -122,6 +140,7 @@
           ]
         },
         "status": { "const": "passed" },
+        "evidenceType": { "enum": ["contract", "live"] },
         "observedAt": { "$ref": "#/$defs/timestamp" },
         "assertions": {
           "type": "array",
@@ -143,9 +162,9 @@
       "additionalProperties": false,
       "required": ["system", "observedAt", "url", "ids", "evidence"],
       "properties": {
-        "system": { "enum": ["woodpecker", "flux", "kubernetes", "tailscale", "prometheus", "loki", "grafana"] },
+        "system": { "enum": ["woodpecker", "kubernetes", "prometheus", "loki", "grafana"] },
         "observedAt": { "$ref": "#/$defs/timestamp" },
-        "url": { "$ref": "#/$defs/httpsUrl" },
+        "url": { "oneOf": [{ "$ref": "#/$defs/httpsUrl" }, { "type": "null" }] },
         "ids": {
           "type": "array",
           "minItems": 1,
@@ -159,18 +178,19 @@
     "visualEvidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "redacted"],
+      "required": ["path", "sha256", "redacted", "evidenceType"],
       "properties": {
         "path": { "$ref": "#/$defs/artifactPath" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "redacted": { "const": true },
+        "evidenceType": { "enum": ["contract", "live"] },
         "viewport": { "enum": ["desktop", "mobile"] }
       }
     },
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["frames", "screenshots", "videos"],
+      "required": ["frames", "screenshots"],
       "properties": {
         "frames": {
           "type": "array",
@@ -182,12 +202,6 @@
           "type": "array",
           "minItems": 2,
           "maxItems": 32,
-          "items": { "$ref": "#/$defs/visualEvidence" }
-        },
-        "videos": {
-          "type": "array",
-          "minItems": 2,
-          "maxItems": 8,
           "items": { "$ref": "#/$defs/visualEvidence" }
         }
       }

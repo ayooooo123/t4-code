@@ -4,9 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export const HARBOR_REGISTRY_ALIASES = Object.freeze([
   "harbor.tailb18de3.ts.net",
-  "harbor.tailb18de3.ts.net:80",
-  "harbor.linkedin-registry.svc.cluster.local",
-  "harbor.linkedin-registry.svc.cluster.local:80",
+  "https://harbor.tailb18de3.ts.net",
 ]);
 
 function isObject(value) {

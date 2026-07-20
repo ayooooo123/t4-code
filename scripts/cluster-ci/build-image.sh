@@ -30,6 +30,15 @@ esac
 : "${BUILDKIT_ADDR:?BUILDKIT_ADDR is required}"
 : "${HARBOR_REGISTRY:?HARBOR_REGISTRY is required}"
 : "${HARBOR_PROJECT:?HARBOR_PROJECT is required}"
+if [ "$HARBOR_REGISTRY" != "harbor.tailb18de3.ts.net" ]; then
+  echo "HARBOR_REGISTRY must be the exact HTTPS tailnet Harbor host" >&2
+  exit 64
+fi
+: "${CI_REPO:?CI_REPO is required}"
+if [ "$CI_REPO" != "z-peterson/t4-code" ]; then
+  echo "CI_REPO must be the canonical source repository" >&2
+  exit 64
+fi
 auth_dir=${T4_REGISTRY_AUTH_DIR:-${CI_WORKSPACE:-$PWD}/.cluster-ci/registry-auth}
 test -r "$auth_dir/config.json"
 export DOCKER_CONFIG="$auth_dir"
@@ -40,16 +49,19 @@ mkdir -p "$artifact_dir"
 metadata="$artifact_dir/$component.buildkit.json"
 digest_file="$artifact_dir/$component.digest"
 
-repository="$HARBOR_REGISTRY/$HARBOR_PROJECT/$repository_suffix"
+repository="$HARBOR_REGISTRY/$HARBOR_PROJECT/quarantine/$repository_suffix"
 reference="$repository:$CI_COMMIT_SHA"
+source_context="https://github.com/z-peterson/t4-code.git#$CI_COMMIT_SHA"
 
 buildctl --addr "$BUILDKIT_ADDR" build \
   --frontend dockerfile.v0 \
-  --local context=. \
-  --local dockerfile=. \
+  --opt "context=$source_context" \
   --opt "filename=$dockerfile" \
-  --opt platform=linux/amd64 \
+  --opt platform=linux/amd64,linux/arm64 \
   --opt "build-arg:SOURCE_COMMIT=$CI_COMMIT_SHA" \
+  --opt "build-arg:SOURCE_REPOSITORY=https://github.com/z-peterson/t4-code" \
+  --opt "label:org.opencontainers.image.source=https://github.com/z-peterson/t4-code" \
+  --opt "label:org.opencontainers.image.revision=$CI_COMMIT_SHA" \
   --output "type=image,name=$reference,push=true,compression=zstd,force-compression=true,oci-mediatypes=true" \
   --attest type=sbom \
   --attest type=provenance,mode=max \

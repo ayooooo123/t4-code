@@ -16,6 +16,48 @@ const proofRoot = resolve(repoRoot, "artifacts/cluster-proof");
 const MAX_HTTP_BYTES = 2 * 1024 * 1024;
 const MAX_LOCAL_ARTIFACTS = 32;
 const SCENARIO_ASSERTION = /^[a-z0-9][a-z0-9._-]{0,127}$/u;
+const CONTRACT_SCENARIOS = new Set([
+  "wire-reconnect-idempotency",
+  "gui-auth-isolation",
+  "desktop-viewport",
+  "mobile-viewport",
+]);
+const WOODPECKER_ORIGIN = "https://woodpecker-ci-dev.tailb18de3.ts.net";
+const REMOTE_OBSERVATIONS = Object.freeze({
+  prometheus: {
+    origin: "https://interview-responder-prometheus.tailb18de3.ts.net",
+    environment: "T4_PROMETHEUS_EVIDENCE_URL",
+  },
+  loki: {
+    origin: "https://interview-responder-loki.tailb18de3.ts.net",
+    environment: "T4_LOKI_EVIDENCE_URL",
+  },
+  grafana: {
+    origin: "https://grafana.tailb18de3.ts.net",
+    environment: "T4_GRAFANA_EVIDENCE_URL",
+  },
+});
+
+export function trustedProofUrl(value, label, allowedHosts) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid URL`);
+  }
+  if (
+    url.protocol !== "https:" ||
+    !allowedHosts.includes(url.hostname) ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(`${label} must be credential-free HTTPS on its exact tailnet/internal allowlist`);
+  }
+  return url.href;
+}
 
 function requiredEnvironment(name) {
   const value = process.env[name]?.trim();
@@ -24,22 +66,33 @@ function requiredEnvironment(name) {
 }
 
 function woodpeckerIdentity() {
-  const url = requiredEnvironment("CI_PIPELINE_URL");
-  const match = new URL(url).pathname.match(/\/repos\/([1-9][0-9]*)\/pipeline\/([1-9][0-9]*)\/?$/u);
+  const value = requiredEnvironment("CI_PIPELINE_URL");
+  const url = new URL(value);
+  const match = url.pathname.match(/\/repos\/([1-9][0-9]*)\/pipeline\/([1-9][0-9]*)\/?$/u);
   const pipelineNumber = Number(requiredEnvironment("CI_PIPELINE_NUMBER"));
-  if (!match || !Number.isSafeInteger(pipelineNumber) || pipelineNumber <= 0) {
+  if (
+    url.origin !== WOODPECKER_ORIGIN ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !match ||
+    !Number.isSafeInteger(pipelineNumber) ||
+    pipelineNumber <= 0
+  ) {
     throw new Error("Woodpecker pipeline URL/number identity is invalid");
   }
   return {
     repositoryId: Number(match[1]),
     pipelineId: Number(match[2]),
     pipelineNumber,
-    url,
+    url: value,
   };
 }
 
-async function boundedFetchJson(url, label) {
-  const response = await fetch(url, {
+async function boundedFetchJson(url, label, allowedHosts) {
+  const trustedUrl = trustedProofUrl(url, label, allowedHosts);
+  const response = await fetch(trustedUrl, {
     headers: { Accept: "application/json", "User-Agent": "t4-cluster-proof/1" },
     redirect: "error",
     signal: AbortSignal.timeout(20_000),
@@ -100,6 +153,7 @@ async function scenarioEntries() {
     entries.push({
       id,
       status: "passed",
+      evidenceType: CONTRACT_SCENARIOS.has(id) ? "contract" : "live",
       observedAt: utcTimestamp(record.observedAt, `scenario ${id}.observedAt`),
       assertions: record.assertions,
       evidence: [await createFileEvidence(path, { artifactRoot: repoRoot })],
@@ -124,7 +178,7 @@ function safeSummary(value, label, depth = 0) {
   const entries = Object.entries(value);
   if (entries.length > 128) throw new Error(`${label} exceeded its field bound`);
   for (const [key, item] of entries) {
-    if (/authorization|cookie|credential|password|prompt|secret|token|transcript/iu.test(key)) {
+    if (/api.?key|private.?key|authorization|auth|bearer|cookie|credential|password|prompt|secret|token|transcript/iu.test(key)) {
       throw new Error(`${label} contained sensitive field ${key}`);
     }
     safeSummary(item, `${label}.${key}`, depth + 1);
@@ -132,74 +186,74 @@ function safeSummary(value, label, depth = 0) {
 }
 
 async function observationEntries() {
-  const metadata = await boundedFetchJson(
-    requiredEnvironment("T4_OBSERVABILITY_MANIFEST_URL"),
-    "observability manifest",
-  );
-  exactKeys(metadata, ["schemaVersion", "sourceCommit", "observations"], "observability manifest");
-  if (
-    metadata.schemaVersion !== "t4-cluster-observations/1" ||
-    metadata.sourceCommit !== requiredEnvironment("CI_COMMIT_SHA") ||
-    !Array.isArray(metadata.observations) ||
-    metadata.observations.length !== OBSERVATION_SYSTEMS.length
-  ) {
-    throw new Error("observability manifest identity or coverage is invalid");
-  }
-  const bySystem = new Map();
-  for (const observation of metadata.observations) {
-    exactKeys(observation, ["system", "observedAt", "url", "ids", "evidenceUrl"], "observation metadata");
-    if (!OBSERVATION_SYSTEMS.includes(observation.system) || bySystem.has(observation.system)) {
-      throw new Error("observability manifest contains an unknown or duplicate system");
-    }
-    bySystem.set(observation.system, observation);
-  }
-
   const directory = resolve(proofRoot, "observations");
   await mkdir(directory, { recursive: true });
+  const commit = requiredEnvironment("CI_COMMIT_SHA");
   const entries = [];
-  for (const system of OBSERVATION_SYSTEMS) {
-    const metadataEntry = bySystem.get(system);
-    if (!metadataEntry) throw new Error(`observability manifest is missing ${system}`);
-    let path;
-    if (system === "kubernetes") {
-      path = resolve(directory, "kubernetes.json");
-    } else if (system === "woodpecker") {
-      path = resolve(directory, "woodpecker.json");
-      await writeFile(
-        path,
-        `${JSON.stringify(
-          {
-            schemaVersion: "t4-woodpecker-observation/1",
-            observedAt: new Date().toISOString(),
-            ...woodpeckerIdentity(),
-          },
-          null,
-          2,
-        )}\n`,
-        { mode: 0o600 },
-      );
-    } else {
-      const payload = await boundedFetchJson(metadataEntry.evidenceUrl, `${system} evidence`);
-      exactKeys(payload, ["schemaVersion", "system", "observedAt", "redacted", "summary"], `${system} evidence`);
-      if (
-        payload.schemaVersion !== "t4-cluster-observation/1" ||
-        payload.system !== system ||
-        payload.redacted !== true
-      ) {
-        throw new Error(`${system} evidence is not an exact redacted observation`);
-      }
-      utcTimestamp(payload.observedAt, `${system} evidence observedAt`);
-      safeSummary(payload.summary, `${system} evidence summary`);
-      path = resolve(directory, `${system}.json`);
-      await writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+
+  const woodpecker = woodpeckerIdentity();
+  const woodpeckerObservedAt = new Date().toISOString();
+  const woodpeckerPath = resolve(directory, "woodpecker.json");
+  await writeFile(
+    woodpeckerPath,
+    `${JSON.stringify({ schemaVersion: "t4-woodpecker-observation/1", observedAt: woodpeckerObservedAt, ...woodpecker }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  entries.push({
+    system: "woodpecker",
+    observedAt: woodpeckerObservedAt,
+    url: WOODPECKER_ORIGIN,
+    ids: [String(woodpecker.repositoryId), String(woodpecker.pipelineId), String(woodpecker.pipelineNumber)],
+    evidence: await createFileEvidence(woodpeckerPath, { artifactRoot: repoRoot }),
+  });
+
+  const kubernetesPath = resolve(directory, "kubernetes.json");
+  const kubernetes = JSON.parse(await readFile(kubernetesPath, "utf8"));
+  if (
+    kubernetes?.schemaVersion !== "t4-cluster-readonly-snapshot/1" ||
+    !Array.isArray(kubernetes.deployments) ||
+    kubernetes.deployments.length < 2
+  ) {
+    throw new Error("Kubernetes observation does not contain exact read-only cluster evidence");
+  }
+  entries.push({
+    system: "kubernetes",
+    observedAt: utcTimestamp(kubernetes.observedAt, "kubernetes observedAt"),
+    url: null,
+    ids: kubernetes.deployments.map(({ name }) => name),
+    evidence: await createFileEvidence(kubernetesPath, { artifactRoot: repoRoot }),
+  });
+
+  for (const system of ["prometheus", "loki", "grafana"]) {
+    const configuration = REMOTE_OBSERVATIONS[system];
+    const evidenceUrl = requiredEnvironment(configuration.environment);
+    const payload = await boundedFetchJson(evidenceUrl, `${system} evidence`, [new URL(configuration.origin).hostname]);
+    exactKeys(payload, ["schemaVersion", "sourceCommit", "system", "observedAt", "redacted", "ids", "summary"], `${system} evidence`);
+    if (
+      payload.schemaVersion !== "t4-cluster-observation/1" ||
+      payload.sourceCommit !== commit ||
+      payload.system !== system ||
+      payload.redacted !== true ||
+      !Array.isArray(payload.ids) ||
+      payload.ids.length < 1 ||
+      payload.ids.length > 16
+    ) {
+      throw new Error(`${system} evidence is not an exact source-bound redacted observation`);
     }
+    utcTimestamp(payload.observedAt, `${system} evidence observedAt`);
+    safeSummary(payload.summary, `${system} evidence summary`);
+    const path = resolve(directory, `${system}.json`);
+    await writeFile(path, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
     entries.push({
       system,
-      observedAt: utcTimestamp(metadataEntry.observedAt, `${system}.observedAt`),
-      url: metadataEntry.url,
-      ids: metadataEntry.ids,
+      observedAt: payload.observedAt,
+      url: configuration.origin,
+      ids: payload.ids,
       evidence: await createFileEvidence(path, { artifactRoot: repoRoot }),
     });
+  }
+  if (entries.length !== OBSERVATION_SYSTEMS.length) {
+    throw new Error("observation coverage does not match the truthfully available systems");
   }
   return entries;
 }
@@ -227,6 +281,7 @@ async function localArtifacts(kind, extensions) {
     results.push({
       ...(await createFileEvidence(path, { artifactRoot: repoRoot })),
       redacted: true,
+      evidenceType: kind === "frames" ? "live" : "contract",
       ...(viewport ? { viewport } : {}),
     });
   }
@@ -244,17 +299,25 @@ async function verifyLiveImageDigests(images) {
   ) {
     throw new Error("Kubernetes observation has no bounded live image identity");
   }
+  const identities = {
+    controller: { component: "controller", container: "controller" },
+    "cluster-server": { component: "server", container: "server" },
+    "session-runtime": { name: "t4-session-runtime", container: "session-runtime" },
+  };
   for (const image of images) {
-    const suffix = image.repository.slice(image.repository.lastIndexOf("/") + 1);
-    const match = snapshot.images.find(
-      ({ image: declaredImage, imageID }) =>
-        typeof declaredImage === "string" &&
-        (declaredImage.includes(`/${suffix}:`) || declaredImage.includes(`/${suffix}@`)) &&
-        typeof imageID === "string" &&
-        imageID.endsWith(`@${image.digest}`),
+    const identity = identities[image.component];
+    const matches = snapshot.images.filter((observed) =>
+      observed?.labels?.partOf === "t4-cluster" &&
+      (identity.component ? observed.labels.component === identity.component : observed.labels.name === identity.name) &&
+      observed.container === identity.container &&
+      observed.phase === "Running" &&
+      observed.ready === true &&
+      observed.image === image.reference &&
+      typeof observed.imageID === "string" &&
+      observed.imageID.endsWith(`@${image.digest}`),
     );
-    if (!match) {
-      throw new Error(`live Kubernetes pods do not run published ${image.component} digest ${image.digest}`);
+    if (matches.length < 1) {
+      throw new Error(`live Kubernetes pods do not run the exact ready ${image.component} reference ${image.reference}`);
     }
   }
 }
@@ -281,7 +344,6 @@ export async function assembleProofManifest() {
     artifacts: {
       frames: await localArtifacts("frames", [".json"]),
       screenshots: await localArtifacts("screenshots", [".png", ".webp"]),
-      videos: await localArtifacts("videos", [".webm"]),
     },
   };
   return validateProofManifest(manifest);

@@ -18,6 +18,34 @@ const proofRoot = resolve(repoRoot, "artifacts/cluster-proof");
 const scenarioRoot = resolve(proofRoot, "scenarios");
 const observationRoot = resolve(proofRoot, "observations");
 
+function requiredEnvironment(name) {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function currentCiMapping() {
+  const pipelineUrl = new URL(requiredEnvironment("CI_PIPELINE_URL"));
+  const match = pipelineUrl.pathname.match(/^\/repos\/([1-9][0-9]*)\/pipeline\/[1-9][0-9]*\/?$/u);
+  if (
+    pipelineUrl.origin !== "https://woodpecker-ci-dev.tailb18de3.ts.net" ||
+    pipelineUrl.username ||
+    pipelineUrl.password ||
+    pipelineUrl.search ||
+    pipelineUrl.hash ||
+    !match
+  ) {
+    throw new Error("CI_PIPELINE_URL does not identify the exact credential-free Woodpecker repository");
+  }
+  const repository = requiredEnvironment("CI_REPO");
+  if (repository !== "z-peterson/t4-code") throw new Error("CI_REPO is not the canonical source repository");
+  return {
+    repositoryId: match[1],
+    ref: requiredEnvironment("CI_COMMIT_REF"),
+    commit: requiredEnvironment("CI_COMMIT_SHA"),
+  };
+}
+
 async function atomicJson(path, value) {
   const temporaryPath = `${path}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -54,16 +82,17 @@ async function defaultOffEvidence(namespace) {
   return result;
 }
 
-export async function collectClusterEvidence({ namespace }) {
+export async function collectClusterEvidence({ namespace, ciMapping = currentCiMapping() }) {
   await mkdir(scenarioRoot, { recursive: true });
   await mkdir(observationRoot, { recursive: true });
   const snapshot = await collectReadOnlyClusterSnapshot({ namespace });
-  const summary = summarizeClusterSnapshot(snapshot);
+  const summary = summarizeClusterSnapshot(snapshot, { ciMapping });
   await atomicJson(resolve(observationRoot, "kubernetes.json"), summary);
   await scenario("ha-manifest", summary.observedAt, [
     "controller.replicas-2",
+    "controller.rolling-update.max-unavailable-1",
     "server.replicas-3",
-    "rolling-update.max-unavailable-0",
+    "server.rolling-update.max-unavailable-0",
   ]);
   await scenario("leader-election", summary.observedAt, [
     "lease.active-holder",
@@ -75,6 +104,12 @@ export async function collectClusterEvidence({ namespace }) {
     "reconcile.observed-generation",
     "storage.bound-read-write-many",
     "placement.session-worker-exclusions",
+  ]);
+  await scenario("ci-mapping", summary.observedAt, [
+    "ci.repository-id-exact",
+    "ci.ref-exact",
+    "ci.commit-exact",
+    "ci.session-running-ready",
   ]);
   const off = await defaultOffEvidence(namespace);
   await scenario("feature-off", new Date().toISOString(), [

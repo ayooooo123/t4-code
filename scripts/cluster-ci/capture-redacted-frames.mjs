@@ -11,6 +11,16 @@ const outputPath = resolve(repoRoot, "artifacts/cluster-proof/frames/live-operat
 const MAX_INBOUND_BYTES = 1024 * 1024;
 const MAX_FRAMES = 32;
 const SAFE_AGENT_ID_KEYS = ["agentId", "rootAgentId", "activeAgentId", "parentAgentId"];
+const CLUSTER_HOST = "t4-dev.tailb18de3.ts.net";
+const EXPECTED_OMP_VERSION = "17.0.5";
+const EXPECTED_OMP_BUILD = "8476f4451ed95c5d5401785d279a93d3c659fac4";
+const REQUIRED_CAPABILITIES = Object.freeze([
+  "sessions.read",
+  "ci.trigger",
+  "preview.read",
+  "preview.control",
+  "preview.input",
+]);
 
 function requiredEnvironment(name) {
   const value = process.env[name]?.trim();
@@ -18,13 +28,22 @@ function requiredEnvironment(name) {
   return value;
 }
 
-function clusterWebSocketUrl(baseUrl) {
+export function clusterWebSocketUrl(baseUrl) {
   const url = new URL(baseUrl);
-  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
-    throw new Error("T4_CLUSTER_BASE_URL must be a credential-free HTTPS origin");
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== CLUSTER_HOST ||
+    url.port ||
+    url.pathname !== "/" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error(`T4_CLUSTER_BASE_URL must be the credential-free HTTPS origin https://${CLUSTER_HOST}/`);
   }
   url.protocol = "wss:";
-  url.pathname = "/omp-app/v1";
+  url.pathname = "/v1/ws";
   return url;
 }
 
@@ -106,8 +125,6 @@ function projectListResult(kind, hostId, value) {
 
 async function capture() {
   const baseUrl = requiredEnvironment("T4_CLUSTER_BASE_URL");
-  const deviceId = requiredEnvironment("T4_CLUSTER_DEVICE_ID");
-  const deviceToken = requiredEnvironment("T4_CLUSTER_AUTH_TOKEN");
   const origin = new URL(baseUrl).origin;
   const pipelineNumber = requiredEnvironment("CI_PIPELINE_NUMBER");
   const sessionRequest = `proof-session-list-${pipelineNumber}`;
@@ -140,9 +157,9 @@ async function capture() {
           type: "hello",
           protocol: { min: "omp-app/1", max: "omp-app/1" },
           client: { name: "t4-cluster-proof", version: "1", build: "1", platform: "woodpecker" },
-          requestedFeatures: ["cluster.operator", "resume"],
+          requestedFeatures: ["cluster.operator", "resume", "preview.control"],
+          capabilities: REQUIRED_CAPABILITIES,
           savedCursors: [],
-          authentication: { deviceId, deviceToken },
         }),
       );
     });
@@ -161,12 +178,15 @@ async function capture() {
         hostId = boundedId(frame.hostId, "welcome.hostId");
         if (
           frame.selectedProtocol !== "omp-app/1" ||
+          frame.ompVersion !== EXPECTED_OMP_VERSION ||
+          frame.ompBuild !== EXPECTED_OMP_BUILD ||
           !Array.isArray(frame.grantedFeatures) ||
           !frame.grantedFeatures.includes("cluster.operator") ||
+          !frame.grantedFeatures.includes("preview.control") ||
           !Array.isArray(frame.grantedCapabilities) ||
-          !frame.grantedCapabilities.includes("sessions.read")
+          REQUIRED_CAPABILITIES.some((capability) => !frame.grantedCapabilities.includes(capability))
         ) {
-          return finish(rejectComplete, new Error("cluster operator/read capability was not negotiated"));
+          return finish(rejectComplete, new Error("cluster operator sessions.read/CI/preview capability contract was not negotiated"));
         }
         frames.push({
           v: "omp-app/1",
@@ -174,8 +194,10 @@ async function capture() {
           hostId,
           epoch: boundedId(frame.epoch, "welcome.epoch"),
           selectedProtocol: frame.selectedProtocol,
+          ompVersion: frame.ompVersion,
+          ompBuild: frame.ompBuild,
           clusterOperator: true,
-          sessionsRead: true,
+          grantedCapabilities: REQUIRED_CAPABILITIES,
         });
         for (const [requestId, command] of [
           [sessionRequest, "session.list"],

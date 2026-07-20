@@ -15,7 +15,7 @@ case "$mode" in
     repository_suffix=t4-cluster-proof
     tag="${CI_COMMIT_SHA:-}-${CI_PIPELINE_NUMBER:-}"
     artifact_type=application/vnd.t4.cluster.proof.v1
-    files="artifacts/cluster-proof/manifest.json artifacts/cluster-proof/scenarios/* artifacts/cluster-proof/observations/* artifacts/cluster-proof/frames/* artifacts/cluster-proof/screenshots/* artifacts/cluster-proof/videos/*"
+    files="artifacts/cluster-proof/manifest.json artifacts/cluster-proof/scenarios/* artifacts/cluster-proof/observations/* artifacts/cluster-proof/frames/* artifacts/cluster-proof/screenshots/*"
     ;;
   *)
     echo "artifact mode must be images or proof" >&2
@@ -38,13 +38,16 @@ fi
 
 : "${HARBOR_REGISTRY:?HARBOR_REGISTRY is required}"
 : "${HARBOR_PROJECT:?HARBOR_PROJECT is required}"
+if [ "$HARBOR_REGISTRY" != "harbor.tailb18de3.ts.net" ]; then
+  echo "HARBOR_REGISTRY must be the exact HTTPS tailnet Harbor host" >&2
+  exit 64
+fi
 auth_dir=${T4_REGISTRY_AUTH_DIR:-${CI_WORKSPACE:-$PWD}/.cluster-ci/registry-auth}
 test -r "$auth_dir/config.json"
 export DOCKER_CONFIG="$auth_dir"
 reference="$HARBOR_REGISTRY/$HARBOR_PROJECT/$repository_suffix:$tag"
 # shellcheck disable=SC2086
 oras push \
-  --plain-http \
   --artifact-type "$artifact_type" \
   --format json \
   "$reference" \
