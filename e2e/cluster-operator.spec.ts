@@ -463,6 +463,10 @@ test.describe("OMP/T4 cluster GUI boundaries", () => {
     await expect.poll(() => wire.hellos.length).toBeGreaterThan(helloCount);
     await page.getByRole("button", { name: "Show session list" }).click();
     await expect(page.locator(`[data-session-row="${VIEW}"]`)).toHaveCount(1);
+    await page
+      .getByRole("dialog", { name: "Working folders and sessions" })
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
     await page.goto(`${web.url}#/hosts`);
     const workspaceRow = page.locator('[data-cluster-workspace-id="workspace-a"]');
     await expect(workspaceRow).toHaveCount(1);
