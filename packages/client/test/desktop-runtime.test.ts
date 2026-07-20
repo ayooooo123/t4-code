@@ -663,7 +663,7 @@ describe("desktop runtime projection", () => {
     shell.emitFrame({ targetId: "local", frame: welcome("host-a", ["sessions.read"], []) });
     for (let index = 0; index < 8; index += 1) await Promise.resolve();
     shell.sessionListResult = {
-      cursor: { epoch: "epoch-1", seq: 2 },
+      cursor: { epoch: "epoch-1", seq: 8 },
       sessions: [],
       totalCount: 4,
       truncated: true,

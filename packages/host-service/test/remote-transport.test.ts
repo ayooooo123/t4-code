@@ -438,7 +438,7 @@ describe("remote appserver policy transport", () => {
 		test(name, async () => {
 			const harness = new FakeBunHarness();
 			harness.install();
-			let currentStatus: SessionRecord["status"] = "idle";
+			let currentTitle = "Session";
 			try {
 				const appserver = createAppserver({
 					hostId: hostId("host"),
@@ -447,9 +447,9 @@ describe("remote appserver policy transport", () => {
 						list: async () => [
 							{
 								...leaseSessionRecord(),
-								status: currentStatus,
+								title: currentTitle,
 								updatedAt:
-									currentStatus === "idle" ? "2026-01-01T00:00:00.000Z" : "2026-01-01T00:00:01.000Z",
+									currentTitle === "Session" ? "2026-01-01T00:00:00.000Z" : "2026-01-01T00:00:01.000Z",
 							},
 						],
 					},
@@ -471,7 +471,7 @@ describe("remote appserver policy transport", () => {
 				});
 				socket.sends.length = 0;
 
-				currentStatus = "active";
+				currentTitle = "Renamed session";
 				const refreshSocket = await openRemote(remote);
 				await remote.config.websocket?.message?.(refreshSocket, hello(features, capabilities));
 				await flush();
@@ -481,7 +481,7 @@ describe("remote appserver policy transport", () => {
 					expect(deltas[0]).toMatchObject({
 						hostId: "host",
 						sessionId: "session",
-						upsert: { status: "active" },
+						upsert: { title: "Renamed session" },
 					});
 				} else expect(deltas).toEqual([]);
 				await appserver.stop();

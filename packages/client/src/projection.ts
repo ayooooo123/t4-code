@@ -1752,6 +1752,7 @@ function applyProjectionInput(
       // but do not let their old completeness metadata prove that a route is
       // gone until the host sends the next authoritative sessions frame.
       const sessionIndexMetadata = mapWithout(snapshot.sessionIndexMetadata, String(frame.hostId));
+      const sessionInventoryCursors = mapWithout(snapshot.sessionInventoryCursors, String(frame.hostId));
       const sessions = immutableMap(
         [...snapshot.sessions.entries()].map(
           ([sessionKey, session]) =>
@@ -1780,7 +1781,7 @@ function applyProjectionInput(
         ),
       );
       if (snapshot.epoch === undefined || snapshot.epoch === frame.epoch) {
-        return updateRoot(Object.freeze({ ...snapshot, sessionIndexMetadata, sessions }), {
+        return updateRoot(Object.freeze({ ...snapshot, sessionIndexMetadata, sessionInventoryCursors, sessions }), {
           epoch: frame.epoch,
           freshness: "fresh",
         });
@@ -1788,6 +1789,7 @@ function applyProjectionInput(
       return Object.freeze({
         ...snapshot,
         sessionIndexMetadata,
+        sessionInventoryCursors,
         sessions,
         epoch: frame.epoch,
         freshness: "catching-up",
