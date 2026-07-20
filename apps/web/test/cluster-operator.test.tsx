@@ -322,8 +322,9 @@ describe("cluster operator presentation", () => {
       "Woodpecker correlation is unavailable because this host did not grant CI trigger access.",
     );
     expect(markup).toMatch(/<fieldset[^>]*disabled=""[^>]*>/u);
-    expect(markup).toMatch(
-      /<button(?![^>]*disabled)[^>]*>Create session with GUI<\/button>/u,
+    expect(markup).toMatch(/<button[^>]*>Create session with GUI<\/button>/u);
+    expect(markup).not.toMatch(
+      /<button[^>]*\sdisabled=""[^>]*>Create session with GUI<\/button>/u,
     );
     const failedSession: SessionRef = {
       ...session,
