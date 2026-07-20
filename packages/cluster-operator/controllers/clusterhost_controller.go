@@ -28,13 +28,17 @@ func (r *ClusterHostReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	original := host.Status
-	if host.Status.Conditions != nil { original.Conditions = append([]metav1.Condition(nil), host.Status.Conditions...) }
+	if host.Status.Conditions != nil {
+		original.Conditions = append([]metav1.Condition(nil), host.Status.Conditions...)
+	}
 	host.Status.ObservedGeneration = host.Generation
 
 	var storageClass storagev1.StorageClass
 	storageReady := true
 	if err := r.Get(ctx, types.NamespacedName{Name: host.Spec.StorageClassName}, &storageClass); err != nil {
-		if !apierrors.IsNotFound(err) { return ctrl.Result{}, err }
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
 		storageReady = false
 		meta.SetStatusCondition(&host.Status.Conditions, condition("StorageReady", metav1.ConditionFalse, ReasonStorageClassNotFound, "selected StorageClass does not exist", host.Generation))
 	} else if !storageClassAllowsRWX(storageClass.Annotations) {
@@ -44,15 +48,24 @@ func (r *ClusterHostReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		meta.SetStatusCondition(&host.Status.Conditions, condition("StorageReady", metav1.ConditionTrue, ReasonStorageReady, "selected StorageClass supports ReadWriteMany", host.Generation))
 	}
 
-	ciReady := host.Spec.CIProvider == nil || host.Spec.CIProvider.SecretRef.Name != "" && host.Spec.CIProvider.ConfigMapRef.Name != ""
-	if ciReady {
-		reason := "NotConfigured"
-		message := "CI provider is optional and not configured"
-		if host.Spec.CIProvider != nil { reason, message = "ReferencesConfigured", "CI provider Secret and ConfigMap references are configured" }
-		meta.SetStatusCondition(&host.Status.Conditions, condition("CIReady", metav1.ConditionTrue, reason, message, host.Generation))
-	} else {
-		meta.SetStatusCondition(&host.Status.Conditions, condition("CIReady", metav1.ConditionFalse, "ReferencesIncomplete", "CI provider requires both Secret and ConfigMap references", host.Generation))
+	ciReady := true
+	ciReason := "NotConfigured"
+	ciMessage := "CI provider is optional and not configured"
+	if host.Spec.CIProvider != nil {
+		hasSecret := host.Spec.CIProvider.SecretRef != nil && host.Spec.CIProvider.SecretRef.Name != ""
+		hasProjectedIdentity := host.Spec.CIProvider.ServiceAccountAudience != ""
+		ciReady = host.Spec.CIProvider.ConfigMapRef.Name != "" && hasSecret != hasProjectedIdentity
+		if ciReady {
+			ciReason, ciMessage = "ReferencesConfigured", "CI provider configuration and one server-side credential source are configured"
+		} else {
+			ciReason, ciMessage = "ReferencesIncomplete", "CI provider requires a ConfigMap and exactly one Secret or projected ServiceAccount identity"
+		}
 	}
+	status := metav1.ConditionFalse
+	if ciReady {
+		status = metav1.ConditionTrue
+	}
+	meta.SetStatusCondition(&host.Status.Conditions, condition("CIReady", status, ciReason, ciMessage, host.Generation))
 
 	available := storageReady && len(host.Spec.RuntimeProfiles) > 0
 	if available {
@@ -61,7 +74,9 @@ func (r *ClusterHostReconciler) Reconcile(ctx context.Context, request ctrl.Requ
 		meta.SetStatusCondition(&host.Status.Conditions, condition("Available", metav1.ConditionFalse, "ConfigurationNotReady", "cluster host infrastructure configuration is not ready", host.Generation))
 	}
 	if !reflect.DeepEqual(original, host.Status) {
-		if err := r.Status().Update(ctx, &host); err != nil { return ctrl.Result{}, err }
+		if err := r.Status().Update(ctx, &host); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }

@@ -228,6 +228,9 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.woodpecker.existingSecret }}
                   key: {{ .Values.woodpecker.tokenKey }}
+            {{- else if .Values.woodpecker.serviceAccountAudience }}
+            - name: T4_WOODPECKER_TOKEN_FILE
+              value: /var/run/secrets/t4-ci/token
             {{- end }}
             {{- if .Values.woodpecker.configMap }}
             - name: T4_WOODPECKER_BASE_URL
@@ -280,6 +283,11 @@ spec:
             - name: kubernetes-api-access
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            {{- if .Values.woodpecker.serviceAccountAudience }}
+            - name: ci-identity
+              mountPath: /var/run/secrets/t4-ci
+              readOnly: true
+            {{- end }}
       volumes:
         - name: cluster-identity
           projected:
@@ -302,6 +310,16 @@ spec:
                   items:
                     - key: ca.crt
                       path: ca.crt
+        {{- if .Values.woodpecker.serviceAccountAudience }}
+        - name: ci-identity
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.woodpecker.serviceAccountAudience | quote }}
+                  expirationSeconds: {{ .Values.woodpecker.tokenExpirationSeconds }}
+                  path: token
+        {{- end }}
         - name: temporary
           emptyDir:
             sizeLimit: 256Mi

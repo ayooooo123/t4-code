@@ -14,10 +14,14 @@ spec:
     resyncSeconds: {{ .Values.clusterHost.projection.resyncSeconds }}
   allowedOrigins:
     {{- toYaml .Values.clusterHost.allowedOrigins | nindent 4 }}
-  {{- if and .Values.woodpecker.existingSecret .Values.woodpecker.configMap }}
+  {{- if and .Values.woodpecker.configMap (or .Values.woodpecker.existingSecret .Values.woodpecker.serviceAccountAudience) }}
   ciProvider:
+    {{- if .Values.woodpecker.existingSecret }}
     secretRef:
       name: {{ .Values.woodpecker.existingSecret }}
+    {{- else }}
+    serviceAccountAudience: {{ .Values.woodpecker.serviceAccountAudience | quote }}
+    {{- end }}
     configMapRef:
       name: {{ .Values.woodpecker.configMap }}
   {{- end }}

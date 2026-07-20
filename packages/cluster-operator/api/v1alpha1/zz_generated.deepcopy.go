@@ -15,7 +15,9 @@ func (in *T4ClusterHost) DeepCopyInto(out *T4ClusterHost) {
 }
 
 func (in *T4ClusterHost) DeepCopy() *T4ClusterHost {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4ClusterHost)
 	in.DeepCopyInto(out)
 	return out
@@ -28,12 +30,16 @@ func (in *T4ClusterHostList) DeepCopyInto(out *T4ClusterHostList) {
 	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
 		out.Items = make([]T4ClusterHost, len(in.Items))
-		for i := range in.Items { in.Items[i].DeepCopyInto(&out.Items[i]) }
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
 	}
 }
 
 func (in *T4ClusterHostList) DeepCopy() *T4ClusterHostList {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4ClusterHostList)
 	in.DeepCopyInto(out)
 	return out
@@ -43,14 +49,26 @@ func (in *T4ClusterHostList) DeepCopyObject() runtime.Object { return in.DeepCop
 
 func (in *T4ClusterHostSpec) DeepCopyInto(out *T4ClusterHostSpec) {
 	*out = *in
-	if in.RuntimeProfiles != nil { out.RuntimeProfiles = append([]string(nil), in.RuntimeProfiles...) }
-	if in.AllowedOrigins != nil { out.AllowedOrigins = append([]string(nil), in.AllowedOrigins...) }
-	if in.CIProvider != nil { out.CIProvider = &CIProviderReferences{SecretRef: in.CIProvider.SecretRef, ConfigMapRef: in.CIProvider.ConfigMapRef} }
+	if in.RuntimeProfiles != nil {
+		out.RuntimeProfiles = append([]string(nil), in.RuntimeProfiles...)
+	}
+	if in.AllowedOrigins != nil {
+		out.AllowedOrigins = append([]string(nil), in.AllowedOrigins...)
+	}
+	if in.CIProvider != nil {
+		out.CIProvider = &CIProviderReferences{ConfigMapRef: in.CIProvider.ConfigMapRef, ServiceAccountAudience: in.CIProvider.ServiceAccountAudience}
+		if in.CIProvider.SecretRef != nil {
+			secret := *in.CIProvider.SecretRef
+			out.CIProvider.SecretRef = &secret
+		}
+	}
 }
 
 func (in *T4ClusterHostStatus) DeepCopyInto(out *T4ClusterHostStatus) {
 	*out = *in
-	if in.Conditions != nil { out.Conditions = append([]metav1.Condition(nil), in.Conditions...) }
+	if in.Conditions != nil {
+		out.Conditions = append([]metav1.Condition(nil), in.Conditions...)
+	}
 }
 
 func (in *T4Workspace) DeepCopyInto(out *T4Workspace) {
@@ -61,7 +79,9 @@ func (in *T4Workspace) DeepCopyInto(out *T4Workspace) {
 }
 
 func (in *T4Workspace) DeepCopy() *T4Workspace {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4Workspace)
 	in.DeepCopyInto(out)
 	return out
@@ -74,12 +94,16 @@ func (in *T4WorkspaceList) DeepCopyInto(out *T4WorkspaceList) {
 	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
 		out.Items = make([]T4Workspace, len(in.Items))
-		for i := range in.Items { in.Items[i].DeepCopyInto(&out.Items[i]) }
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
 	}
 }
 
 func (in *T4WorkspaceList) DeepCopy() *T4WorkspaceList {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4WorkspaceList)
 	in.DeepCopyInto(out)
 	return out
@@ -89,14 +113,18 @@ func (in *T4WorkspaceList) DeepCopyObject() runtime.Object { return in.DeepCopy(
 
 func (in *T4WorkspaceSpec) DeepCopyInto(out *T4WorkspaceSpec) {
 	*out = *in
-	if in.Repository != nil { out.Repository = &RepositoryMetadata{RepositoryID: in.Repository.RepositoryID, Ref: in.Repository.Ref, Commit: in.Repository.Commit} }
+	if in.Repository != nil {
+		out.Repository = &RepositoryMetadata{RepositoryID: in.Repository.RepositoryID, Ref: in.Repository.Ref, Commit: in.Repository.Commit}
+	}
 	out.Size = in.Size.DeepCopy()
 }
 
 func (in *T4WorkspaceStatus) DeepCopyInto(out *T4WorkspaceStatus) {
 	*out = *in
 	out.Capacity = in.Capacity.DeepCopy()
-	if in.Conditions != nil { out.Conditions = append([]metav1.Condition(nil), in.Conditions...) }
+	if in.Conditions != nil {
+		out.Conditions = append([]metav1.Condition(nil), in.Conditions...)
+	}
 }
 
 func (in *T4Session) DeepCopyInto(out *T4Session) {
@@ -107,7 +135,9 @@ func (in *T4Session) DeepCopyInto(out *T4Session) {
 }
 
 func (in *T4Session) DeepCopy() *T4Session {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4Session)
 	in.DeepCopyInto(out)
 	return out
@@ -120,12 +150,16 @@ func (in *T4SessionList) DeepCopyInto(out *T4SessionList) {
 	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
 		out.Items = make([]T4Session, len(in.Items))
-		for i := range in.Items { in.Items[i].DeepCopyInto(&out.Items[i]) }
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
 	}
 }
 
 func (in *T4SessionList) DeepCopy() *T4SessionList {
-	if in == nil { return nil }
+	if in == nil {
+		return nil
+	}
 	out := new(T4SessionList)
 	in.DeepCopyInto(out)
 	return out
@@ -139,10 +173,14 @@ func (in *T4SessionSpec) DeepCopyInto(out *T4SessionSpec) {
 		copy := *in.InitialPromptSecretRef
 		out.InitialPromptSecretRef = &copy
 	}
-	if in.CI != nil { out.CI = &SessionCIMetadata{RepositoryID: in.CI.RepositoryID, Ref: in.CI.Ref, Commit: in.CI.Commit} }
+	if in.CI != nil {
+		out.CI = &SessionCIMetadata{RepositoryID: in.CI.RepositoryID, Ref: in.CI.Ref, Commit: in.CI.Commit}
+	}
 }
 
 func (in *T4SessionStatus) DeepCopyInto(out *T4SessionStatus) {
 	*out = *in
-	if in.Conditions != nil { out.Conditions = append([]metav1.Condition(nil), in.Conditions...) }
+	if in.Conditions != nil {
+		out.Conditions = append([]metav1.Condition(nil), in.Conditions...)
+	}
 }

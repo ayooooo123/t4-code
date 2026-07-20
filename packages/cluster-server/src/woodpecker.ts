@@ -1,3 +1,5 @@
+import { isAbsolute } from "node:path";
+import { readBoundedRegularFile } from "./config.ts";
 import type { CiRunResult, SessionCiState } from "@t4-code/host-wire";
 
 export const WOODPECKER_MAX_PIPELINES = 100;
@@ -19,7 +21,8 @@ export interface CiProvider {
 export interface WoodpeckerRepositoryConfig { readonly slug: string; }
 export interface WoodpeckerProviderOptions {
 	readonly baseUrl: string;
-	readonly token: string;
+	readonly token?: string;
+	readonly tokenFile?: string;
 	readonly repositories: Readonly<Record<string, WoodpeckerRepositoryConfig>>;
 	readonly fetch?: typeof globalThis.fetch;
 }
@@ -108,14 +111,20 @@ export function mapWoodpeckerPipeline(
 export class WoodpeckerProvider implements CiProvider {
 	readonly name = "woodpecker" as const;
 	readonly #baseUrl: string;
-	readonly #token: string;
+	readonly #token?: string;
+	readonly #tokenFile?: string;
 	readonly #repositories: Readonly<Record<string, WoodpeckerRepositoryConfig>>;
 	readonly #fetch: typeof globalThis.fetch;
 	readonly #inflight = new Map<string, Promise<CiRunResult>>();
 
 	constructor(options: WoodpeckerProviderOptions) {
 		this.#baseUrl = httpsBase(options.baseUrl);
-		this.#token = bounded(options.token, "Woodpecker token", 16_384);
+		if (Boolean(options.token) === Boolean(options.tokenFile)) throw new Error("Woodpecker provider requires exactly one credential source");
+		if (options.token) this.#token = bounded(options.token, "Woodpecker token", 16_384);
+		if (options.tokenFile) {
+			if (!isAbsolute(options.tokenFile)) throw new Error("Woodpecker token file must be absolute");
+			this.#tokenFile = options.tokenFile;
+		}
 		const repositories: Record<string, WoodpeckerRepositoryConfig> = {};
 		for (const [id, config] of Object.entries(options.repositories)) {
 			bounded(id, "Woodpecker repository id", 256);
@@ -182,8 +191,14 @@ export class WoodpeckerProvider implements CiProvider {
 		bounded(value.ref, "CI ref", 512);
 		bounded(value.commit, "CI commit", 512);
 	}
+	async #credential(): Promise<string> {
+		if (this.#token) return this.#token;
+		const token = (await readBoundedRegularFile(this.#tokenFile!, 16_384, "Woodpecker token")).trim();
+		if (new TextEncoder().encode(token).byteLength < 32 || /\s/u.test(token)) throw new Error("Woodpecker token file is invalid");
+		return token;
+	}
 	async #json(path: string, init: RequestInit): Promise<unknown> {
-		const headers = { Authorization: `Bearer ${this.#token}`, ...Object.fromEntries(new Headers(init.headers).entries()) };
+		const headers = { Authorization: `Bearer ${await this.#credential()}`, ...Object.fromEntries(new Headers(init.headers).entries()) };
 		const response = await this.#fetch(`${this.#baseUrl}${path}`, { ...init, headers });
 		const declaredLength = Number(response.headers.get("content-length"));
 		if (Number.isFinite(declaredLength) && declaredLength > WOODPECKER_MAX_RESPONSE_BYTES) throw new Error("Woodpecker response exceeds byte limit");

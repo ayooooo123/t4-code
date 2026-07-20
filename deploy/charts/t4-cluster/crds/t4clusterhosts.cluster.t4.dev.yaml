@@ -39,8 +39,8 @@ spec:
               type: object
               required: [storageClassName, runtimeProfiles]
               x-kubernetes-validations:
-                - rule: "!has(self.ciProvider) || (self.ciProvider.secretRef.name != '' && self.ciProvider.configMapRef.name != '')"
-                  message: CI provider requires non-empty Secret and ConfigMap references
+                - rule: "!has(self.ciProvider) || (self.ciProvider.configMapRef.name != '' && (has(self.ciProvider.secretRef) != has(self.ciProvider.serviceAccountAudience)))"
+                  message: CI provider requires a ConfigMap and exactly one Secret or projected ServiceAccount identity
                 - rule: "!has(self.allowedOrigins) || self.allowedOrigins.all(o, o.startsWith('https://') && !o.contains('@'))"
                   message: allowed origins must be credential-free HTTPS origins
               properties:
@@ -76,7 +76,7 @@ spec:
                       default: 60
                 ciProvider:
                   type: object
-                  required: [secretRef, configMapRef]
+                  required: [configMapRef]
                   properties:
                     secretRef:
                       type: object
@@ -87,6 +87,11 @@ spec:
                           minLength: 1
                           maxLength: 253
                           pattern: '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
+                    serviceAccountAudience:
+                      type: string
+                      minLength: 1
+                      maxLength: 253
+                      pattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]*$'
                     configMapRef:
                       type: object
                       required: [name]

@@ -52,10 +52,10 @@ type ClusterServerProjectionSpec struct {
 }
 
 type CIProviderReferences struct {
-	SecretRef    corev1.LocalObjectReference `json:"secretRef"`
-	ConfigMapRef corev1.LocalObjectReference `json:"configMapRef"`
+	SecretRef              *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	ConfigMapRef           corev1.LocalObjectReference  `json:"configMapRef"`
+	ServiceAccountAudience string                       `json:"serviceAccountAudience,omitempty"`
 }
-
 type T4ClusterHostSpec struct {
 	StorageClassName string                      `json:"storageClassName"`
 	RuntimeProfiles  []string                    `json:"runtimeProfiles"`

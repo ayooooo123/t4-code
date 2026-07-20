@@ -19,8 +19,9 @@ export interface ClusterServerConfig {
 	readonly trustedProxyCidrs: readonly string[];
 	readonly woodpecker?: {
 		readonly baseUrl: string;
-		readonly token: string;
 		readonly repositories: Readonly<Record<string, { readonly slug: string }>>;
+		readonly token?: string;
+		readonly tokenFile?: string;
 	};
 }
 function required(env: Readonly<Record<string, string | undefined>>, name: string): string {
@@ -109,8 +110,14 @@ export function clusterServerConfigFromEnv(env: Readonly<Record<string, string |
 	const servicePort = port(env.KUBERNETES_SERVICE_PORT_HTTPS ?? env.KUBERNETES_SERVICE_PORT, 443, "KUBERNETES_SERVICE_PORT");
 	const identityTokenPath = absolutePath(required(env, "T4_CLUSTER_IDENTITY_TOKEN_FILE"), "T4_CLUSTER_IDENTITY_TOKEN_FILE");
 	const serverServiceAccountName = dns(required(env, "T4_CLUSTER_SERVER_SERVICE_ACCOUNT"), "T4_CLUSTER_SERVER_SERVICE_ACCOUNT");
-	const woodpeckerValues = [env.T4_WOODPECKER_BASE_URL, env.T4_WOODPECKER_TOKEN, env.T4_WOODPECKER_REPOSITORIES];
-	if (woodpeckerValues.some(Boolean) && !woodpeckerValues.every(Boolean)) throw new Error("Woodpecker configuration must be complete");
+	const woodpeckerBaseUrl = env.T4_WOODPECKER_BASE_URL;
+	const woodpeckerRepositories = env.T4_WOODPECKER_REPOSITORIES;
+	const woodpeckerToken = env.T4_WOODPECKER_TOKEN;
+	const woodpeckerTokenFile = env.T4_WOODPECKER_TOKEN_FILE;
+	if (woodpeckerToken && woodpeckerTokenFile) throw new Error("Woodpecker configuration requires exactly one credential source");
+	const woodpeckerConfigured = Boolean(woodpeckerBaseUrl || woodpeckerRepositories || woodpeckerToken || woodpeckerTokenFile);
+	if (woodpeckerConfigured && (!woodpeckerBaseUrl || !woodpeckerRepositories || !(woodpeckerToken || woodpeckerTokenFile)))
+		throw new Error("Woodpecker configuration must be complete");
 	return {
 		namespace,
 		podName,
@@ -125,9 +132,11 @@ export function clusterServerConfigFromEnv(env: Readonly<Record<string, string |
 		kubernetesCaPath: absolutePath(env.T4_KUBERNETES_CA_PATH ?? "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt", "T4_KUBERNETES_CA_PATH"),
 		identityTokenPath,
 		serverServiceAccountName,
-		...(woodpeckerValues.every(Boolean) ? {
+		...(woodpeckerConfigured ? {
 			woodpecker: {
-				baseUrl: woodpeckerValues[0]!, token: woodpeckerValues[1]!, repositories: repositories(woodpeckerValues[2]!),
+				baseUrl: woodpeckerBaseUrl!,
+				repositories: repositories(woodpeckerRepositories!),
+				...(woodpeckerToken ? { token: woodpeckerToken } : { tokenFile: absolutePath(woodpeckerTokenFile!, "T4_WOODPECKER_TOKEN_FILE") }),
 			},
 		} : {}),
 	};
