@@ -3,7 +3,6 @@ when:
       - push
       - pull_request
       - manual
-      - deployment
 
 clone:
   git:
@@ -177,6 +176,8 @@ steps:
   cluster-server-tests:
     depends_on: [cluster-ci-contracts]
     image: mirror.gcr.io/library/node:24.13.1-bookworm
+    environment:
+      T4_PROOF_OUTPUT_DIR: artifacts/cluster-proof/scenarios
     commands:
       - corepack enable
       - pnpm --filter @t4-code/cluster-server test
@@ -260,7 +261,7 @@ steps:
             ephemeral-storage: 1Gi
 
   sbom-controller:
-    depends_on: [build-controller]
+    depends_on: [build-session-runtime]
     image: anchore/syft:1.33.0
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
@@ -335,7 +336,7 @@ steps:
             ephemeral-storage: 1Gi
 
   build-cluster-server:
-    depends_on: [provenance-controller]
+    depends_on: [build-controller]
     image: mirror.gcr.io/moby/buildkit:v0.30.0-rootless
     environment:
       BUILDKIT_ADDR: tcp://woodpecker-buildkitd.linkedin-ci.svc.cluster.local:1234
@@ -361,7 +362,7 @@ steps:
             ephemeral-storage: 1Gi
 
   sbom-cluster-server:
-    depends_on: [build-cluster-server]
+    depends_on: [provenance-controller]
     image: anchore/syft:1.33.0
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
@@ -436,7 +437,7 @@ steps:
             ephemeral-storage: 1Gi
 
   build-session-runtime:
-    depends_on: [provenance-cluster-server]
+    depends_on: [build-cluster-server]
     image: mirror.gcr.io/moby/buildkit:v0.30.0-rootless
     environment:
       BUILDKIT_ADDR: tcp://woodpecker-buildkitd.linkedin-ci.svc.cluster.local:1234
@@ -462,7 +463,7 @@ steps:
             ephemeral-storage: 1Gi
 
   sbom-session-runtime:
-    depends_on: [build-session-runtime]
+    depends_on: [provenance-cluster-server]
     image: anchore/syft:1.33.0
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
@@ -559,22 +560,74 @@ steps:
             memory: 512Mi
             ephemeral-storage: 1Gi
 
-  live-cluster-proof:
-    depends_on: [cluster-chart-tests]
-    image: mcr.microsoft.com/playwright:v1.61.1-noble
+  publish-image-evidence:
+    depends_on: [image-publication-manifest]
+    image: ghcr.io/oras-project/oras:v1.3.0
+    environment:
+      HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
+      HARBOR_PROJECT: linkedin-bot
+      HARBOR_USERNAME:
+        from_secret: t4_harbor_username
+      HARBOR_PASSWORD:
+        from_secret: t4_harbor_password
+    commands:
+      - scripts/cluster-ci/publish-artifact.sh images
+    when:
+      - event: push
+        branch: main
+      - event: manual
+    backend_options:
+      kubernetes:
+        serviceAccountName: woodpecker-ci-untrusted
+        resources:
+          requests:
+            cpu: "0"
+            memory: 128Mi
+            ephemeral-storage: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+            ephemeral-storage: 1Gi
+
+  live-cluster-observations:
+    depends_on: [publish-image-evidence]
+    image: harbor.tailb18de3.ts.net/linkedin-bot/woodpecker-buildkit-deploy-tools@sha256:7936be1edac8ce3c225b148cff0e89b1446fc88185d72379398617f7279ad8cc
     environment:
       T4_CLUSTER_NAMESPACE: t4-development
     commands:
-      - corepack enable
-      - pnpm test:cluster:e2e
       - node scripts/cluster-ci/collect-readonly-cluster.mjs
-      - node scripts/cluster-ci/assemble-proof.mjs
-      - node scripts/cluster-ci/validate-proof.mjs artifacts/cluster-proof/manifest.json
     when:
-      - event: deployment
+      - event: manual
+        evaluate: 'T4_CLUSTER_PROOF_ENABLED == "true"'
     backend_options:
       kubernetes:
         serviceAccountName: woodpecker-dev-verifier
+        resources:
+          requests:
+            cpu: "0"
+            memory: 256Mi
+            ephemeral-storage: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+            ephemeral-storage: 1Gi
+
+  live-ui-proof:
+    depends_on: [live-cluster-observations]
+    image: mcr.microsoft.com/playwright:v1.61.1-noble
+    environment:
+      T4_CLUSTER_NAMESPACE: t4-development
+
+    commands:
+      - corepack enable
+      - pnpm test:cluster:e2e
+      - node scripts/cluster-ci/capture-redacted-frames.mjs
+    when:
+      - event: manual
+        evaluate: 'T4_CLUSTER_PROOF_ENABLED == "true"'
+    backend_options:
+      kubernetes:
+        serviceAccountName: woodpecker-ci-untrusted
         resources:
           requests:
             cpu: "0"
@@ -584,6 +637,59 @@ steps:
             cpu: "2"
             memory: 4Gi
             ephemeral-storage: 6Gi
+
+  live-proof-assembly:
+    depends_on: [live-ui-proof]
+    image: mirror.gcr.io/library/node:24.13.1-bookworm
+    environment:
+      T4_OBSERVABILITY_MANIFEST_URL:
+        from_secret: t4_observability_manifest_url
+    commands:
+      - node scripts/cluster-ci/assemble-proof.mjs
+      - node scripts/cluster-ci/validate-proof.mjs artifacts/cluster-proof/manifest.json
+    when:
+      - event: manual
+        evaluate: 'T4_CLUSTER_PROOF_ENABLED == "true"'
+    backend_options:
+      kubernetes:
+        serviceAccountName: woodpecker-ci-untrusted
+        resources:
+          requests:
+            cpu: "0"
+            memory: 256Mi
+            ephemeral-storage: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+            ephemeral-storage: 1Gi
+
+  publish-live-proof:
+    depends_on: [live-proof-assembly]
+    image: ghcr.io/oras-project/oras:v1.3.0
+    environment:
+      HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
+      HARBOR_PROJECT: linkedin-bot
+      HARBOR_USERNAME:
+        from_secret: t4_harbor_username
+      HARBOR_PASSWORD:
+        from_secret: t4_harbor_password
+    commands:
+      - scripts/cluster-ci/publish-artifact.sh proof
+    when:
+      - event: manual
+        evaluate: 'T4_CLUSTER_PROOF_ENABLED == "true"'
+    backend_options:
+      kubernetes:
+        serviceAccountName: woodpecker-ci-untrusted
+        resources:
+          requests:
+            cpu: "0"
+            memory: 128Mi
+            ephemeral-storage: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+            ephemeral-storage: 1Gi
 
   verify:
     depends_on:

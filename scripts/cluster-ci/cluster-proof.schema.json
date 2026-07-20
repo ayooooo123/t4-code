@@ -37,7 +37,7 @@
     "httpsUrl": { "type": "string", "format": "uri", "pattern": "^https://", "maxLength": 2048 },
     "artifactPath": {
       "type": "string",
-      "pattern": "^artifacts/cluster-proof/[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$",
+      "pattern": "^artifacts/cluster-proof/(?!.*(?:/\\.\\.?/|/\\.\\.?$))[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$",
       "maxLength": 288
     },
     "source": {

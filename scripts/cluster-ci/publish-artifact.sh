@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+mode=${1:-}
+case "$mode" in
+  images)
+    repository_suffix=t4-cluster-image-evidence
+    tag=${CI_COMMIT_SHA:-}
+    artifact_type=application/vnd.t4.cluster.images.v1
+    files="artifacts/cluster-proof/image-publication.json artifacts/cluster-proof/images/*"
+    ;;
+  proof)
+    repository_suffix=t4-cluster-proof
+    tag="${CI_COMMIT_SHA:-}-${CI_PIPELINE_NUMBER:-}"
+    artifact_type=application/vnd.t4.cluster.proof.v1
+    files="artifacts/cluster-proof/manifest.json artifacts/cluster-proof/scenarios/* artifacts/cluster-proof/observations/* artifacts/cluster-proof/frames/* artifacts/cluster-proof/screenshots/* artifacts/cluster-proof/videos/*"
+    ;;
+  *)
+    echo "artifact mode must be images or proof" >&2
+    exit 64
+    ;;
+esac
+
+case "${CI_COMMIT_SHA:-}" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *)
+    echo "CI_COMMIT_SHA must be an exact lowercase 40-character SHA" >&2
+    exit 64
+    ;;
+esac
+if [ "$mode" = proof ]; then
+  case "${CI_PIPELINE_NUMBER:-}" in
+    '' | *[!0-9]*) echo "CI_PIPELINE_NUMBER must be numeric" >&2; exit 64 ;;
+  esac
+fi
+
+: "${HARBOR_REGISTRY:?HARBOR_REGISTRY is required}"
+: "${HARBOR_PROJECT:?HARBOR_PROJECT is required}"
+: "${HARBOR_USERNAME:?HARBOR_USERNAME is required}"
+: "${HARBOR_PASSWORD:?HARBOR_PASSWORD is required}"
+
+auth_dir=$(mktemp -d)
+trap 'rm -rf "$auth_dir"' EXIT HUP INT TERM
+export DOCKER_CONFIG="$auth_dir"
+printf '%s' "$HARBOR_PASSWORD" | oras login "$HARBOR_REGISTRY" --plain-http --username "$HARBOR_USERNAME" --password-stdin >/dev/null
+reference="$HARBOR_REGISTRY/$HARBOR_PROJECT/$repository_suffix:$tag"
+# shellcheck disable=SC2086
+oras push \
+  --plain-http \
+  --artifact-type "$artifact_type" \
+  --format json \
+  "$reference" \
+  $files > "artifacts/cluster-proof/$mode-oci-publication.json"
+test -s "artifacts/cluster-proof/$mode-oci-publication.json"
