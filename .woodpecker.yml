@@ -139,7 +139,7 @@ steps:
     depends_on: [legacy-authority-build]
     image: mirror.gcr.io/library/node:24.13.1-bookworm@sha256:00e9195ebd49985a6da8921f419978d85dfe354589755192dc090425ce4da2f7
     environment:
-      T4_OMP_SOURCE_DIR: /woodpecker/src/.continuity/omp
+      T4_OMP_SOURCE_DIR: .continuity/omp
     commands:
       - corepack enable
       - pnpm test:legacy-bridge-continuity
@@ -332,12 +332,17 @@ steps:
 
   sbom-controller:
     depends_on: [build-session-runtime]
-    image: anchore/syft:v1.33.0@sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357
+    image: anchore/syft:v1.33.0-debug@sha256:421a1367ee81b35b094defc7c1c42774e9f0c2f818e278848175015987c4a034
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+      PATH: "/busybox:/"
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh sbom controller t4-cluster-operator
+      - sh scripts/cluster-ci/capture-image-evidence.sh sbom controller t4-cluster-operator
     when:
       - event: push
         branch: main
@@ -384,12 +389,16 @@ steps:
 
   provenance-controller:
     depends_on: [vulnerability-controller]
-    image: gcr.io/projectsigstore/cosign:v2.6.0@sha256:71b96f6405dd3c3f081ebf73099f18edac7a716699398660890a86c42bf5edfd
+    image: gcr.io/projectsigstore/cosign:v2.6.0-dev@sha256:927acebad5fd845802b560f2a1b2cfa7c7170a5056511d2cae137a5e4fc39a4c
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh provenance controller t4-cluster-operator
+      - sh scripts/cluster-ci/capture-image-evidence.sh provenance controller t4-cluster-operator
     when:
       - event: push
         branch: main
@@ -437,12 +446,17 @@ steps:
 
   sbom-cluster-server:
     depends_on: [provenance-controller]
-    image: anchore/syft:v1.33.0@sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357
+    image: anchore/syft:v1.33.0-debug@sha256:421a1367ee81b35b094defc7c1c42774e9f0c2f818e278848175015987c4a034
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+      PATH: "/busybox:/"
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh sbom cluster-server t4-cluster-server
+      - sh scripts/cluster-ci/capture-image-evidence.sh sbom cluster-server t4-cluster-server
     when:
       - event: push
         branch: main
@@ -489,12 +503,16 @@ steps:
 
   provenance-cluster-server:
     depends_on: [vulnerability-cluster-server]
-    image: gcr.io/projectsigstore/cosign:v2.6.0@sha256:71b96f6405dd3c3f081ebf73099f18edac7a716699398660890a86c42bf5edfd
+    image: gcr.io/projectsigstore/cosign:v2.6.0-dev@sha256:927acebad5fd845802b560f2a1b2cfa7c7170a5056511d2cae137a5e4fc39a4c
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh provenance cluster-server t4-cluster-server
+      - sh scripts/cluster-ci/capture-image-evidence.sh provenance cluster-server t4-cluster-server
     when:
       - event: push
         branch: main
@@ -542,12 +560,17 @@ steps:
 
   sbom-session-runtime:
     depends_on: [provenance-cluster-server]
-    image: anchore/syft:v1.33.0@sha256:f94e5d9fce1f2278491a8e3a63bd5f6ddb81fdfdbb8bf7a1637565c1d5344357
+    image: anchore/syft:v1.33.0-debug@sha256:421a1367ee81b35b094defc7c1c42774e9f0c2f818e278848175015987c4a034
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+      PATH: "/busybox:/"
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh sbom session-runtime t4-session-runtime
+      - sh scripts/cluster-ci/capture-image-evidence.sh sbom session-runtime t4-session-runtime
     when:
       - event: push
         branch: main
@@ -594,12 +617,16 @@ steps:
 
   provenance-session-runtime:
     depends_on: [vulnerability-session-runtime]
-    image: gcr.io/projectsigstore/cosign:v2.6.0@sha256:71b96f6405dd3c3f081ebf73099f18edac7a716699398660890a86c42bf5edfd
+    image: gcr.io/projectsigstore/cosign:v2.6.0-dev@sha256:927acebad5fd845802b560f2a1b2cfa7c7170a5056511d2cae137a5e4fc39a4c
     environment:
       HARBOR_REGISTRY: harbor.tailb18de3.ts.net
       HARBOR_PROJECT: linkedin-bot
+    entrypoint:
+      - /busybox/sh
+      - -c
+      - echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e
     commands:
-      - scripts/cluster-ci/capture-image-evidence.sh provenance session-runtime t4-session-runtime
+      - sh scripts/cluster-ci/capture-image-evidence.sh provenance session-runtime t4-session-runtime
     when:
       - event: push
         branch: main

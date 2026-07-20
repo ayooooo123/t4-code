@@ -248,6 +248,7 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
     assert.ok(coreCommands.includes(command), `upstream-core must run ${command}`);
   }
   assert.ok(steps["legacy-bridge-continuity"].commands.includes("pnpm test:legacy-bridge-continuity"));
+  assert.equal(steps["legacy-bridge-continuity"].environment.T4_OMP_SOURCE_DIR, ".continuity/omp");
   assert.ok(
     steps["android-debug"].commands.includes("pnpm --filter @t4-code/mobile check:android:debug"),
   );
@@ -300,6 +301,27 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.match(steps["build-cluster-server"].commands[0], /t4-cluster-server/u);
   assert.match(steps["build-session-runtime"].commands[0], /t4-session-runtime/u);
 
+  const busyboxEntrypoint = [
+    "/busybox/sh",
+    "-c",
+    'echo "$CI_SCRIPT" | /busybox/base64 -d | /busybox/sh -e',
+  ];
+  for (const component of ["controller", "cluster-server", "session-runtime"]) {
+    const sbomStep = steps[`sbom-${component}`];
+    assert.match(sbomStep.image, /anchore\/syft:v1\.33\.0-debug@sha256:[0-9a-f]{64}$/u);
+    assert.equal(sbomStep.environment.PATH, "/busybox:/");
+    assert.deepEqual(sbomStep.entrypoint, busyboxEntrypoint);
+    assert.match(sbomStep.commands[0], /^sh scripts\/cluster-ci\/capture-image-evidence\.sh sbom /u);
+
+    const provenanceStep = steps[`provenance-${component}`];
+    assert.match(provenanceStep.image, /projectsigstore\/cosign:v2\.6\.0-dev@sha256:[0-9a-f]{64}$/u);
+    assert.deepEqual(provenanceStep.entrypoint, busyboxEntrypoint);
+    assert.match(
+      provenanceStep.commands[0],
+      /^sh scripts\/cluster-ci\/capture-image-evidence\.sh provenance /u,
+    );
+  }
+
   for (const [name, step] of Object.entries(steps)) {
     assert.match(step.image, /@sha256:[0-9a-f]{64}$/u, `${name} image must be immutable`);
     if (step.environment?.HARBOR_REGISTRY) {
@@ -325,6 +347,10 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   const buildSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/build-image.sh"), "utf8");
   assert.match(buildSource, /platform=linux\/amd64,linux\/arm64/u);
   assert.match(buildSource, /quarantine/u);
+  assert.match(buildSource, /chmod 1777 "\$artifact_dir"/u);
+  assert.match(buildSource, /chmod 0444 "\$metadata" "\$digest_file"/u);
+  const authSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/load-registry-auth.sh"), "utf8");
+  assert.match(authSource, /chmod 0711 "\$auth_parent" "\$auth_dir"/u);
   const provenanceSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/capture-image-evidence.sh"), "utf8");
   assert.match(provenanceSource, /cosign verify-attestation/u);
   assert.match(provenanceSource, /cosign download attestation/u);

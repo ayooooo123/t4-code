@@ -14,6 +14,9 @@ esac
 
 rm -rf "$auth_dir"
 mkdir -p "$auth_dir"
+auth_parent=${auth_dir%/*}
+chmod 0711 "$auth_parent" "$auth_dir"
+unset auth_parent
 encoded=$(kubectl -n linkedin-ci get secret harbor-registry-credentials -o 'jsonpath={.data.\.dockerconfigjson}')
 if [ -z "$encoded" ]; then
   echo "Harbor credential resource is missing its Docker config key" >&2

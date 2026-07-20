@@ -46,6 +46,7 @@ export DOCKER_CONFIG="$auth_dir"
 test -f "$dockerfile"
 artifact_dir="artifacts/cluster-proof/images"
 mkdir -p "$artifact_dir"
+chmod 1777 "$artifact_dir"
 metadata="$artifact_dir/$component.buildkit.json"
 digest_file="$artifact_dir/$component.digest"
 
@@ -77,3 +78,4 @@ case "$digest" in
 esac
 printf '%s\n' "$digest" > "$digest_file"
 printf '%s@%s\n' "$repository" "$digest" > "$artifact_dir/$component.reference"
+chmod 0444 "$metadata" "$digest_file" "$artifact_dir/$component.reference"
