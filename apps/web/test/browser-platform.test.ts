@@ -95,18 +95,14 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4PreparedMobileConnection: {
-          hostId: "host_AAAAAAAAAAA",
-          transportId: "tail_AAAAAAAAAAA",
-          kind: "tailscale",
+        __t4MobileBackend: {
+          endpointKey: "https://host.tailnet.ts.net:8445#profile=default",
           origin: "https://host.tailnet.ts.net:8445",
+          profileId: "default",
           wsUrl: "wss://host.tailnet.ts.net:8445/v1/ws",
           label: "T4 on host",
-          credentialScopeKey: "https://host.tailnet.ts.net:8445",
-          credentials: {
-            deviceId: "android-device",
-            deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-          },
+          deviceId: "android-device",
+          deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         },
         location: { search: "" },
       },
@@ -124,7 +120,15 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4MobileBackend: { wsUrl: "wss://old.invalid/v1/ws", label: "Old" },
+        __t4PreparedMobileConnection: {
+          hostId: "host_OLDAAAAAAAA",
+          transportId: "tail_OLDAAAAAAAA",
+          kind: "tailscale",
+          origin: "https://old.tailnet.ts.net:8445",
+          wsUrl: "wss://old.tailnet.ts.net:8445/v1/ws",
+          label: "Old",
+          credentialScopeKey: "https://old.tailnet.ts.net:8445",
+        },
         __t4MobilePeerInvite: "t4peer://v1/old/old",
         location: { search: "" },
       },
@@ -147,11 +151,12 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4PreparedMobileConnection: {
-          hostId: "host_LOGICALAAAAA", label: "Tail desktop", transportId: "tail_AAAAAAAAAAA",
-          kind: "tailscale", origin: "https://tail.tailnet.ts.net:8445",
+        __t4MobileBackend: {
+          endpointKey: "https://tail.tailnet.ts.net:8445#profile=default",
+          origin: "https://tail.tailnet.ts.net:8445",
+          profileId: "default",
           wsUrl: "wss://tail.tailnet.ts.net:8445/v1/ws",
-          credentialScopeKey: "https://tail.tailnet.ts.net:8445",
+          label: "Tail desktop",
         },
         location: { search: "" },
       },
@@ -190,10 +195,9 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4PreparedMobileConnection: {
-          hostId: "host_LOGICALBBBBB", label: "Peer desktop", transportId: "peer_AAAAAAAAAAA",
-          kind: "hyperdht",
+        __t4MobilePeer: {
           invite: "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          label: "Peer desktop",
         },
         location: { search: "" },
       },
@@ -265,13 +269,10 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", {
       configurable: true,
       value: {
-        __t4PreparedMobileConnection: {
-          hostId: "host_RESUMEAAAAA",
-          label: "Peer desktop",
-          transportId: "peer_RESUMEAAAAA",
-          kind: "hyperdht",
+        __t4MobilePeer: {
           invite:
             "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          label: "Peer desktop",
         },
         location: { search: "" },
       },

@@ -1,50 +1,34 @@
-import { deviceToken as validateDeviceToken } from "@t4-code/protocol";
-
+import { deviceToken as validateDeviceToken, type AndroidUpdateState } from "@t4-code/protocol";
 import {
-  MobileConnectionUserError,
-  parsePeerBackend,
-  peerDesktopFingerprint,
-  type StoredMobileBackend,
-  type StoredMobileConnection,
-  type StoredPeerMobileBackend,
-} from "./mobile-connection-records.ts";
-import {
-  MOBILE_HOST_DIRECTORY_STORAGE_KEY,
-  activeMobileHost,
-  parseMobileHostDirectory,
-  type MobileHost,
-  type MobileHostDirectory,
-} from "./mobile-host-schema.ts";
-import {
-  commitPreparedMobileHostMigration,
-  decodeStoredMobileBackend,
-  decodeStoredMobileBackendDirectory,
-  decodeStoredPeerMobileBackend,
-  prepareMobileHostDirectoryLoad,
-  type MobileHostMigrationIdKind,
-  type StoredMobileBackendDirectory,
-} from "./mobile-host-storage.ts";
-
-export {
-  MobileConnectionUserError,
-  parsePeerBackend,
+  DEFAULT_MOBILE_PROFILE_ID,
+  MOBILE_BACKEND_STORAGE_KEY,
   parseTailnetBackend,
   type StoredMobileBackend,
-  type StoredMobileConnection,
-  type StoredPeerMobileBackend,
-} from "./mobile-connection-records.ts";
-export { MOBILE_HOST_DIRECTORY_STORAGE_KEY } from "./mobile-host-schema.ts";
-export type { StoredMobileBackendDirectory } from "./mobile-host-storage.ts";
+  type StoredMobileBackendDirectory,
+} from "./native-mobile-backend.ts";
+import { parsePeerBackend, type StoredPeerMobileBackend } from "./mobile-connection-records.ts";
+
+export {
+  MOBILE_BACKEND_STORAGE_KEY,
+  normalizeMobileProfileId,
+  parseTailnetBackend,
+  type StoredMobileBackend,
+  type StoredMobileBackendDirectory,
+} from "./native-mobile-backend.ts";
 
 const LEGACY_MOBILE_BACKEND_STORAGE_KEY = "t4-code:mobile-backend:v1";
-export const MOBILE_BACKEND_STORAGE_KEY = "t4-code:mobile-backends:v2";
+const LEGACY_MOBILE_BACKENDS_STORAGE_KEY = "t4-code:mobile-backends:v2";
+const DEFAULT_PROFILE_ID = DEFAULT_MOBILE_PROFILE_ID;
 
 const MAX_SAVED_MOBILE_BACKENDS = 16;
+const SECURE_STORAGE_BRIDGE_TIMEOUT_MS = 1_500;
 
 export type NativeMobilePlatform = "android" | "ios";
 
 export interface NativeMobileBackendConfig {
+  readonly endpointKey: string;
   readonly origin: string;
+  readonly profileId: string;
   readonly wsUrl: string;
   readonly label: string;
   readonly deviceId?: string;
@@ -66,26 +50,16 @@ interface T4SecureStoragePlugin {
   clearCredentials(options: { readonly hostKey: string }): Promise<void>;
 }
 
-export interface NativeUpdateState {
-  readonly currentVersion: string;
-  readonly latestVersion?: string;
-  readonly checkedAt?: number;
-  readonly phase: "idle" | "checking" | "current" | "available" | "downloading" | "installer" | "error";
-  readonly revision: number;
-  readonly error?: string;
-  readonly message?: string;
+interface NativeMobileCredentials {
+  readonly deviceId: string;
+  readonly deviceToken: string;
 }
 
-export interface T4UpdatePlugin {
-  getState(): Promise<NativeUpdateState>;
-  checkForUpdate(): Promise<NativeUpdateState>;
-  /** Starts the native-owned download; later state changes report verification and installer handoff. */
-  openUpdate(): Promise<NativeUpdateState>;
-  addListener(
-    eventName: "stateChanged",
-    listener: (state: NativeUpdateState) => void,
-  ): Promise<{ remove(): Promise<void> }>;
+export interface T4SpeechPlugin {
+  speakText(options: { readonly text: string }): Promise<{ readonly accepted: boolean; readonly error?: string }>;
+  stopSpeaking(): Promise<{ readonly accepted: boolean; readonly error?: string }>;
 }
+
 export interface T4PeerConnectionPlugin {
   open(options: { readonly publicKey: string; readonly attemptId: string }): Promise<{ readonly sessionId: string }>;
   cancelOpen(options: { readonly attemptId: string }): Promise<void>;
@@ -117,18 +91,91 @@ export interface T4QrScannerPlugin {
   ): Promise<{ readonly remove: () => Promise<void> | void }>;
 }
 
-export interface T4SpeechPlugin {
-  speakText(options: { readonly text: string }): Promise<{ readonly accepted: boolean; readonly error?: string }>;
-  stopSpeaking(): Promise<{ readonly accepted: boolean; readonly error?: string }>;
+class SecureStorageBridgeTimeoutError extends Error {
+  constructor() {
+    super("Android secure storage did not answer.");
+    this.name = "SecureStorageBridgeTimeoutError";
+  }
+}
+
+async function withSecureStorageTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new SecureStorageBridgeTimeoutError()), SECURE_STORAGE_BRIDGE_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readSecureCredentials(
+  plugin: T4SecureStoragePlugin,
+  options: { readonly hostKey: string; readonly migrateLegacy: boolean },
+): ReturnType<T4SecureStoragePlugin["getCredentials"]> {
+  try {
+    return await withSecureStorageTimeout(plugin.getCredentials(options));
+  } catch (error) {
+    if (!(error instanceof SecureStorageBridgeTimeoutError)) throw error;
+    return await withSecureStorageTimeout(plugin.getCredentials(options));
+  }
+}
+
+function validatedSecureCredentials(credentials: NativeMobileCredentials): NativeMobileCredentials {
+  if (credentials.deviceId.length === 0 || credentials.deviceId.length > 256) {
+    throw new Error("invalid device id");
+  }
+  return {
+    deviceId: credentials.deviceId,
+    deviceToken: validateDeviceToken(credentials.deviceToken, "deviceToken"),
+  };
+}
+
+async function readBackendSecureCredentials(
+  plugin: T4SecureStoragePlugin,
+  backend: StoredMobileBackend,
+  migrateLegacy: boolean,
+): Promise<NativeMobileCredentials | null> {
+  const current = await readSecureCredentials(plugin, {
+    hostKey: backend.endpointKey,
+    migrateLegacy: false,
+  });
+  if (current.credentials !== null) return validatedSecureCredentials(current.credentials);
+  if (backend.profileId !== DEFAULT_PROFILE_ID) return null;
+
+  const legacy = await readSecureCredentials(plugin, {
+    hostKey: backend.origin,
+    migrateLegacy,
+  });
+  if (legacy.credentials === null) return null;
+  const credentials = validatedSecureCredentials(legacy.credentials);
+  await withSecureStorageTimeout(plugin.setCredentials({ hostKey: backend.endpointKey, ...credentials }));
+  await withSecureStorageTimeout(plugin.clearCredentials({ hostKey: backend.origin }));
+  return credentials;
+}
+export type NativeUpdateState = AndroidUpdateState;
+
+export interface T4UpdatePlugin {
+  getState(): Promise<NativeUpdateState>;
+  checkForUpdate(): Promise<NativeUpdateState>;
+  /** Starts the native-owned download; later state changes report verification and installer handoff. */
+  openUpdate(): Promise<NativeUpdateState>;
+  addListener(
+    eventName: "stateChanged",
+    listener: (state: NativeUpdateState) => void,
+  ): Promise<{ remove(): Promise<void> }>;
 }
 
 interface CapacitorBridge {
   readonly Plugins?: {
     readonly T4SecureStorage?: T4SecureStoragePlugin;
-    readonly T4PeerConnection?: T4PeerConnectionPlugin;
-    readonly T4QrScanner?: T4QrScannerPlugin;
     readonly T4Update?: T4UpdatePlugin;
     readonly T4Speech?: T4SpeechPlugin;
+    readonly T4PeerConnection?: T4PeerConnectionPlugin;
+    readonly T4QrScanner?: T4QrScannerPlugin;
   };
   readonly getPlatform?: () => string;
   readonly isNativePlatform?: () => boolean;
@@ -137,49 +184,30 @@ interface CapacitorBridge {
 declare global {
   interface Window {
     Capacitor?: CapacitorBridge;
-    __t4PreparedMobileConnection?: PreparedMobileConnection;
     __t4MobileBackend?: NativeMobileBackendConfig;
-    __t4MobilePeerInvite?: string;
+    __t4MobilePeer?: MobilePeerConnectionConfig;
   }
 }
 
-interface PreparedMobileConnectionBase {
-  readonly hostId: string;
-  readonly label: string;
-  readonly transportId: string;
-}
+export const MOBILE_PEER_BACKEND_STORAGE_KEY = "t4-code:mobile-peer:v1";
 
-export type PreparedMobileConnection =
-  | (PreparedMobileConnectionBase & {
-      readonly kind: "tailscale";
-      readonly origin: string;
-      readonly wsUrl: string;
-      readonly credentialScopeKey: string;
-      readonly credentials?: { readonly deviceId: string; readonly deviceToken: string };
-    })
-  | (PreparedMobileConnectionBase & {
-      readonly kind: "hyperdht";
-      readonly invite: string;
-    });
+/** Renderer-local projection of the active HyperDHT private connection. */
+export interface MobilePeerConnectionConfig {
+  readonly invite: string;
+  readonly label: string;
+}
 
 export type MobileBootResult =
   | { readonly kind: "web" }
-  | {
-      readonly kind: "ready";
-      readonly host: MobileHost;
-      readonly directory: MobileHostDirectory;
-      readonly connection: PreparedMobileConnection;
-    }
+  | { readonly kind: "ready"; readonly backend: StoredMobileBackend }
+  | { readonly kind: "ready"; readonly peer: MobilePeerConnectionConfig }
   | { readonly kind: "setup"; readonly mode: "first-run"; readonly message?: string }
   | {
       readonly kind: "setup";
       readonly mode: "repair";
-      readonly repairAction: "tailnet" | "upgrade" | "unavailable";
+      readonly repairAction: "tailnet" | "unavailable";
       readonly message: string;
     };
-
-/** Identifies validated corrupt state without ever exposing its raw details. */
-class StoredMobileStateError extends Error {}
 
 function secureStorage(): T4SecureStoragePlugin | null {
   return window.Capacitor?.Plugins?.T4SecureStorage ?? null;
@@ -190,7 +218,6 @@ export function peerConnection(): T4PeerConnectionPlugin | null {
 }
 
 export function nativeQrScanner(): T4QrScannerPlugin | null {
-  if (typeof window === "undefined") return null;
   return window.Capacitor?.Plugins?.T4QrScanner ?? null;
 }
 
@@ -214,70 +241,80 @@ function parsedStorageValue(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
-    throw new StoredMobileStateError("damaged saved host list");
+    throw new Error("The saved host list is damaged. Add the host again.");
   }
 }
 
 function storedMobileBackend(value: unknown): StoredMobileBackend {
-  try {
-    return decodeStoredMobileBackend(value);
-  } catch {
-    throw new StoredMobileStateError("inconsistent saved host list");
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The saved host list is damaged. Add the host again.");
   }
+  const data = value as Record<string, unknown>;
+  if (data.version !== 1 && data.version !== 3) {
+    throw new Error("The saved host list is from an unsupported app version.");
+  }
+  if (typeof data.origin !== "string") throw new Error("The saved host list is damaged. Add the host again.");
+  const parsed = parseTailnetBackend(
+    data.origin,
+    data.version === 3 && typeof data.profileId === "string" ? data.profileId : undefined,
+  );
+  if (
+    data.wsUrl !== parsed.wsUrl ||
+    data.label !== parsed.label ||
+    (data.version === 3 && data.endpointKey !== parsed.endpointKey)
+  ) {
+    throw new Error("The saved host list is inconsistent. Add the host again.");
+  }
+  return parsed;
 }
 
-function storedPeerMobileBackend(value: unknown): StoredPeerMobileBackend | null {
-  try {
-    return decodeStoredPeerMobileBackend(value);
-  } catch {
-    throw new StoredMobileStateError("invalid private connection");
+function storedMobileBackendDirectory(value: unknown, version: 2 | 3): StoredMobileBackendDirectory {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The saved host list is damaged. Add the host again.");
   }
-}
-
-export function readStoredMobileConnection(storage: ReadableMobileStorage = window.localStorage): StoredMobileConnection | null {
-  const raw = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
-  if (raw !== null) {
-    const value = parsedStorageValue(raw);
-    const peer = storedPeerMobileBackend(value);
-    if (peer !== null) return peer;
+  const data = value as Record<string, unknown>;
+  const activeEndpointKey =
+    version === 3
+      ? data.activeEndpointKey
+      : typeof data.activeOrigin === "string"
+        ? parseTailnetBackend(data.activeOrigin, DEFAULT_PROFILE_ID).endpointKey
+        : undefined;
+  if (
+    (version === 3 && data.version !== 3) ||
+    (version === 2 && data.version !== 2) ||
+    typeof activeEndpointKey !== "string" ||
+    !Array.isArray(data.backends) ||
+    data.backends.length === 0 ||
+    data.backends.length > MAX_SAVED_MOBILE_BACKENDS
+  ) {
+    throw new Error("The saved host list is from an unsupported app version.");
   }
-  return readStoredMobileBackend(storage);
-}
-
-function storedMobileBackendDirectory(value: unknown): StoredMobileBackendDirectory {
-  try {
-    return decodeStoredMobileBackendDirectory(value);
-  } catch {
-    throw new StoredMobileStateError("inconsistent saved host list");
+  const backends = data.backends.map(storedMobileBackend);
+  const keys = new Set(backends.map((backend) => backend.endpointKey));
+  if (keys.size !== backends.length || !keys.has(activeEndpointKey)) {
+    throw new Error("The saved host list is inconsistent. Add the host again.");
   }
+  return { version: 3, activeEndpointKey, backends };
 }
 
 export function readStoredMobileBackendDirectory(
   storage: ReadableMobileStorage = window.localStorage,
 ): StoredMobileBackendDirectory | null {
-  const raw = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
-  if (raw !== null) {
-    const value = parsedStorageValue(raw);
-    if (storedPeerMobileBackend(value) !== null) return null;
-    return storedMobileBackendDirectory(value);
-  }
+  const current = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
+  if (current !== null) return storedMobileBackendDirectory(parsedStorageValue(current), 3);
+  const legacyDirectory = storage.getItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY);
+  if (legacyDirectory !== null) return storedMobileBackendDirectory(parsedStorageValue(legacyDirectory), 2);
   const legacy = storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
   if (legacy === null) return null;
   const backend = storedMobileBackend(parsedStorageValue(legacy));
-  return { version: 2, activeOrigin: backend.origin, backends: [backend] };
+  return { version: 3, activeEndpointKey: backend.endpointKey, backends: [backend] };
 }
 
 export function readStoredMobileBackend(
   storage: ReadableMobileStorage = window.localStorage,
 ): StoredMobileBackend | null {
-  const raw = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
-  if (raw !== null && storedPeerMobileBackend(parsedStorageValue(raw)) !== null) {
-    throw new Error("The saved connection is private, not a Tailnet host.");
-  }
   const directory = readStoredMobileBackendDirectory(storage);
-  return (
-    directory?.backends.find((backend) => backend.origin === directory.activeOrigin) ?? null
-  );
+  return directory?.backends.find((backend) => backend.endpointKey === directory.activeEndpointKey) ?? null;
 }
 
 function writeStoredMobileBackendDirectory(
@@ -285,6 +322,7 @@ function writeStoredMobileBackendDirectory(
   storage: MutableMobileStorage,
 ): void {
   storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(directory));
+  storage.removeItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY);
   storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
 }
 
@@ -294,16 +332,15 @@ export function writeStoredMobileBackend(
 ): void {
   const canonical = storedMobileBackend(backend);
   const current = readStoredMobileBackendDirectory(storage);
-  const existing = current?.backends.filter((item) => item.origin !== canonical.origin) ?? [];
-  if (existing.length >= MAX_SAVED_MOBILE_BACKENDS) {
+  const existing = current?.backends.filter((item) => item.endpointKey !== canonical.endpointKey) ?? [];
+  if (current === null && existing.length >= MAX_SAVED_MOBILE_BACKENDS) {
     throw new Error(`This phone can save up to ${MAX_SAVED_MOBILE_BACKENDS} T4 hosts.`);
   }
+  if (existing.length >= MAX_SAVED_MOBILE_BACKENDS) {
+    throw new Error(`This phone can save up to ${MAX_SAVED_MOBILE_BACKENDS} T4 endpoints.`);
+  }
   writeStoredMobileBackendDirectory(
-    {
-      version: 2,
-      activeOrigin: canonical.origin,
-      backends: [...existing, canonical],
-    },
+    { version: 3, activeEndpointKey: canonical.endpointKey, backends: [...existing, canonical] },
     storage,
   );
 }
@@ -315,60 +352,105 @@ export function replaceStoredMobileBackend(
 ): void {
   const canonical = storedMobileBackend(backend);
   writeStoredMobileBackendDirectory(
-    { version: 2, activeOrigin: canonical.origin, backends: [canonical] },
+    { version: 3, activeEndpointKey: canonical.endpointKey, backends: [canonical] },
     storage,
   );
 }
 
+function findEndpoint(directory: StoredMobileBackendDirectory, keyOrOrigin: string): StoredMobileBackend | undefined {
+  return (
+    directory.backends.find((backend) => backend.endpointKey === keyOrOrigin) ??
+    directory.backends.find(
+      (backend) => backend.origin === keyOrOrigin && backend.profileId === DEFAULT_PROFILE_ID,
+    )
+  );
+}
+
 export function selectStoredMobileBackend(
-  origin: string,
+  endpointKey: string,
   storage: MutableMobileStorage = window.localStorage,
 ): void {
   const directory = readStoredMobileBackendDirectory(storage);
-  if (directory === null || !directory.backends.some((backend) => backend.origin === origin)) {
-    throw new Error("That saved host is no longer available.");
-  }
-  writeStoredMobileBackendDirectory({ ...directory, activeOrigin: origin }, storage);
+  const backend = directory === null ? undefined : findEndpoint(directory, endpointKey);
+  if (directory === null || backend === undefined) throw new Error("That saved host is no longer available.");
+  writeStoredMobileBackendDirectory({ ...directory, activeEndpointKey: backend.endpointKey }, storage);
 }
 
-export function writeStoredPeerBackend(
-  backend: StoredPeerMobileBackend,
-  storage: Pick<Storage, "setItem"> = window.localStorage,
-): void {
-  storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(backend));
-}
-
-function firstRunStorageIsEmpty(storage: Pick<Storage, "getItem">): boolean {
+function decodeStoredPeerBackend(raw: string): StoredPeerMobileBackend {
+  let value: unknown;
   try {
-    const existing = [
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  const record = value as Record<string, unknown>;
+  if (record.version !== 2 || record.kind !== "peer" || typeof record.invite !== "string") {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  const canonical = parsePeerBackend(record.invite);
+  if (canonical.invite !== record.invite || canonical.label !== record.label) {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  return canonical;
+}
+
+export function readStoredPeerMobileBackend(
+  storage: ReadableMobileStorage = window.localStorage,
+): StoredPeerMobileBackend | null {
+  const raw = storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY);
+  if (raw === null) return null;
+  return decodeStoredPeerBackend(raw);
+}
+
+function firstRunStorageIsEmpty(storage: ReadableMobileStorage): boolean {
+  try {
+    return [
       storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY),
+      storage.getItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY),
       storage.getItem(MOBILE_BACKEND_STORAGE_KEY),
-      storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY),
-    ];
-    return existing.every((value) => value === null);
+      storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY),
+    ].every((value) => value === null);
   } catch {
     return false;
   }
 }
 
 /**
- * The only persistence boundary used by first-run private pairing.
- *
- * Existing bytes are deliberately treated as opaque ownership markers: this
- * function neither parses nor removes them. All reads happen synchronously
- * immediately before the write, so a scan or paste preview cannot overwrite a
- * Tailnet record that appeared while the preview was open. A read failure is a
- * refusal, as is a repeated confirmation.
+ * The only persistence boundary used by first-run private pairing. Existing
+ * bytes at any connection key are a refusal: a scan or paste preview must
+ * never overwrite a record that appeared while the preview was open.
  */
 export function writeFirstRunPeerBackend(
   candidate: StoredPeerMobileBackend,
   storage: Pick<Storage, "getItem" | "setItem"> = window.localStorage,
 ): boolean {
-  const canonical = parsePeerBackend(candidate.invite);
-  if (canonical.label !== candidate.label) return false;
+  let canonical: StoredPeerMobileBackend;
+  try {
+    canonical = parsePeerBackend(candidate.invite);
+    if (canonical.label !== candidate.label) return false;
+  } catch {
+    return false;
+  }
   if (!firstRunStorageIsEmpty(storage)) return false;
   try {
-    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(canonical));
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(canonical));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Guarded first-run equivalent for a verified Tailnet backend. */
+export function writeFirstRunTailnetBackend(
+  candidate: StoredMobileBackend,
+  storage: MutableMobileStorage = window.localStorage,
+): boolean {
+  if (!firstRunStorageIsEmpty(storage)) return false;
+  try {
+    writeStoredMobileBackend(candidate, storage);
     return true;
   } catch {
     return false;
@@ -376,11 +458,9 @@ export function writeFirstRunPeerBackend(
 }
 
 /**
- * Explicit repair boundary for a QR/pasted private key.
- *
- * A valid directory is never replaced here. Unreadable generations are
- * snapshotted, checked again immediately before the write, and retained until
- * the canonical v3 replacement has been read back successfully.
+ * Explicit repair boundary for a QR/pasted private key. A healthy Tailnet
+ * directory or a healthy stored private connection is never replaced here;
+ * only unreadable state is.
  */
 export function replaceBrokenMobileConnectionWithPeer(
   candidate: StoredPeerMobileBackend,
@@ -393,321 +473,191 @@ export function replaceBrokenMobileConnectionWithPeer(
   } catch {
     return false;
   }
-
-  const nextId = (kind: MobileHostMigrationIdKind): string => {
-    const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
-      `${Date.now().toString(36)}${Math.random().toString(36).slice(2).padEnd(16, "0")}`;
-    return `${kind}_${random}`.slice(0, 64);
-  };
-  let originalV3: string | null;
-  let originalV2: string | null;
-  let originalLegacy: string | null;
+  let broken = false;
   try {
-    originalV3 = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
-    originalV2 = storage.getItem(MOBILE_BACKEND_STORAGE_KEY);
-    originalLegacy = storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
-    if (prepareMobileHostDirectoryLoad(storage, nextId).kind !== "repair") return false;
-    if (
-      storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY) !== originalV3 ||
-      storage.getItem(MOBILE_BACKEND_STORAGE_KEY) !== originalV2 ||
-      storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY) !== originalLegacy
-    ) {
-      return false;
-    }
-  } catch {
-    return false;
-  }
-
-  const hostId = nextId("host");
-  const transportId = nextId("hyperdht");
-  const directory = parseMobileHostDirectory({
-    version: 3,
-    activeHostId: hostId,
-    hosts: [{
-      id: hostId,
-      label: canonical.label,
-      transports: [{
-        id: transportId,
-        kind: "hyperdht",
-        invite: canonical.invite,
-        desktopFingerprint: peerDesktopFingerprint(canonical.invite),
-      }],
-      preferredTransportIds: [transportId],
-      lastConnection: null,
-    }],
-  });
-  const replacement = JSON.stringify(directory);
-  try {
-    storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, replacement);
-    const written = storage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
-    if (written !== replacement) throw new Error("saved repair did not verify");
-    parseMobileHostDirectory(JSON.parse(written));
-  } catch {
+    if (readStoredMobileBackendDirectory(storage) !== null) return false;
     try {
-      if (originalV3 === null) storage.removeItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
-      else storage.setItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY, originalV3);
+      if (readStoredPeerMobileBackend(storage) !== null) return false;
     } catch {
-      // Restoration is best effort when the platform storage itself is broken.
+      broken = true;
     }
+  } catch {
+    broken = true;
+  }
+  if (!broken) return false;
+  try {
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(canonical));
+    const written = storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY);
+    if (written === null) return false;
+    decodeStoredPeerBackend(written);
+  } catch {
     return false;
   }
-
-  try { storage.removeItem(MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
-  try { storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY); } catch { /* v3 is authoritative */ }
+  try { storage.removeItem(MOBILE_BACKEND_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
   return true;
 }
 
-/** Guarded first-run equivalent for a verified Tailnet backend. */
-export function writeFirstRunTailnetBackend(
-  candidate: StoredMobileBackend,
-  storage: Pick<Storage, "getItem" | "setItem"> = window.localStorage,
-): boolean {
-  let canonical: StoredMobileBackend;
-  try {
-    canonical = storedMobileBackend(candidate);
-  } catch {
-    return false;
-  }
-  if (!firstRunStorageIsEmpty(storage)) return false;
-  const directory: StoredMobileBackendDirectory = {
-    version: 2,
-    activeOrigin: canonical.origin,
-    backends: [canonical],
-  };
-  try {
-    storage.setItem(MOBILE_BACKEND_STORAGE_KEY, JSON.stringify(directory));
-    return true;
-  } catch {
-    return false;
-  }
+export function currentNativeMobilePeer(): MobilePeerConnectionConfig | null {
+  if (typeof window === "undefined") return null;
+  return window.__t4MobilePeer ?? null;
+}
+
+export function currentNativeMobilePeerInvite(): string | null {
+  return currentNativeMobilePeer()?.invite ?? null;
 }
 
 export function currentNativeMobileBackend(): NativeMobileBackendConfig | null {
   if (typeof window === "undefined") return null;
-  const connection = window.__t4PreparedMobileConnection;
-  if (connection?.kind !== "tailscale") return null;
-  return {
-    origin: connection.origin,
-    wsUrl: connection.wsUrl,
-    label: connection.label,
-    ...connection.credentials,
-  };
-}
-
-export function currentNativeMobilePeerInvite(): string | null {
-  if (typeof window === "undefined") return null;
-  const connection = window.__t4PreparedMobileConnection;
-  return connection?.kind === "hyperdht" ? connection.invite : null;
-}
-
-export function currentPreparedMobileConnection(): PreparedMobileConnection | null {
-  if (typeof window === "undefined") return null;
-  return window.__t4PreparedMobileConnection ?? null;
+  return window.__t4MobileBackend ?? null;
 }
 
 export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   const platform = nativeMobilePlatform();
   if (platform === null) return { kind: "web" };
-  delete window.__t4PreparedMobileConnection;
-  delete window.__t4MobileBackend;
-  delete window.__t4MobilePeerInvite;
   document.documentElement.dataset.platform = platform;
-  const nextId = (kind: MobileHostMigrationIdKind): string => {
-    const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "") ??
-      `${Date.now().toString(36)}${Math.random().toString(36).slice(2).padEnd(16, "0")}`;
-    return `${kind}_${random}`.slice(0, 64);
-  };
-  let observedV3: string | null;
+  delete window.__t4MobileBackend;
+  delete window.__t4MobilePeer;
+  let shouldMigrateLegacyCredentials = false;
+  let backend: StoredMobileBackend | null;
   try {
-    observedV3 = window.localStorage.getItem(MOBILE_HOST_DIRECTORY_STORAGE_KEY);
-  } catch {
+    shouldMigrateLegacyCredentials =
+      window.localStorage.getItem(MOBILE_BACKEND_STORAGE_KEY) === null &&
+      (window.localStorage.getItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY) !== null ||
+        window.localStorage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY) !== null);
+    backend = readStoredMobileBackend();
+    if (backend !== null && window.localStorage.getItem(MOBILE_BACKEND_STORAGE_KEY) === null) {
+      const directory = readStoredMobileBackendDirectory();
+      if (directory !== null) writeStoredMobileBackendDirectory(directory, window.localStorage);
+    }
+  } catch (error) {
+    return {
+      kind: "setup",
+      mode: "repair",
+      repairAction: "tailnet",
+      message: error instanceof Error ? error.message : "Enter the host address again.",
+    };
+  }
+  if (backend === null) {
+    let peer: StoredPeerMobileBackend | null;
+    try {
+      peer = readStoredPeerMobileBackend();
+    } catch {
+      return {
+        kind: "setup",
+        mode: "repair",
+        repairAction: "tailnet",
+        message: "The saved private connection cannot be opened. Scan a replacement key or use a Tailnet address.",
+      };
+    }
+    if (peer !== null) {
+      window.__t4MobilePeer = { invite: peer.invite, label: peer.label };
+      return { kind: "ready", peer: { invite: peer.invite, label: peer.label } };
+    }
+    return { kind: "setup", mode: "first-run" };
+  }
+
+  const plugin = secureStorage();
+  if (plugin === null) {
     return {
       kind: "setup",
       mode: "repair",
       repairAction: "unavailable",
-      message: "T4 Code cannot read saved connection storage. Close and reopen the app, then check system storage settings.",
+      message: "The Android security bridge did not start. Close T4 Code and open it again.",
     };
   }
-  const prepared = prepareMobileHostDirectoryLoad(window.localStorage, nextId);
-  if (prepared.kind === "empty") return { kind: "setup", mode: "first-run" };
-  if (prepared.kind === "repair") {
-    if (observedV3 !== null) {
+
+  let credentials: NativeMobileCredentials | null = null;
+  try {
+    credentials = await readBackendSecureCredentials(
+      plugin,
+      backend,
+      shouldMigrateLegacyCredentials,
+    );
+  } catch (error) {
+    if (error instanceof SecureStorageBridgeTimeoutError) {
       return {
         kind: "setup",
         mode: "repair",
-        repairAction: "upgrade",
-        message: "A newer saved host directory is present but is not available in this build.",
+        repairAction: "unavailable",
+        message: "Android secure storage did not answer. Close T4 Code and open it again.",
       };
     }
-    return mobileMigrationRepair("tailnet");
+    await withSecureStorageTimeout(
+      plugin.clearCredentials({ hostKey: backend.endpointKey }),
+    ).catch(() => undefined);
   }
 
-  const directory = prepared.directory;
-  const host = activeMobileHost(directory);
-  const connection = projectedMobileConnection(host);
-  if (prepared.kind === "existing") {
-    if (connection.kind === "hyperdht") return readyMobileBoot(directory, host, connection);
-    const plugin = secureStorage();
-    if (plugin === null) return mobileMigrationRepair("unavailable");
-    let credentials: { readonly deviceId: string; readonly deviceToken: string } | null = null;
-    try {
-      const result = await plugin.getCredentials({
-        hostKey: connection.credentialScopeKey,
-        migrateLegacy: false,
-      });
-      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
-    } catch {
-      try { await plugin.clearCredentials({ hostKey: connection.credentialScopeKey }); } catch { /* best effort */ }
-    }
-    return readyMobileBoot(directory, host, withPreparedCredentials(connection, credentials));
-  }
-
-  const plugin = secureStorage();
-  let credentials: { readonly deviceId: string; readonly deviceToken: string } | null = null;
-  if (prepared.legacyOrigin !== undefined) {
-    if (plugin === null) {
-      if (connection.kind === "hyperdht") return readyMobileBoot(directory, host, connection);
-      return mobileMigrationRepair("unavailable");
-    }
-    try {
-      const result = await plugin.getCredentials({
-        hostKey: prepared.legacyOrigin,
-        migrateLegacy: true,
-      });
-      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
-    } catch {
-      return readyMobileBoot(directory, host, connection);
-    }
-    if (connection.kind !== "tailscale" || connection.credentialScopeKey !== prepared.legacyOrigin) {
-      credentials = null;
-    }
-  } else if (connection.kind === "tailscale") {
-    if (plugin === null) return mobileMigrationRepair("unavailable");
-    try {
-      const result = await plugin.getCredentials({ hostKey: connection.credentialScopeKey, migrateLegacy: false });
-      if (result.credentials !== null) credentials = validatedNativeCredentials(result.credentials);
-    } catch {
-      return readyMobileBoot(directory, host, connection);
-    }
-  }
-
-  const committed = commitPreparedMobileHostMigration(prepared, window.localStorage);
-  if (committed.kind === "repair") return mobileMigrationRepair("unavailable");
-  return readyMobileBoot(
-    committed.directory,
-    activeMobileHost(committed.directory),
-    withPreparedCredentials(connection, credentials),
-  );
-}
-
-function mobileMigrationRepair(
-  repairAction: "tailnet" | "unavailable",
-): Extract<MobileBootResult, { readonly kind: "setup"; readonly mode: "repair" }> {
-  return {
-    kind: "setup",
-    mode: "repair",
-    repairAction,
-    message: repairAction === "tailnet"
-      ? "The saved connection cannot be opened. You can replace it with a verified Tailnet address."
-      : "T4 Code cannot update saved connection storage. Close and reopen the app, then check system storage settings.",
+  window.__t4MobileBackend = {
+    endpointKey: backend.endpointKey,
+    origin: backend.origin,
+    profileId: backend.profileId,
+    wsUrl: backend.wsUrl,
+    label: backend.label,
+    ...(credentials === null ? {} : credentials),
   };
+  return { kind: "ready", backend };
 }
 
-function projectedMobileConnection(host: MobileHost): PreparedMobileConnection {
-  const preferredId = host.preferredTransportIds[0]!;
-  const transport = host.transports.find((item) => item.id === preferredId)!;
-  return transport.kind === "tailscale"
-    ? {
-        hostId: host.id,
-        label: host.label,
-        transportId: transport.id,
-        kind: "tailscale",
-        origin: transport.origin,
-        wsUrl: transport.wsUrl,
-        credentialScopeKey: transport.credentialScopeKey,
-      }
-    : {
-        hostId: host.id,
-        label: host.label,
-        transportId: transport.id,
-        kind: "hyperdht",
-        invite: transport.invite,
-      };
-}
-
-function validatedNativeCredentials(credentials: {
-  readonly deviceId: string;
-  readonly deviceToken: string;
-}): { readonly deviceId: string; readonly deviceToken: string } {
-  if (credentials.deviceId.length === 0 || credentials.deviceId.length > 256) {
-    throw new Error("invalid device id");
+export function assertCurrentNativeMobileEndpoint(endpointKey: string): void {
+  const configured = currentNativeMobileBackend();
+  if (configured?.endpointKey !== endpointKey) {
+    throw new Error("The active mobile host changed while pairing.");
   }
-  return {
-    deviceId: credentials.deviceId,
-    deviceToken: validateDeviceToken(credentials.deviceToken, "deviceToken"),
-  };
+  const stored = readStoredMobileBackend();
+  if (stored?.endpointKey !== endpointKey) {
+    throw new Error("The active mobile host changed while pairing.");
+  }
 }
 
-function withPreparedCredentials(
-  connection: PreparedMobileConnection,
-  credentials: { readonly deviceId: string; readonly deviceToken: string } | null,
-): PreparedMobileConnection {
-  if (connection.kind === "hyperdht" || credentials === null) return connection;
-  return { ...connection, credentials };
-}
-
-function readyMobileBoot(
-  directory: MobileHostDirectory,
-  host: MobileHost,
-  connection: PreparedMobileConnection,
-): Extract<MobileBootResult, { readonly kind: "ready" }> {
-  window.__t4PreparedMobileConnection = connection;
-  delete window.__t4MobileBackend;
-  delete window.__t4MobilePeerInvite;
-  return { kind: "ready", host, directory, connection };
-}
-
-export async function persistNativeMobileCredentials(credentials: {
-  readonly deviceId: string;
-  readonly deviceToken: string;
-}): Promise<void> {
+export async function persistNativeMobileCredentials(
+  credentials: {
+    readonly deviceId: string;
+    readonly deviceToken: string;
+  },
+  endpointKey?: string,
+): Promise<void> {
   if (nativeMobilePlatform() === null) return;
-  const connection = currentPreparedMobileConnection();
-  if (connection === null) throw new Error("The active mobile host is unavailable");
-  if (connection.kind === "hyperdht") return;
+  if (endpointKey === undefined) throw new Error("The active mobile host is unavailable");
   const plugin = secureStorage();
   if (plugin === null) throw new Error("Android secure storage is unavailable");
+  assertCurrentNativeMobileEndpoint(endpointKey);
   await plugin.setCredentials({
-    hostKey: connection.credentialScopeKey,
+    hostKey: endpointKey,
     deviceId: credentials.deviceId,
     deviceToken: validateDeviceToken(credentials.deviceToken, "deviceToken"),
   });
 }
 
 export async function removeNativeMobileBackend(
-  origin: string,
+  endpointKey: string,
   storage: MutableMobileStorage = window.localStorage,
 ): Promise<void> {
   const directory = readStoredMobileBackendDirectory(storage);
-  if (directory === null || !directory.backends.some((backend) => backend.origin === origin)) {
+  const backend = directory === null ? undefined : findEndpoint(directory, endpointKey);
+  if (directory === null || backend === undefined) {
     throw new Error("That saved host is no longer available.");
   }
   const plugin = secureStorage();
   if (plugin === null) throw new Error("Android secure storage is unavailable");
 
-  // Remove non-secret routing metadata before touching the irreversible
-  // credential. If secure deletion fails, restore the complete directory so a
-  // failed removal never strands the selected host without an address.
-  const backends = directory.backends.filter((backend) => backend.origin !== origin);
+  // Remove routing metadata before irreversible credential deletion. Restore
+  // the exact prior directory if secure deletion fails.
+  const backends = directory.backends.filter((item) => item.endpointKey !== backend.endpointKey);
   const next = backends[0];
   if (next === undefined) {
     storage.removeItem(MOBILE_BACKEND_STORAGE_KEY);
+    storage.removeItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY);
     storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY);
   } else {
     writeStoredMobileBackendDirectory(
       {
-        version: 2,
-        activeOrigin: directory.activeOrigin === origin ? next.origin : directory.activeOrigin,
+        version: 3,
+        activeEndpointKey:
+          directory.activeEndpointKey === backend.endpointKey
+            ? next.endpointKey
+            : directory.activeEndpointKey,
         backends,
       },
       storage,
@@ -715,7 +665,10 @@ export async function removeNativeMobileBackend(
   }
 
   try {
-    await plugin.clearCredentials({ hostKey: origin });
+    await plugin.clearCredentials({ hostKey: backend.endpointKey });
+    if (backend.profileId === DEFAULT_PROFILE_ID) {
+      await plugin.clearCredentials({ hostKey: backend.origin });
+    }
   } catch (error) {
     try {
       writeStoredMobileBackendDirectory(directory, storage);
@@ -726,11 +679,8 @@ export async function removeNativeMobileBackend(
     }
     throw error;
   }
-  if (
-    window.__t4PreparedMobileConnection?.kind === "tailscale" &&
-    window.__t4PreparedMobileConnection.credentialScopeKey === origin
-  ) {
-    delete window.__t4PreparedMobileConnection;
+  if (window.__t4MobileBackend?.endpointKey === backend.endpointKey) {
+    delete window.__t4MobileBackend;
   }
 }
 
@@ -768,16 +718,16 @@ export async function probeMobileBackend(
       socket.close(1000, "T4 mobile connection check");
     };
     const onError = () =>
-      finish(new MobileConnectionUserError("T4 Code could not reach that host. Check Tailscale and the address."));
+      finish(new Error("T4 Code could not reach that host. Check Tailscale and the address."));
     const onClose = () =>
-      finish(new MobileConnectionUserError("The host closed the connection before T4 Code could start."));
+      finish(new Error("The host closed the connection before T4 Code could start."));
     const onAbort = () => {
       finish(new DOMException("The host check was cancelled.", "AbortError"));
       socket.close();
     };
     const timer = setTimeout(() => {
       socket.close();
-      finish(new MobileConnectionUserError("The host did not answer. Check that Tailscale and the T4 gateway are running."));
+      finish(new Error("The host did not answer. Check that Tailscale and the T4 gateway are running."));
     }, timeoutMs);
     socket.addEventListener("open", onOpen);
     socket.addEventListener("error", onError);

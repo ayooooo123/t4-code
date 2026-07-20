@@ -66,8 +66,9 @@ import {
   type BrowserConnectionLifecycleOptions,
 } from "./browser-connection-lifecycle.ts";
 import {
-  currentPreparedMobileConnection,
+  assertCurrentNativeMobileEndpoint,
   currentNativeMobileBackend,
+  currentNativeMobilePeer,
   nativeMobilePlatform,
   persistNativeMobileCredentials,
 } from "./native-mobile.ts";
@@ -219,13 +220,14 @@ export interface BrowserShellPortOptions {
 export function createBrowserShellPort(
   options: BrowserShellPortOptions = {},
 ): DesktopShellPort | null {
-  const preparedConnection = currentPreparedMobileConnection();
-  const peerInvite = preparedConnection?.kind === "hyperdht" ? preparedConnection.invite : null;
+  const peer = currentNativeMobilePeer();
+  const peerInvite = peer?.invite ?? null;
   const config = peerInvite === null
     ? detectBackend()
-    : { wsUrl: "wss://private.invalid", label: preparedConnection?.label ?? "T4 private host" };
+    : { wsUrl: "wss://private.invalid", label: peer?.label ?? "T4 private host" };
   if (config === null) return null;
   const backendConfig = config;
+  const nativeEndpointKey = currentNativeMobileBackend()?.endpointKey;
   const mobilePlatform = nativeMobilePlatform();
   const platform: "linux" | "darwin" = (() => {
     if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform)) return "darwin";
@@ -322,7 +324,12 @@ export function createBrowserShellPort(
         peerInvite === null ? COMPATIBILITY_FEATURES : HYPERDHT_COMPATIBILITY_FEATURES,
       authentication: () => authentication,
       privilegedPairResult: async (result) => {
-        await persistNativeMobileCredentials(result);
+        if (peerInvite === null) {
+          await persistNativeMobileCredentials(result, nativeEndpointKey);
+          if (nativeEndpointKey !== undefined) {
+            assertCurrentNativeMobileEndpoint(nativeEndpointKey);
+          }
+        }
         authentication = { deviceId: result.deviceId, deviceToken: result.deviceToken };
       },
       client: {

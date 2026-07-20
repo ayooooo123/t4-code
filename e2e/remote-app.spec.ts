@@ -370,9 +370,7 @@ async function openSession(page: Page, mobile: boolean): Promise<void> {
 }
 
 test.describe.configure({ mode: "serial" });
-// TODO(mobile-profiles): re-enable once upstream's endpointKey/profileId mobile-backend
-// model is integrated with this branch's HyperDHT host-directory model (deferred; see PR notes).
-test.skip("routes mobile session creation to the selected profile and preserves both profiles", async ({
+test("routes mobile session creation to the selected profile and preserves both profiles", async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });

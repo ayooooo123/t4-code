@@ -3,17 +3,15 @@ import { Cable, KeyRound, LockKeyhole, Network } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
 import {
+  parseTailnetBackend,
   probeMobileBackend,
   replaceBrokenMobileConnectionWithPeer,
   replaceStoredMobileBackend,
+  type StoredMobileBackend,
   writeFirstRunPeerBackend,
   writeFirstRunTailnetBackend,
 } from "../platform/native-mobile.ts";
-import {
-  MobileConnectionUserError,
-  parseTailnetBackend,
-  type StoredMobileBackend,
-} from "../platform/mobile-connection-records.ts";
+import { MobileConnectionUserError } from "../platform/mobile-connection-records.ts";
 import { buildPeerPairingCandidate } from "../platform/mobile-qr-scanner.ts";
 import { MobileQrScannerFlow } from "./MobileQrScannerFlow.tsx";
 
@@ -67,6 +65,9 @@ export async function probeAndSaveMobileBackend(
 
 export function safeTailnetFormMessage(error: unknown, phase: "validation" | "probe"): string {
   if (error instanceof MobileConnectionUserError) return error.message;
+  if (phase === "validation" && error instanceof Error && error.message.length > 0) {
+    return error.message;
+  }
   return phase === "validation"
     ? "Enter a valid HTTPS Tailnet address."
     : "T4 Code could not verify that host. Check Tailscale and try again.";
@@ -85,6 +86,7 @@ export function TailnetAddressForm({
 }) {
   const id = useId();
   const [address, setAddress] = useState("");
+  const [profileId, setProfileId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const activeProbe = useRef<AbortController | null>(null);
@@ -95,6 +97,7 @@ export function TailnetAddressForm({
     [],
   );
   const addressId = `${id}-address`;
+  const profileIdId = `${id}-profile`;
   const helpId = `${id}-help`;
   const statusId = `${id}-status`;
 
@@ -107,7 +110,7 @@ export function TailnetAddressForm({
         setMessage(null);
         let backend;
         try {
-          backend = parseTailnetBackend(address);
+          backend = parseTailnetBackend(address, profileId);
         } catch (error) {
           setMessage(safeTailnetFormMessage(error, "validation"));
           return;
@@ -159,6 +162,22 @@ export function TailnetAddressForm({
         type="url"
         value={address}
       />
+      <label className="font-medium text-sm" htmlFor={profileIdId}>
+        Profile ID <span className="font-normal text-muted-foreground">(optional)</span>
+      </label>
+      <input
+        aria-describedby={helpId}
+        autoCapitalize="none"
+        autoComplete="off"
+        autoCorrect="off"
+        className="h-12 w-full rounded-lg border border-input bg-background px-3 font-mono text-base outline-none transition-shadow duration-(--motion-duration-fast) placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+        disabled={checking}
+        id={profileIdId}
+        onChange={(event) => setProfileId(event.target.value)}
+        placeholder="default route"
+        spellCheck={false}
+        value={profileId}
+      />
       <p className="text-muted-foreground text-xs leading-relaxed" id={helpId}>
         Use the full HTTPS address shown by the T4 gateway on your computer.
       </p>
@@ -179,11 +198,11 @@ export function TailnetAddressForm({
 }
 
 export function MobileConnectionScreen({
-  mode,
+  mode = "first-run",
   repairAction,
   startupMessage,
 }: {
-  readonly mode: "first-run" | "repair";
+  readonly mode?: "first-run" | "repair";
   readonly repairAction?: "tailnet" | "upgrade" | "unavailable";
   readonly startupMessage?: string;
 }) {
