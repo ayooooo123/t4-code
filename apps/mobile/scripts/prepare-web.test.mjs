@@ -263,8 +263,25 @@ test("private Android DHT stays active under a foreground connection service", a
   assert.match(service, /START_STICKY/);
   assert.match(service, /fun start\(context: Context\) \{\s+if \(active\) return/);
   assert.match(service, /HyperDHT\(DhtOptions\(usePublicBootstrap = true\)\)/);
-  assert.match(plugin, /if \(!T4PeerConnectionService\.isActive\(\)\) T4PeerConnectionService\.currentDht\(\)\?\.suspend\(\)/);
-  assert.match(plugin, /if \(!T4PeerConnectionService\.isActive\(\)\) T4PeerConnectionService\.currentDht\(\)\?\.resume\(\)/);
+  assert.match(plugin, /val idle = !opening && sessions\.isEmpty\(\) && !T4PeerConnectionService\.isActive\(\)/);
+  assert.match(plugin, /T4PeerConnectionService\.currentDht\(\)\?\.also \{ suspendedDht = it \}/);
+  assert.match(plugin, /toSuspend\?\.suspend\(\)/);
+});
+
+test("rapid Android app switching cannot strand a suspended DHT node", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  // Resume must not be gated on the foreground-service flag: the service can
+  // start between pause and resume, which used to strand the node suspended.
+  assert.doesNotMatch(plugin, /if \(!T4PeerConnectionService\.isActive\(\)\) T4PeerConnectionService\.currentDht\(\)\?\.resume\(\)/);
+  assert.match(plugin, /private var suspendedDht: HyperDHT\? = null/);
+  assert.match(plugin, /private fun resumeSuspendedDht\(exclude: HyperDHT\?\)/);
+  // Foreground resume drains the tracked suspend unconditionally.
+  assert.match(plugin, /resumeSuspendedDht\(exclude = null\)/);
+  // Every open clears leftover suspended state, including on a recreated
+  // plugin instance that never tracked the suspend.
+  assert.match(plugin, /resumeSuspendedDht\(exclude = retiredDht\)/);
+  assert.match(plugin, /it !== exclude && it\.isSuspended/);
 });
 
 test("private Android reconnects recreate stale DHT state after a long background interval", async () => {

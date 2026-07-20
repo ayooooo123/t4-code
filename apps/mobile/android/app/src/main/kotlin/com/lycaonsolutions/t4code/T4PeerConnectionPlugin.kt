@@ -35,6 +35,7 @@ class T4PeerConnectionPlugin : Plugin() {
     private var openingJob: Job? = null
     private var pausedAtElapsedMs: Long? = null
     private var resetDhtBeforeNextOpen = false
+    private var suspendedDht: HyperDHT? = null
 
     @PluginMethod
     fun open(call: PluginCall) {
@@ -76,6 +77,11 @@ class T4PeerConnectionPlugin : Plugin() {
                     Log.i(TAG, "Recreating private DHT after an extended background interval.")
                 }
                 try { retiredDht?.close() } catch (_: Exception) {}
+                // A rapid background/foreground cycle can leave the shared node
+                // suspended: pause fires while the service is still inactive and
+                // the resume-side wake races the service start. A suspended node
+                // cannot bootstrap or hole-punch, so every open clears that first.
+                resumeSuspendedDht(exclude = retiredDht)
                 val activeDht = dht()
                 dht = activeDht
                 withTimeout(NATIVE_OPEN_TIMEOUT_MS) {
@@ -188,10 +194,13 @@ class T4PeerConnectionPlugin : Plugin() {
     }
 
     override fun handleOnPause() {
-        synchronized(sessions) {
+        val toSuspend = synchronized(sessions) {
             pausedAtElapsedMs = SystemClock.elapsedRealtime()
+            val idle = !opening && sessions.isEmpty() && !T4PeerConnectionService.isActive()
+            if (!idle || suspendedDht != null) null
+            else T4PeerConnectionService.currentDht()?.also { suspendedDht = it }
         }
-        if (!T4PeerConnectionService.isActive()) T4PeerConnectionService.currentDht()?.suspend()
+        toSuspend?.suspend()
         super.handleOnPause()
     }
 
@@ -205,7 +214,9 @@ class T4PeerConnectionPlugin : Plugin() {
                 resetDhtBeforeNextOpen = true
             }
         }
-        if (!T4PeerConnectionService.isActive()) T4PeerConnectionService.currentDht()?.resume()
+        // Resume regardless of the service flag: the service may have started
+        // between pause and resume, which previously stranded the node suspended.
+        resumeSuspendedDht(exclude = null)
     }
 
     override fun handleOnDestroy() {
@@ -219,6 +230,28 @@ class T4PeerConnectionPlugin : Plugin() {
         val session = synchronized(sessions) { sessions.remove(id) } ?: return
         if (cancelReceiver) session.receiveJob.cancel()
         try { session.stream.close() } catch (_: Exception) {}
+    }
+
+    /**
+     * Resume whatever this plugin suspended, even if the foreground service
+     * started in the meantime. suspend()/resume() are serialized on the DHT
+     * loop executor, so resuming the tracked instance is ordered after a
+     * still-queued suspend from a rapid pause/resume cycle. The isSuspended
+     * fallback covers a recreated plugin instance that inherited a suspended
+     * node it never tracked.
+     */
+    private fun resumeSuspendedDht(exclude: HyperDHT?) {
+        val tracked = synchronized(sessions) {
+            val dht = suspendedDht
+            suspendedDht = null
+            dht
+        }
+        val target = tracked?.takeIf { it !== exclude }
+            ?: T4PeerConnectionService.currentDht()?.takeIf { it !== exclude && it.isSuspended }
+            ?: return
+        try { target.resume() } catch (error: RuntimeException) {
+            Log.w(TAG, "Could not resume the private DHT node.", error)
+        }
     }
 
     /** The foreground service owns one DHT node across Activity and OMP stream lifecycles. */
