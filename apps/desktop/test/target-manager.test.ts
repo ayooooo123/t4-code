@@ -602,7 +602,7 @@ describe("desktop target manager boundaries", () => {
     expect(transports.every((item) => item.closed)).toBe(true);
     await runtime.close();
   });
-  it("keeps local full scope and isolates each remote scope across reconnects", async () => {
+  it("keeps local cluster control default-off and isolates each remote scope across reconnects", async () => {
     const localTransports: Transport[] = [];
     const local = new DesktopTargetManager({
       cursorStore: new Store(),
@@ -617,7 +617,9 @@ describe("desktop target manager boundaries", () => {
     const localHello = JSON.parse(localTransports[0]?.sent[0] ?? "{}") as Record<string, unknown>;
     expect(localHello).toMatchObject({
       type: "hello",
-      capabilities: { client: [...DEVICE_CAPABILITIES] },
+      capabilities: {
+        client: DEVICE_CAPABILITIES.filter((capability) => capability !== "ci.trigger"),
+      },
     });
     await local.close();
 
