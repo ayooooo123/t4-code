@@ -9,6 +9,7 @@ import {
 import {
   commandId,
   confirmationId,
+  CLUSTER_OPERATOR_FEATURE,
   DEVICE_CAPABILITIES,
   hostId,
   revision,
@@ -224,6 +225,34 @@ async function settlesBeforeTurnLimit<T>(promise: Promise<T>): Promise<T> {
 }
 
 describe("desktop target manager boundaries", () => {
+  it("requests cluster.operator only after explicit desktop opt-in", async () => {
+    const defaultTransport = new Transport();
+    const defaultRuntime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      localTransportFactory: () => defaultTransport as never,
+      events: { onEvent: () => {}, onState: () => {}, onError: () => {} },
+    });
+    await defaultRuntime.connect("local");
+    const defaultHello = JSON.parse(defaultTransport.sent[0] ?? "{}") as {
+      readonly requestedFeatures?: readonly string[];
+    };
+    expect(defaultHello.requestedFeatures).not.toContain(CLUSTER_OPERATOR_FEATURE);
+    await defaultRuntime.close();
+
+    const enabledTransport = new Transport();
+    const enabledRuntime = new DesktopTargetManager({
+      cursorStore: new Store(),
+      clusterOperatorEnabled: true,
+      localTransportFactory: () => enabledTransport as never,
+      events: { onEvent: () => {}, onState: () => {}, onError: () => {} },
+    });
+    await enabledRuntime.connect("local");
+    const enabledHello = JSON.parse(enabledTransport.sent[0] ?? "{}") as {
+      readonly requestedFeatures?: readonly string[];
+    };
+    expect(enabledHello.requestedFeatures).toContain(CLUSTER_OPERATOR_FEATURE);
+    await enabledRuntime.close();
+  });
   it("lists and connects named local profiles through profile-scoped transports", async () => {
     const transports: Transport[] = [];
     const requestedProfiles: string[] = [];

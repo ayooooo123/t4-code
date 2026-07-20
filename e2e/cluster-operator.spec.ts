@@ -1,0 +1,395 @@
+import { type AddressInfo } from "node:net";
+import { expect, test, type Page } from "@playwright/test";
+import WebSocket, { WebSocketServer } from "ws";
+
+import { BuiltWebServer } from "./built-web-server.ts";
+
+const PUBLIC_WSS = "wss://operator-fixture.tailnet.ts.net/v1/ws";
+const HOST = "cluster-host";
+const SESSION = "cluster-session";
+const VIEW = `${HOST}/${SESSION}`;
+const WORKSPACE = {
+  id: "workspace-a",
+  displayName: "Release train",
+  phase: "Ready",
+  retentionPolicy: "Retain",
+  storageClass: "t4-workspaces-rwx",
+  capacity: "20Gi",
+  accessMode: "ReadWriteMany",
+  revision: "workspace-r2",
+  condition: {
+    type: "StorageReady",
+    status: "True",
+    reason: "Bound",
+    message: "The RWX claim is bound.",
+    observedGeneration: 2,
+  },
+} as const;
+
+function sessionRef(ciStatus: "queued" | "running" | "success" = "running") {
+  return {
+    hostId: HOST,
+    sessionId: SESSION,
+    project: { projectId: "cluster/workspace-a", name: "Release train" },
+    revision: "session-r3",
+    title: "Ship release",
+    status: "active",
+    updatedAt: "2026-07-20T12:00:00.000Z",
+    model: "gpt-proxy/gpt-5.6-sol",
+    liveState: {
+      phase: "running",
+      cluster: {
+        workspaceId: WORKSPACE.id,
+        infrastructurePhase: "Running",
+        gui: { state: "Ready", previewId: "preview-a" },
+      },
+      ci: {
+        provider: "woodpecker",
+        correlation: "exact",
+        repositoryId: "repo-a",
+        branch: "main",
+        ref: "refs/heads/main",
+        commit: "0123456789abcdef",
+        pipelineNumber: 42,
+        status: ciStatus,
+        currentStage: ciStatus === "success" ? "complete" : "verify",
+        startedAt: "2026-07-20T12:01:00.000Z",
+        deepLink: "https://ci.tailnet.ts.net/repos/repo-a/pipeline/42",
+      },
+    },
+  };
+}
+
+class OperatorWireFixture {
+  readonly commands: Array<Record<string, unknown>> = [];
+  readonly hellos: Array<Record<string, unknown>> = [];
+  private readonly server = new WebSocketServer({ host: "127.0.0.1", port: 0, path: "/v1/ws" });
+  private workspaceSeq = 2;
+  private ciStatus: "queued" | "running" | "success" = "running";
+
+  get url(): string {
+    const address = this.server.address() as AddressInfo | null;
+    if (address === null) throw new Error("operator fixture is not listening");
+    return `ws://127.0.0.1:${address.port}/v1/ws`;
+  }
+
+  async start(): Promise<void> {
+    if (this.server.address() !== null) return;
+    await new Promise<void>((resolve, reject) => {
+      this.server.once("listening", resolve);
+      this.server.once("error", reject);
+    });
+    this.server.on("connection", (socket) => {
+      socket.on("message", (data) => this.receive(socket, JSON.parse(data.toString()) as Record<string, unknown>));
+    });
+  }
+
+  async stop(): Promise<void> {
+    for (const socket of this.server.clients) socket.terminate();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+
+  disconnectClients(): void {
+    for (const socket of this.server.clients) socket.close(1012, "fixture restart");
+  }
+
+  private send(socket: WebSocket, frame: unknown): void {
+    socket.send(JSON.stringify(frame));
+  }
+
+  private response(socket: WebSocket, frame: Record<string, unknown>, result: unknown): void {
+    this.send(socket, {
+      v: "omp-app/1",
+      type: "response",
+      requestId: frame.requestId,
+      commandId: frame.commandId,
+      hostId: HOST,
+      ...(frame.sessionId === undefined ? {} : { sessionId: frame.sessionId }),
+      command: frame.command,
+      ok: true,
+      result,
+    });
+  }
+
+  private receive(socket: WebSocket, frame: Record<string, unknown>): void {
+    if (frame.type === "hello") {
+      this.hellos.push(frame);
+      this.send(socket, {
+        v: "omp-app/1",
+        type: "welcome",
+        selectedProtocol: "omp-app/1",
+        hostId: HOST,
+        ompVersion: "17.0.5",
+        ompBuild: "8476f4451ed95c5d5401785d279a93d3c659fac4",
+        appserverVersion: "cluster-fixture",
+        appserverBuild: "redacted",
+        epoch: "cluster-epoch-1",
+        grantedCapabilities: [
+          "sessions.read",
+          "sessions.manage",
+          "sessions.prompt",
+          "sessions.control",
+          "preview.read",
+          "preview.control",
+          "preview.input",
+          "ci.trigger",
+        ],
+        grantedFeatures: ["resume", "host.watch", "cluster.operator", "preview.control"],
+        negotiatedLimits: {},
+        authentication: "paired",
+        resumed: this.hellos.length > 1,
+      });
+      return;
+    }
+    if (frame.type !== "command") return;
+    this.commands.push(frame);
+    switch (frame.command) {
+      case "session.list":
+        this.response(socket, frame, {
+          cursor: { epoch: "session-index-1", seq: 3 },
+          sessions: [sessionRef(this.ciStatus)],
+          totalCount: 1,
+          truncated: false,
+        });
+        return;
+      case "host.watch":
+        this.response(socket, frame, { watching: true, cursor: { epoch: "session-index-1", seq: 3 } });
+        return;
+      case "workspace.list":
+        this.response(socket, frame, {
+          cursor: { epoch: "workspace-index-1", seq: this.workspaceSeq },
+          workspaces: [WORKSPACE],
+        });
+        this.send(socket, {
+          v: "omp-app/1",
+          type: "workspace.state",
+          hostId: HOST,
+          workspaceId: WORKSPACE.id,
+          cursor: { epoch: "workspace-index-1", seq: this.workspaceSeq },
+          revision: WORKSPACE.revision,
+          upsert: WORKSPACE,
+        });
+        return;
+      case "session.attach":
+        this.response(socket, frame, { attached: true, cursor: { epoch: "transcript-1", seq: 1 } });
+        this.send(socket, {
+          v: "omp-app/1",
+          type: "snapshot",
+          hostId: HOST,
+          sessionId: SESSION,
+          cursor: { epoch: "transcript-1", seq: 1 },
+          revision: "session-r3",
+          entries: [],
+        });
+        this.send(socket, {
+          v: "omp-app/1",
+          type: "agent",
+          hostId: HOST,
+          sessionId: SESSION,
+          agentId: "Main",
+          state: "running",
+          progress: 0.4,
+          detail: { kind: "main", title: "Main", startedAt: "2026-07-20T12:00:00.000Z" },
+        });
+        this.send(socket, {
+          v: "omp-app/1",
+          type: "agent",
+          hostId: HOST,
+          sessionId: SESSION,
+          agentId: "WorkerA",
+          state: "running",
+          progress: 0.7,
+          detail: {
+            parentId: "Main",
+            title: "WorkerA",
+            description: "Verify CI and wait for peer reply",
+            currentTool: "irc.wait",
+            evidence: "Parked peer revived; owner-scoped job still running",
+            startedAt: "2026-07-20T12:00:10.000Z",
+          },
+        });
+        this.send(socket, {
+          v: "omp-app/1",
+          type: "preview.state",
+          hostId: HOST,
+          sessionId: SESSION,
+          previewId: "preview-a",
+          state: "ready",
+          url: "https://127.0.0.1:4173/",
+          revision: "preview-r1",
+          cursor: { epoch: "preview-1", seq: 1 },
+          title: "Session GUI",
+          canGoBack: false,
+          canGoForward: false,
+          viewport: { width: 1280, height: 720, deviceScaleFactor: 1 },
+          availableActions: ["navigate", "capture", "click", "fill", "type", "press", "scroll"],
+          authority: {
+            id: "omp-session",
+            label: "Session",
+            kind: "isolated-session",
+            requiresExplicitOptIn: false,
+          },
+        });
+        return;
+      case "session.steer":
+      case "session.prompt":
+        this.response(socket, frame, { accepted: true });
+        return;
+      case "preview.policy.check":
+        this.response(socket, frame, { allowed: true });
+        return;
+      case "preview.lease.acquire":
+        this.response(socket, frame, {
+          previewId: "preview-a",
+          leaseId: "preview-lease-a",
+          expiresAt: Date.now() + 30_000,
+        });
+        return;
+      case "preview.lease.release":
+        this.response(socket, frame, { previewId: "preview-a", released: true });
+        return;
+      case "preview.type":
+      case "preview.fill":
+      case "preview.press":
+      case "preview.scroll":
+        this.response(socket, frame, { accepted: true });
+        return;
+      case "ci.run":
+        this.ciStatus = "queued";
+        this.response(socket, frame, {
+          provider: "woodpecker",
+          correlation: "exact",
+          pipelineNumber: 43,
+          status: "queued",
+        });
+        return;
+      default:
+        this.response(socket, frame, {});
+    }
+  }
+}
+
+let wire: OperatorWireFixture;
+let web: BuiltWebServer;
+
+async function routeFixtureWss(page: Page): Promise<void> {
+  await page.addInitScript(
+    ({ publicUrl, routedUrl }) => {
+      const NativeWebSocket = window.WebSocket;
+      class RoutedWebSocket extends NativeWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          super(String(url) === publicUrl ? routedUrl : url, protocols);
+        }
+      }
+      Object.defineProperties(RoutedWebSocket, {
+        CONNECTING: { value: NativeWebSocket.CONNECTING },
+        OPEN: { value: NativeWebSocket.OPEN },
+        CLOSING: { value: NativeWebSocket.CLOSING },
+        CLOSED: { value: NativeWebSocket.CLOSED },
+      });
+      window.WebSocket = RoutedWebSocket;
+    },
+    { publicUrl: PUBLIC_WSS, routedUrl: wire.url },
+  );
+}
+
+async function openSession(page: Page, mobile = false): Promise<void> {
+  await routeFixtureWss(page);
+  await page.goto(web.url, { waitUntil: "domcontentloaded" });
+  if (mobile) await page.getByRole("button", { name: "Show session list" }).click();
+  const row = page.locator(`[data-session-row="${VIEW}"]`);
+  await expect(row).toBeVisible();
+  await row.click();
+  await expect(page).toHaveURL(/#\/sessions\/cluster-host%2Fcluster-session|#\/sessions\/cluster-host\/cluster-session/u);
+}
+
+test.describe("OMP/T4 cluster GUI boundaries", () => {
+  test.describe.configure({ mode: "serial" });
+
+  test.beforeAll(async () => {
+    wire = new OperatorWireFixture();
+    await wire.start();
+    web = new BuiltWebServer({
+      wsUrl: PUBLIC_WSS,
+      label: "Redacted cluster fixture",
+      clusterOperatorEnabled: true,
+    });
+    await web.start();
+  });
+
+  test.afterAll(async () => {
+    await web?.stop();
+    await wire?.stop();
+  });
+
+  test("desktop attach, steer, and reconnect preserve canonical cursors without duplicate rows", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await openSession(page);
+    const composer = page.getByRole("textbox", { name: "Message the session" });
+    await composer.fill("Keep the current approach");
+    await page.getByRole("button", { name: "Steer", exact: true }).click();
+    await expect.poll(() => wire.commands.some((frame) => frame.command === "session.steer")).toBe(true);
+
+    const helloCount = wire.hellos.length;
+    wire.disconnectClients();
+    await expect.poll(() => wire.hellos.length).toBeGreaterThan(helloCount);
+    await expect(page.locator(`[data-session-row="${VIEW}"]`)).toHaveCount(1);
+    expect(wire.hellos.at(-1)?.requestedFeatures).toContain("cluster.operator");
+  });
+
+  test("Agent View keeps exact OMP ids, parentage, attention, and progress alongside exact CI state", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await openSession(page);
+    await page.goto(`${web.url}#/agents`);
+    await expect(page.getByRole("heading", { name: "Agent View" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Main", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "WorkerA", exact: true })).toBeVisible();
+    await expect(page.getByText("Parent: Main", { exact: false })).toBeVisible();
+    await expect(page.getByRole("progressbar", { name: "70% done" })).toBeVisible();
+    await expect(page.getByText("Parked peer revived; owner-scoped job still running", { exact: true })).toBeVisible();
+    await expect(page.getByText("verify", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("running", { exact: true }).first()).toBeVisible();
+  });
+
+  test("phone uses one secure WSS target and reconnect replay does not duplicate workspace or session rows", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openSession(page, true);
+    expect(wire.hellos.at(-1)?.requestedFeatures).toContain("cluster.operator");
+    const helloCount = wire.hellos.length;
+    wire.disconnectClients();
+    await expect.poll(() => wire.hellos.length).toBeGreaterThan(helloCount);
+    await page.getByRole("button", { name: "Show session list" }).click();
+    await expect(page.locator(`[data-session-row="${VIEW}"]`)).toHaveCount(1);
+    await page.goto(`${web.url}#/hosts`);
+    await expect(page.locator('[data-cluster-workspace-id="workspace-a"]')).toHaveCount(1);
+    await expect(page.getByText("t4-workspaces-rwx", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Cluster workspaces" })).toBeVisible();
+    const createWorkspace = page.getByRole("button", { name: "Create cluster workspace" });
+    await expect(createWorkspace).toBeVisible();
+    const createBox = await createWorkspace.boundingBox();
+    expect(createBox).not.toBeNull();
+    expect(createBox!.height).toBeGreaterThanOrEqual(43.99);
+    expect(
+      await page.evaluate(() =>
+        getComputedStyle(document.documentElement).getPropertyValue("--motion-duration-fast").trim(),
+      ),
+    ).toBe("0ms");
+  });
+
+  test("phone Browser Preview gates input through lease/revision and denies cross-session GUI routes", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openSession(page, true);
+    await page.goto(`${web.url}#/sessions/${encodeURIComponent(VIEW)}/preview`);
+    await expect(page.getByRole("heading", { name: "Browser preview" })).toBeVisible();
+    await page.getByRole("textbox", { name: "Text" }).fill("hello from phone");
+    await page.getByRole("button", { name: "Type", exact: true }).click();
+    await expect.poll(() => wire.commands.some((frame) => frame.command === "preview.lease.acquire")).toBe(true);
+    await expect.poll(() => wire.commands.some((frame) => frame.command === "preview.type")).toBe(true);
+
+    await page.setViewportSize({ width: 844, height: 390 });
+    await expect(page.getByRole("heading", { name: "Browser preview" })).toBeVisible();
+    await page.goto(`${web.url}#/sessions/${encodeURIComponent(`${HOST}/other-session`)}/preview`);
+    await expect(page.getByRole("heading", { name: "Browser preview" })).toHaveCount(0);
+  });
+});
