@@ -375,7 +375,7 @@ describe("cluster operator presentation", () => {
   });
 
   it("sends only allowlisted workspace, session, and CI arguments", async () => {
-    const command = vi.fn(async () => ({ accepted: true, result: {} }));
+    const command = vi.fn(async (..._args: Parameters<DesktopRuntimeController["command"]>) => ({ accepted: true, result: {} }));
     const controller = { command, getSnapshot: () => snapshot({ enabled: true, workspace, session }) } as unknown as DesktopRuntimeController;
 
     await createClusterWorkspace(controller, TARGET, HOST, {

@@ -80,8 +80,8 @@ describe("mobile cluster target", () => {
     expect(capture.options().compatibilityRequestedFeatures).not.toContain(
       CLUSTER_OPERATOR_FEATURE,
     );
-    expect(capture.options().requestedCapabilities).not.toContain(CI_TRIGGER_CAPABILITY);
-    expect(capture.options().requestedCapabilities).toEqual(
+    expect(capture.options().capabilities).not.toContain(CI_TRIGGER_CAPABILITY);
+    expect(capture.options().capabilities).toEqual(
       expect.arrayContaining(["sessions.read", "preview.read", "preview.control", "preview.input"]),
     );
   });
@@ -101,7 +101,7 @@ describe("mobile cluster target", () => {
     expect(capture.options().requestedFeatures).toContain(CLUSTER_OPERATOR_FEATURE);
     expect(capture.options().compatibilityRequestedFeatures).toContain(CLUSTER_OPERATOR_FEATURE);
     expect(capture.options().requestedFeatures).toContain("preview.control");
-    expect(capture.options().requestedCapabilities).toEqual(
+    expect(capture.options().capabilities).toEqual(
       expect.arrayContaining([
         "sessions.read",
         "sessions.manage",

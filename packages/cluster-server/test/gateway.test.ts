@@ -127,7 +127,7 @@ describe("stateless omp-app cluster gateway", () => {
 			type: "welcome",
 			hostId: "cluster:host-uid",
 			epoch: "replica-uid-1",
-			grantedFeatures: ["resume", "cluster.operator"],
+			grantedFeatures: ["resume", "preview.control", "cluster.operator"],
 		});
 		expect((first.client.frames[1] as { sessions: unknown[] }).sessions).toHaveLength(2);
 

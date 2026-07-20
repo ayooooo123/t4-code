@@ -189,7 +189,7 @@ export async function createClusterWorkspace(
   const result = await controller.command(targetId, {
     hostId: hostId(hostIdValue),
     command: "workspace.create",
-    args,
+    args: { ...args },
   });
   if (!result.accepted) throw new Error("Cluster workspace creation was rejected.");
   return result;
@@ -205,7 +205,7 @@ export async function createClusterSession(
   const result = await controller.command(targetId, {
     hostId: hostId(hostIdValue),
     command: "session.create",
-    args,
+    args: { ...args },
   });
   if (!result.accepted) throw new Error("Cluster session creation was rejected.");
   return result;
@@ -225,7 +225,7 @@ export async function runClusterCi(
     sessionId: sessionId(sessionIdValue),
     command: "ci.run",
     expectedRevision,
-    args,
+    args: { ...args },
   });
   if (!result.accepted) throw new Error("CI run was rejected.");
   return result;
