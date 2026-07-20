@@ -67,13 +67,6 @@ class FakeDht {
 
 describe("PeerShareHost", () => {
   it("shares one listener while concurrent callers start the host", async () => {
-    const PeerShareHost = (peer as Record<string, unknown>).PeerShareHost as new (options: {
-      readonly createDht: () => FakeDht;
-      readonly createKeyPair: () => { readonly publicKey: Uint8Array; readonly secretKey: Uint8Array };
-      readonly randomBytes: (length: number) => Uint8Array;
-      readonly setTimer: (callback: () => void, delay: number) => unknown;
-      readonly clearTimer: (timer: unknown) => void;
-    }) => { start(): Promise<{ readonly invite: string }>; stop(): Promise<void> };
     const dht = new FakeDht();
     let resolveListen: (() => void) | undefined;
     const listening = new Promise<void>((resolve) => { resolveListen = resolve; });

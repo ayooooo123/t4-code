@@ -96,7 +96,7 @@ function stripQuotedLiterals(source) {
 
 function directCoordinates(gradle, group, artifact) {
   const escaped = `${group}:${artifact}`.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  const stringNotation = [...gradle.matchAll(new RegExp(`(?:implementation|api|compileOnly|runtimeOnly)\\s*(?:\\(|\\s)[\\s'\"]*${escaped}:([^'\"\\s)]+)`, "gu"))]
+  const stringNotation = [...gradle.matchAll(new RegExp(`(?:implementation|api|compileOnly|runtimeOnly)\\s*(?:\\(|\\s)[\\s'"]*${escaped}:([^'"\\s)]+)`, "gu"))]
     .map((match) => match[1]);
   const mapNotation = dependencyDeclarations(gradle).flatMap((declaration) => {
     const declaredGroup = gradleMapAttribute(declaration, "group");
@@ -126,7 +126,7 @@ function dependencyDeclarations(gradle) {
 }
 
 function gradleMapAttribute(declaration, name) {
-  const match = declaration.match(new RegExp(`\\b${name}\\s*(?::|=)\\s*(['\"])([^'\"]+)\\1`, "u"));
+  const match = declaration.match(new RegExp(`\\b${name}\\s*(?::|=)\\s*(['"])([^'"]+)\\1`, "u"));
   return match?.[2] ?? null;
 }
 

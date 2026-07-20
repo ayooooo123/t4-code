@@ -16,7 +16,7 @@ import {
 import { FolderCog, FolderPlus } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { desktopRuntime, useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
+import { useDesktopRuntimeSnapshot } from "../platform/desktop-runtime.ts";
 import { rendererPlatform, workspaceStore } from "../state/store-instance.ts";
 
 type Roots = { readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null };

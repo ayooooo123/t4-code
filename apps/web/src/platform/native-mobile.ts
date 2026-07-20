@@ -3,7 +3,6 @@ import { deviceToken as validateDeviceToken } from "@t4-code/protocol";
 import {
   MobileConnectionUserError,
   parsePeerBackend,
-  parseTailnetBackend,
   peerDesktopFingerprint,
   type StoredMobileBackend,
   type StoredMobileConnection,
@@ -491,7 +490,7 @@ export function currentNativeMobileBackend(): NativeMobileBackendConfig | null {
     origin: connection.origin,
     wsUrl: connection.wsUrl,
     label: connection.label,
-    ...(connection.credentials ?? {}),
+    ...connection.credentials,
   };
 }
 

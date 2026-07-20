@@ -23,7 +23,7 @@ test("emits deterministic public-only acceptance PNGs", async (context) => {
   };
 
   const firstResult = await generateQrAcceptanceFixtures(first, { encode });
-  const secondResult = await generateQrAcceptanceFixtures(second, { encode });
+  await generateQrAcceptanceFixtures(second, { encode });
 
   assert.deepEqual(firstResult.files, ["invalid.png", "valid.png"]);
   assert.deepEqual(seen.map(([value]) => value), [
