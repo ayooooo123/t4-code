@@ -240,10 +240,6 @@ steps:
       BUILDKIT_ADDR: tcp://woodpecker-buildkitd.linkedin-ci.svc.cluster.local:1234
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/build-image.sh controller t4-cluster-operator cluster/images/controller/Dockerfile
     when:
@@ -269,10 +265,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh sbom controller t4-cluster-operator
     when:
@@ -298,10 +290,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh vulnerability controller t4-cluster-operator
     when:
@@ -327,10 +315,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh provenance controller t4-cluster-operator
     when:
@@ -357,10 +341,6 @@ steps:
       BUILDKIT_ADDR: tcp://woodpecker-buildkitd.linkedin-ci.svc.cluster.local:1234
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/build-image.sh cluster-server t4-cluster-server cluster/images/cluster-server/Dockerfile
     when:
@@ -386,10 +366,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh sbom cluster-server t4-cluster-server
     when:
@@ -415,10 +391,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh vulnerability cluster-server t4-cluster-server
     when:
@@ -444,10 +416,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh provenance cluster-server t4-cluster-server
     when:
@@ -474,10 +442,6 @@ steps:
       BUILDKIT_ADDR: tcp://woodpecker-buildkitd.linkedin-ci.svc.cluster.local:1234
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/build-image.sh session-runtime t4-session-runtime cluster/images/session-runtime/Dockerfile
     when:
@@ -503,10 +467,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh sbom session-runtime t4-session-runtime
     when:
@@ -532,10 +492,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh vulnerability session-runtime t4-session-runtime
     when:
@@ -561,10 +517,6 @@ steps:
     environment:
       HARBOR_REGISTRY: harbor.linkedin-registry.svc.cluster.local
       HARBOR_PROJECT: linkedin-bot
-      HARBOR_USERNAME:
-        from_secret: t4_harbor_username
-      HARBOR_PASSWORD:
-        from_secret: t4_harbor_password
     commands:
       - scripts/cluster-ci/capture-image-evidence.sh provenance session-runtime t4-session-runtime
     when:
@@ -612,14 +564,6 @@ steps:
     image: mcr.microsoft.com/playwright:v1.61.1-noble
     environment:
       T4_CLUSTER_NAMESPACE: t4-development
-      T4_CLUSTER_BASE_URL:
-        from_secret: t4_cluster_base_url
-      T4_CLUSTER_AUTH_TOKEN:
-        from_secret: t4_cluster_proof_token
-      T4_IMAGE_PUBLICATION_MANIFEST_URL:
-        from_secret: t4_image_publication_manifest_url
-      T4_OBSERVABILITY_MANIFEST_URL:
-        from_secret: t4_observability_manifest_url
     commands:
       - corepack enable
       - pnpm test:cluster:e2e
@@ -628,7 +572,6 @@ steps:
       - node scripts/cluster-ci/validate-proof.mjs artifacts/cluster-proof/manifest.json
     when:
       - event: deployment
-        environment: development
     backend_options:
       kubernetes:
         serviceAccountName: woodpecker-dev-verifier
