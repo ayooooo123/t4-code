@@ -11,6 +11,16 @@ import { peerConnection, type T4PeerConnectionPlugin } from "./native-mobile.ts"
 const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 const PEER_OPEN_TIMEOUT_MS = 50_000;
 const encoder = new TextEncoder();
+let nativeCloseBarrier: Promise<void> = Promise.resolve();
+
+async function waitForNativeClose(): Promise<void> {
+  let pending = nativeCloseBarrier;
+  await pending;
+  while (pending !== nativeCloseBarrier) {
+    pending = nativeCloseBarrier;
+    await pending;
+  }
+}
 
 export type PeerWorkspaceRoots = { readonly roots: readonly { readonly id: string; readonly label: string }[]; readonly activeRootId: string | null };
 export type PeerWorkspaceProject = { readonly id: string; readonly name: string };
@@ -73,6 +83,8 @@ export class CapacitorPeerTransport implements OmpTransport {
   }
 
   async open(): Promise<void> {
+    if (this.closed) throw new Error("private mobile connection is closed");
+    await waitForNativeClose();
     if (this.closed) throw new Error("private mobile connection is closed");
     if (this.opened || this.sessionId !== undefined) throw new Error("private mobile connection is already opening");
     const plugin = peerConnection();
@@ -158,7 +170,10 @@ export class CapacitorPeerTransport implements OmpTransport {
     const plugin = this.plugin;
     const id = this.sessionId;
     this.sessionId = undefined;
-    if (plugin !== undefined && id !== undefined) void plugin.close({ sessionId: id }).catch(() => undefined);
+    if (plugin !== undefined && id !== undefined) {
+      const closing = Promise.resolve().then(() => plugin.close({ sessionId: id })).catch(() => undefined);
+      nativeCloseBarrier = Promise.all([nativeCloseBarrier, closing]).then(() => undefined);
+    }
     this.finishClose();
   }
 

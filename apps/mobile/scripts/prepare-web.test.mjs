@@ -207,22 +207,44 @@ test("private Android connections have a bounded native open attempt", async () 
   assert.doesNotMatch(plugin, /call\.reject\(message\)\s+try \{ dht\?\.close\(\) \}/);
 });
 
-test("private Android reconnects retain the app-process DHT node", async () => {
+test("private Android reconnects retain the foreground-service DHT node", async () => {
   const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+  const service = await readFile(
+    resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionService.kt"),
+    "utf8",
+  );
 
-  assert.match(plugin, /private var activeDht: HyperDHT\? = null/);
-  assert.match(plugin, /private fun dht\(\): HyperDHT/);
-  assert.doesNotMatch(plugin, /Session\(\s*val dht: HyperDHT/);
+  assert.match(service, /private var activeDht: HyperDHT\? = null/);
+  assert.match(service, /fun dht\(\): HyperDHT/);
+  assert.match(plugin, /private fun dht\(\): HyperDHT = T4PeerConnectionService\.dht\(\)/);
+  assert.doesNotMatch(plugin, /private var activeDht: HyperDHT/);
   assert.doesNotMatch(plugin, /session\.dht\.close\(\)/);
 });
 
-test("private Android DHT follows activity pause and resume", async () => {
+test("private Android DHT stays active under a foreground connection service", async () => {
   const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+  const service = await readFile(
+    resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionService.kt"),
+    "utf8",
+  ).catch(() => "");
+  const manifest = await readFile(
+    resolve(mobileRoot, "android/app/src/main/AndroidManifest.xml"),
+    "utf8",
+  );
 
-  assert.match(plugin, /override fun handleOnPause\(\)/);
-  assert.match(plugin, /activeDht\?\.suspend\(\)/);
-  assert.match(plugin, /override fun handleOnResume\(\)/);
-  assert.match(plugin, /activeDht\?\.resume\(\)/);
+  assert.match(manifest, /android\.permission\.FOREGROUND_SERVICE_CONNECTED_DEVICE/);
+  assert.match(manifest, /android\.permission\.CHANGE_NETWORK_STATE/);
+  assert.match(manifest, /android:name="\.T4PeerConnectionService"/);
+  assert.match(manifest, /android:foregroundServiceType="connectedDevice"/);
+  assert.match(service, /class T4PeerConnectionService : Service\(\)/);
+  assert.match(manifest, /android:stopWithTask="false"/);
+  assert.match(service, /startForeground\(/);
+  assert.match(plugin, /T4PeerConnectionService\.start\(context\)/);
+  assert.match(service, /START_STICKY/);
+  assert.match(service, /fun start\(context: Context\) \{\s+if \(active\) return/);
+  assert.match(service, /HyperDHT\(DhtOptions\(usePublicBootstrap = true\)\)/);
+  assert.match(plugin, /if \(!T4PeerConnectionService\.isActive\(\)\) T4PeerConnectionService\.currentDht\(\)\?\.suspend\(\)/);
+  assert.match(plugin, /if \(!T4PeerConnectionService\.isActive\(\)\) T4PeerConnectionService\.currentDht\(\)\?\.resume\(\)/);
 });
 
 test("private Android reconnects recreate stale DHT state after a long background interval", async () => {
@@ -231,7 +253,8 @@ test("private Android reconnects recreate stale DHT state after a long backgroun
   assert.match(plugin, /SystemClock\.elapsedRealtime\(\)/);
   assert.match(plugin, /LONG_BACKGROUND_RESET_MS/);
   assert.match(plugin, /resetDhtBeforeNextOpen = true/);
-  assert.match(plugin, /activeDht = null/);
+  assert.match(plugin, /if \(!T4PeerConnectionService\.isActive\(\) && pausedAt != null/);
+  assert.match(plugin, /T4PeerConnectionService\.retireDht\(\)/);
   assert.match(plugin, /retiredDht\?\.close\(\)/);
 });
 

@@ -1,6 +1,6 @@
 import { createOmpClient, type OmpClient, type OmpClientOptions, type OmpTransport, type PublicServerFrame } from "@t4-code/client";
 import { commandId, confirmationId, hostId, requestId } from "@t4-code/protocol";
-import { describe, expect, it, afterEach } from "vite-plus/test";
+import { describe, expect, it, afterEach, vi } from "vite-plus/test";
 
 import { resolveRendererPlatform } from "../src/platform/bridge.ts";
 import { createBrowserShellPort, detectBackend } from "../src/platform/browser-shell-port.ts";
@@ -43,6 +43,7 @@ function setBackendScript(payload: string): void {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   Object.defineProperty(globalThis, "document", { configurable: true, value: originalDocument });
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
   Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: originalWebSocket });
@@ -156,6 +157,8 @@ describe("browser platform boundary", () => {
     expect(tailOptions).toBeDefined();
     expect(tailOptions).not.toHaveProperty("expectedHostId");
     expect(tailOptions?.client).not.toHaveProperty("hostId");
+    expect(tailOptions?.requestedFeatures).toContain("agent.transcript");
+    expect(tailOptions?.compatibilityRequestedFeatures).toContain("agent.transcript");
     class OpeningWebSocket {
       static readonly OPEN = 1;
       readyState = OpeningWebSocket.OPEN;
@@ -196,6 +199,8 @@ describe("browser platform boundary", () => {
     expect(peerOptions).toBeDefined();
     expect(peerOptions).not.toHaveProperty("expectedHostId");
     expect(peerOptions?.client).not.toHaveProperty("hostId");
+    expect(peerOptions?.requestedFeatures).not.toContain("agent.transcript");
+    expect(peerOptions?.compatibilityRequestedFeatures).not.toContain("agent.transcript");
     await expect(peerOptions?.transport()).rejects.toThrow(/native private connection is unavailable/u);
     expect(CapacitorPeerTransport.name).toBe("CapacitorPeerTransport");
   });
@@ -248,7 +253,8 @@ describe("browser platform boundary", () => {
     expect(wakes).toBe(1);
   });
 
-  it("replaces a private peer transport immediately after native resume", async () => {
+  it("preserves a healthy private peer transport after native resume", async () => {
+    vi.useFakeTimers();
     Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
     Object.defineProperty(globalThis, "window", {
       configurable: true,
@@ -292,8 +298,15 @@ describe("browser platform boundary", () => {
     windowTarget.dispatch("t4:native-resume");
     await Promise.resolve();
 
-    expect(reconnects).toBe(1);
+    expect(reconnects).toBe(0);
     expect(wakes).toBe(0);
+    windowTarget.dispatch("pageshow");
+    windowTarget.dispatch("online");
+    await Promise.resolve();
+    expect(wakes).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reconnects).toBe(0);
+    expect(wakes).toBe(1);
     await shell.disconnect({ targetId: "remote" });
   });
 
@@ -426,6 +439,8 @@ describe("browser platform boundary", () => {
     expect(connectCalls).toBe(1);
     expect(capturedOptions?.requestedFeatures).toContain("prompt.images");
     expect(capturedOptions?.requestedFeatures).toContain("transcript.images");
+    expect(capturedOptions?.requestedFeatures).toContain("agent.transcript");
+    expect(capturedOptions?.compatibilityRequestedFeatures).toContain("agent.transcript");
     expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("prompt.images");
     expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("transcript.images");
     const pair = await shell.pair({ targetId: "remote", code: "123456" });

@@ -6,4 +6,8 @@
     <string name="custom_url_scheme">com.lycaonsolutions.t4code</string>
     <string name="t4_qr_scan_status">Align the T4 connection code inside the frame</string>
     <string name="t4_qr_scan_cancel">Cancel</string>
+    <string name="t4_peer_service_channel">Private connections</string>
+    <string name="t4_peer_service_title">T4 Code connection active</string>
+    <string name="t4_peer_service_text">Keeping the private desktop connection available</string>
+    <string name="t4_peer_service_stop">Disconnect</string>
 </resources>

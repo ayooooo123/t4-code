@@ -8,7 +8,6 @@ import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
-import com.hyperdht.DhtOptions
 import com.hyperdht.HyperDHT
 import com.hyperdht.Stream
 import kotlinx.coroutines.CoroutineScope
@@ -31,7 +30,6 @@ class T4PeerConnectionPlugin : Plugin() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = mutableMapOf<String, Session>()
-    private var activeDht: HyperDHT? = null
     private var opening = false
     private var openingAttemptId: String? = null
     private var openingJob: Job? = null
@@ -50,6 +48,12 @@ class T4PeerConnectionPlugin : Plugin() {
             call.reject("Invalid private connection attempt.")
             return
         }
+        try {
+            T4PeerConnectionService.start(context)
+        } catch (_: RuntimeException) {
+            call.reject("Could not start the private connection service.")
+            return
+        }
         synchronized(sessions) {
             if (opening || sessions.isNotEmpty()) {
                 call.reject("Only one private mobile connection can be active.")
@@ -65,9 +69,7 @@ class T4PeerConnectionPlugin : Plugin() {
                 val retiredDht = synchronized(sessions) {
                     if (!resetDhtBeforeNextOpen) null else {
                         resetDhtBeforeNextOpen = false
-                        val current = activeDht
-                        activeDht = null
-                        current
+                        T4PeerConnectionService.retireDht()
                     }
                 }
                 if (retiredDht != null) {
@@ -186,37 +188,29 @@ class T4PeerConnectionPlugin : Plugin() {
     }
 
     override fun handleOnPause() {
-        val activeDht = synchronized(sessions) {
+        synchronized(sessions) {
             pausedAtElapsedMs = SystemClock.elapsedRealtime()
-            activeDht
         }
-        activeDht?.suspend()
+        if (!T4PeerConnectionService.isActive()) T4PeerConnectionService.currentDht()?.suspend()
         super.handleOnPause()
     }
 
     override fun handleOnResume() {
         super.handleOnResume()
         val now = SystemClock.elapsedRealtime()
-        val activeDht = synchronized(sessions) {
+        synchronized(sessions) {
             val pausedAt = pausedAtElapsedMs
             pausedAtElapsedMs = null
-            if (pausedAt != null && now - pausedAt >= LONG_BACKGROUND_RESET_MS) {
+            if (!T4PeerConnectionService.isActive() && pausedAt != null && now - pausedAt >= LONG_BACKGROUND_RESET_MS) {
                 resetDhtBeforeNextOpen = true
             }
-            activeDht
         }
-        activeDht?.resume()
+        if (!T4PeerConnectionService.isActive()) T4PeerConnectionService.currentDht()?.resume()
     }
 
     override fun handleOnDestroy() {
         val ids = synchronized(sessions) { sessions.keys.toList() }
         for (id in ids) closeSession(id, true)
-        val dht = synchronized(sessions) {
-            val current = activeDht
-            activeDht = null
-            current
-        }
-        try { dht?.close() } catch (_: Exception) {}
         scope.cancel()
         super.handleOnDestroy()
     }
@@ -227,17 +221,8 @@ class T4PeerConnectionPlugin : Plugin() {
         try { session.stream.close() } catch (_: Exception) {}
     }
 
-    /**
-     * A DHT node owns the phone's UDP mapping. Reusing it across OMP stream
-     * reconnects avoids turning every transient close into a cold bootstrap
-     * and a brand-new hole-punch attempt.
-     */
-    private fun dht(): HyperDHT = synchronized(sessions) {
-        activeDht ?: HyperDHT(DhtOptions(usePublicBootstrap = true)).also {
-            it.start()
-            activeDht = it
-        }
-    }
+    /** The foreground service owns one DHT node across Activity and OMP stream lifecycles. */
+    private fun dht(): HyperDHT = T4PeerConnectionService.dht()
 
     private fun decode(value: String?): ByteArray? {
         if (value == null || value.isEmpty() || value.length > MAX_ENCODED_BYTES) return null

@@ -77,10 +77,17 @@ const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
     (feature) => feature !== "prompt.images" && feature !== "transcript.images",
   ),
 );
+const HYPERDHT_REQUESTED_FEATURES: readonly string[] = Object.freeze(
+  ADDITIVE_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
+const HYPERDHT_COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
+  COMPATIBILITY_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
 
 const MAX_URL_LENGTH = 2048;
 const MAX_LABEL_LENGTH = 128;
 const MAX_DEVICE_ID_LENGTH = 256;
+const NATIVE_RESUME_GRACE_MS = 500;
 
 export interface BrowserBackendConfig {
   readonly wsUrl: string;
@@ -232,6 +239,7 @@ export function createBrowserShellPort(
   const pendingOpens = new Set<OmpTransport>();
   let welcome: WelcomeFrame | undefined;
   let stopLifecycle: Unsubscribe | undefined;
+  let cancelNativeResumeWake: (() => void) | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
     backendConfig.deviceId === undefined || backendConfig.deviceToken === undefined
@@ -304,8 +312,9 @@ export function createBrowserShellPort(
     const c = (options.clientFactory ?? createOmpClient)({
       transport: transportFactory,
       capabilities: DEVICE_CAPABILITIES,
-      requestedFeatures: ADDITIVE_FEATURES,
-      compatibilityRequestedFeatures: COMPATIBILITY_FEATURES,
+      requestedFeatures: peerInvite === null ? ADDITIVE_FEATURES : HYPERDHT_REQUESTED_FEATURES,
+      compatibilityRequestedFeatures:
+        peerInvite === null ? COMPATIBILITY_FEATURES : HYPERDHT_COMPATIBILITY_FEATURES,
       authentication: () => authentication,
       privilegedPairResult: async (result) => {
         await persistNativeMobileCredentials(result);
@@ -349,10 +358,25 @@ export function createBrowserShellPort(
     return c;
   }
 
+  function clearNativeResumeWake(): void {
+    cancelNativeResumeWake?.();
+    cancelNativeResumeWake = undefined;
+  }
+
   function ensureLifecycle(): void {
     stopLifecycle ??= bindBrowserConnectionWake((source) => {
-      if (source === "native-resume" && peerInvite !== null) {
-        client?.reconnectNow();
+      if (source === "browser" && cancelNativeResumeWake !== undefined) return;
+      clearNativeResumeWake();
+      if (
+        source === "native-resume" &&
+        peerInvite !== null &&
+        (client?.state === "ready" || client?.state === "pairing")
+      ) {
+        const timer = setTimeout(() => {
+          cancelNativeResumeWake = undefined;
+          client?.wake();
+        }, NATIVE_RESUME_GRACE_MS);
+        cancelNativeResumeWake = () => clearTimeout(timer);
         return;
       }
       client?.wake();
@@ -394,6 +418,7 @@ export function createBrowserShellPort(
     },
 
     async disconnect(_request: TargetRequest): Promise<DisconnectResult> {
+      clearNativeResumeWake();
       for (const pending of pendingOpens) pending.close();
       if (client !== undefined) {
         await client.close();

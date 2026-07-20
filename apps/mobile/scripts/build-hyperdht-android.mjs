@@ -12,7 +12,7 @@ const depsRoot = resolve(cacheRoot, "deps");
 const output = resolve(androidRoot, "app/src/main/jniLibs/arm64-v8a/libhyperdht_jni.so");
 const ABI = "arm64-v8a";
 const API = "26";
-const HYPERDHT_COMMIT = "17e665ee0871522b748d4148547e6c8747f9dff1";
+const HYPERDHT_COMMIT = "91ab6a2dcf9394bef8b788f9199422f5f56243cf";
 const LIBSODIUM_COMMIT = "2ce4d906a68eae82b27b4867f3d4172ec508cb27";
 const LIBUV_COMMIT = "5152db2cbfeb5582e9c27c5ea1dba2cd9e10759b";
 
@@ -92,7 +92,7 @@ async function main() {
     // Build the complete static library ourselves so every symbol is bundled
     // into the JNI library and Android has no secondary native dependency.
     await rm(sodiumPrefix, { force: true, recursive: true });
-    run("make", ["distclean"], { cwd: sodiumRoot });
+    if (await exists(resolve(sodiumRoot, "Makefile"))) run("make", ["distclean"], { cwd: sodiumRoot });
     run("./autogen.sh", [], {
       cwd: sodiumRoot,
       env: { ...process.env, LIBTOOLIZE: process.platform === "darwin" ? "glibtoolize" : "libtoolize" },
@@ -123,7 +123,7 @@ async function main() {
     run("ninja", ["-C", uvBuild, "install"]);
   }
 
-  const hyperdhtBuild = resolve(cacheRoot, "hyperdht-build");
+  const hyperdhtBuild = resolve(cacheRoot, `hyperdht-build-${HYPERDHT_COMMIT}`);
   const builtLibrary = resolve(hyperdhtBuild, "libhyperdht.a");
   if (!(await exists(builtLibrary))) {
     await rm(hyperdhtBuild, { force: true, recursive: true });
