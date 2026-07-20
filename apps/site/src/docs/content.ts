@@ -98,24 +98,13 @@ const install: DocTopic = {
     },
     {
       kind: "note",
-      text: `The v${RELEASE_VERSION} macOS build is unsigned and not notarized. Gatekeeper can report a damaged app or an unidentified developer. Only bypass that warning if you trust the release from this repository.`,
+      text: `The v${RELEASE_VERSION} macOS build is signed with the project's pinned Developer ID identity and notarized by Apple. The release workflow verifies both downloadable formats with Gatekeeper before publication.`,
     },
     { kind: "h3", id: "install-gatekeeper", text: "First launch on macOS" },
-    { kind: "p", text: "After copying the app into Applications, pick either route:" },
-    {
-      kind: "ol",
-      items: [
-        "If Finder offers it, right-click **T4 Code.app**, choose **Open**, then confirm the security prompt.",
-        "If Gatekeeper still blocks it and you choose to proceed, clear the quarantine attribute in a terminal:",
-      ],
-    },
-    {
-      kind: "code",
-      code: 'xattr -dr com.apple.quarantine "/Applications/T4 Code.app"',
-    },
+    { kind: "p", text: "After copying the app into Applications, open T4 Code normally." },
     {
       kind: "note",
-      text: "The `xattr` command does not sign, notarize, or verify T4 Code. It only removes the quarantine attribute from the downloaded app.",
+      text: "If macOS reports that this release is damaged or from an unidentified developer, do not bypass Gatekeeper. Delete that copy, download it again from the linked GitHub release, and verify its SHA-256 entry in `SHA256SUMS.txt`.",
     },
     { kind: "h2", id: "install-requirements", text: "Requirements" },
     {
@@ -136,11 +125,11 @@ const install: DocTopic = {
 const firstRun: DocTopic = {
   id: "first-run",
   title: "First run",
-  lede: "Desktop builds can manage local Oh My Pi app servers, one per profile. Android connects to the T4 gateway on your computer.",
+  lede: "The Mac app brings its matching Oh My Pi backend and can set up private phone access from one screen.",
   blocks: [
     {
       kind: "note",
-      text: "The discovery and service steps below apply to Linux and macOS. On Android, connect Tailscale to the same tailnet as your computer, then enter the gateway's full HTTPS address in T4 Code.",
+      text: "On an Apple Silicon Mac, T4 Code installs its pinned backend inside its own Application Support folder. It does not replace the `omp` command you may already use in Terminal.",
     },
     { kind: "h2", id: "first-run-discovery", text: "How desktop T4 finds omp" },
     { kind: "p", text: "T4 Code checks these places, in order, and uses the first match:" },
@@ -159,6 +148,11 @@ const firstRun: DocTopic = {
     {
       kind: "p",
       text: "Before trusting a match, T4 runs `omp appserver status --json` and checks the answer. A build that cannot answer is skipped.",
+    },
+    { kind: "h2", id: "first-run-phone", text: "Use your phone" },
+    {
+      kind: "p",
+      text: "Install and connect Tailscale on the Mac and phone. In T4 Code, open **Settings → Hosts**, choose **Set up phone access**, then scan the QR code. T4 Code installs the private loopback gateway and configures Tailscale Serve; it never enables public Tailscale Funnel.",
     },
     { kind: "h2", id: "first-run-service", text: "Who keeps the desktop app server running" },
     {
@@ -213,7 +207,20 @@ const localSessions: DocTopic = {
     },
     {
       kind: "note",
-      text: "Removing a shortcut is view state for that T4 Code client, so desktop and phone can differ. Archived sessions remain visible, and their folder menu can restore the shortcut. A new or restored Current session always makes the folder visible. T4 Code still does not alias, pin, reorder, delete, or rename the underlying folder.",
+      text: "Removing, pinning, or manually ordering shortcuts is view state for that T4 Code client, so desktop and phone can differ. Archived sessions remain visible, and their folder menu can restore a removed shortcut. A new or restored Current session always makes the folder visible. T4 Code never moves, deletes, or renames the underlying folder.",
+    },
+    { kind: "h2", id: "local-sessions-organize", text: "Organize a large session library" },
+    {
+      kind: "p",
+      text: "Use the rail's organization menu to group sessions by working folder or combine them into one list. Sort by **Priority**, **Last updated**, or **Manual order**. Priority puts approval requests, questions, running work, unread completions, errors, and plans ahead of ordinary recent work in that order.",
+    },
+    {
+      kind: "p",
+      text: "The rail search matches session titles, models, working folders, and host names. Quick filters narrow the list to Attention, Running, Unread, or Errors. Search and filters reset when T4 Code restarts so an old filter never makes work look missing.",
+    },
+    {
+      kind: "p",
+      text: "Pin a session or working folder from its action menu to create a shortcut in the Pinned section. In Manual order, the same menus provide Move up and Move down actions. Large folders initially draw a bounded set of rows; **Show more** reveals the next set without forcing the entire library into the page at once.",
     },
     {
       kind: "h2",
@@ -557,7 +564,7 @@ const troubleshooting: DocTopic = {
     { kind: "h2", id: "troubleshooting-mac", text: "macOS says the app is damaged" },
     {
       kind: "p",
-      text: "That is Gatekeeper reacting to the unsigned build, not real damage. Follow the [first-launch steps](#install-gatekeeper): right-click → Open, or clear the quarantine flag with `xattr -dr com.apple.quarantine`.",
+      text: "The public macOS release is signed and notarized. Do not bypass Gatekeeper. Delete the blocked copy, download it again from the linked GitHub release, verify its checksum in `SHA256SUMS.txt`, and follow the [first-launch steps](#install-gatekeeper).",
     },
     { kind: "h2", id: "troubleshooting-settings", text: "Settings never load" },
     {
@@ -572,10 +579,10 @@ const security: DocTopic = {
   title: "Security",
   lede: "Plain answers about what T4 Code stores, sends, and never does.",
   blocks: [
-    { kind: "h2", id: "security-unsigned", text: "The unsigned macOS build" },
+    { kind: "h2", id: "security-unsigned", text: "Signed macOS releases" },
     {
       kind: "p",
-      text: `The v${RELEASE_VERSION} macOS build is unsigned and not notarized, so macOS warns before first launch. Clearing \`com.apple.quarantine\` changes Gatekeeper handling but does not sign, notarize, or verify the app. If you would rather not trust a downloaded binary, [build from source](#build-from-source). The repository is public at [LycaonLLC/t4-code](${REPO_URL}).`,
+      text: `The v${RELEASE_VERSION} macOS build is signed with the project's pinned Developer ID identity and notarized by Apple. Publication stops if the certificate, Team ID, hardened runtime, secure timestamp, stapled ticket, or Gatekeeper result drifts. You can also [build from source](#build-from-source). The repository is public at [LycaonLLC/t4-code](${REPO_URL}).`,
     },
     { kind: "h2", id: "security-credentials", text: "Credentials" },
     {
@@ -614,7 +621,7 @@ const buildFromSource: DocTopic = {
     { kind: "code", code: "pnpm package:linux" },
     {
       kind: "p",
-      text: "On a Mac, `pnpm package:mac:unsigned` produces the same unsigned build we ship. Installers land in `release/`.",
+      text: "On a Mac, `pnpm package:mac:unsigned` produces a local unsigned development package. Public release artifacts use the protected signing and notarization workflow instead. Installers land in `release/`.",
     },
   ],
 };

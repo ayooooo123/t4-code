@@ -13,14 +13,31 @@ import {
   type ConfirmationId,
   type HostId,
   type ResultError,
-  type ServerFrame,
   type SessionId,
   type TerminalId,
-} from "@oh-my-pi/app-wire";
-import { decodeServerFrame } from "./index.ts";
+} from "@t4-code/host-wire";
+import {
+  ompServerEventFromFrame,
+  type OmpServerFrame,
+  type PublicOmpServerEvent,
+} from "./server-event.ts";
+import {
+  decodeDesktopUpdateState,
+  type DesktopUpdateState,
+} from "./app-update.ts";
+import { decodePairLinkEvent, type PairLinkEvent } from "./pair-link.ts";
+
+export { decodeDesktopUpdateState } from "./app-update.ts";
+export type { DesktopUpdatePhase, DesktopUpdateState } from "./app-update.ts";
+export type { PairLinkEvent } from "./pair-link.ts";
 
 export const DESKTOP_IPC_VERSION = PROTOCOL_VERSION;
-export type RendererServerFrame = Exclude<ServerFrame, { type: "pair.ok" }>;
+export type RendererServerFrame = Exclude<OmpServerFrame, { type: "pair.ok" }>;
+export type RendererServerEvent = PublicOmpServerEvent;
+
+export function rendererServerEventFromFrame(frame: RendererServerFrame): RendererServerEvent {
+  return ompServerEventFromFrame(frame);
+}
 export const DESKTOP_IPC_CHANNELS = [
   "omp:targets:list",
   "omp:targets:add",
@@ -60,12 +77,18 @@ export const DESKTOP_IPC_CHANNELS = [
   "app:update:get-state",
   "app:update:check",
   "app:update:download",
+  "omp:speech:speak",
+  "omp:speech:stop",
   "app:update:restart",
   "app:update:renderer-ready",
+  "app:projection-cache:load",
+  "app:projection-cache:save",
+  "app:phone-setup:inspect",
+  "app:phone-setup:configure",
 ] as const;
 export type DesktopInvokeChannel = (typeof DESKTOP_IPC_CHANNELS)[number];
 export const DESKTOP_IPC_EVENTS = [
-  "omp:server-frame",
+  "omp:server-event",
   "omp:connection-state",
   "omp:runtime-error",
   "omp:pair-link",
@@ -115,6 +138,33 @@ export interface WorkspaceRootChooseRequest {}
 export interface WorkspaceRootChooseResult { readonly root: WorkspaceRoot | null; }
 export interface WorkspaceProjectCreateRequest { readonly name: string; }
 export interface WorkspaceProjectCreateResult { readonly project: WorkspaceProject; }
+export type PhoneSetupPhase = "unsupported" | "tailscale-required" | "not-configured" | "ready" | "error";
+export interface PhoneSetupState {
+  readonly phase: PhoneSetupPhase;
+  readonly message: string;
+  readonly url?: string;
+}
+export interface PhoneSetupRequest {}
+export function decodePhoneSetupState(value: unknown): PhoneSetupState {
+  const item = object(value, "phone setup state");
+  exact(item, ["phase", "message", "url"]);
+  if (!["unsupported", "tailscale-required", "not-configured", "ready", "error"].includes(item.phase as string)) {
+    throw new Error("invalid phone setup phase");
+  }
+  const message = controlFree(item.message, "phone setup message", 512);
+  let url: string | undefined;
+  if (item.url !== undefined) {
+    const parsed = new URL(controlFree(item.url, "phone setup URL", 2_048));
+    if (
+      parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "" ||
+      !parsed.hostname.endsWith(".ts.net") || parsed.port !== "8445" || parsed.pathname !== "/" ||
+      parsed.search !== "" || parsed.hash !== ""
+    ) throw new Error("invalid phone setup URL");
+    url = parsed.toString();
+  }
+  if (item.phase === "ready" && url === undefined) throw new Error("ready phone setup requires a URL");
+  return Object.freeze({ phase: item.phase as PhoneSetupPhase, message, ...(url === undefined ? {} : { url }) });
+}
 export interface LocalProfile {
   readonly profileId: string;
   readonly label: string;
@@ -156,11 +206,6 @@ export interface BootstrapResult {
   version: typeof PROTOCOL_VERSION;
   connected: boolean;
   service?: ServiceInspection;
-}
-export interface PairLinkEvent {
-  hostHint: string;
-  code: string;
-  issuedAt: number;
 }
 export interface PairLinksDrainRequest {}
 export interface PairLinksDrainResult {
@@ -286,28 +331,27 @@ export interface TerminalResult {
   targetId: string;
   accepted: boolean;
 }
-
-export type DesktopUpdatePhase =
-  | "idle"
-  | "checking"
-  | "current"
-  | "available"
-  | "manual"
-  | "downloading"
-  | "ready"
-  | "error";
-
-/** Renderer-safe update metadata. Download URLs and filesystem paths stay in Electron main. */
-export interface DesktopUpdateState {
-  readonly version: 1;
-  readonly currentVersion: string;
-  readonly phase: DesktopUpdatePhase;
-  readonly checkedAt?: number;
-  readonly availableVersion?: string;
-  readonly progressPercent?: number;
-  readonly message?: string;
+export const MAX_SPEECH_TEXT_BYTES = 64 * 1024;
+export interface SpeechRequest {
+  readonly text: string;
+}
+export interface SpeechResult {
+  readonly accepted: boolean;
+  readonly error?: string;
 }
 
+export const MAX_PROJECTION_CACHE_BYTES = 2 * 1024 * 1024;
+export interface ProjectionCacheLoadRequest {}
+export interface ProjectionCacheLoadResult {
+  readonly available: boolean;
+  readonly value: string | null;
+}
+export interface ProjectionCacheSaveRequest {
+  readonly value: string;
+}
+export interface ProjectionCacheSaveResult {
+  readonly saved: boolean;
+}
 export interface DesktopUpdateRequest {}
 export interface DesktopUpdateRendererReadyResult {
   readonly openSettings: boolean;
@@ -473,6 +517,8 @@ export interface DesktopInvokeRequestMap {
   "omp:pair": PairRequest;
   "omp:pair-links:drain": PairLinksDrainRequest;
   "omp:service:inspect": ServiceActionRequest;
+  "omp:speech:speak": SpeechRequest;
+  "omp:speech:stop": {};
   "omp:service:install": ServiceActionRequest;
   "omp:service:start": ServiceActionRequest;
   "omp:service:stop": ServiceActionRequest;
@@ -491,6 +537,10 @@ export interface DesktopInvokeRequestMap {
   "app:update:download": DesktopUpdateRequest;
   "app:update:restart": DesktopUpdateRequest;
   "app:update:renderer-ready": DesktopUpdateRequest;
+  "app:projection-cache:load": ProjectionCacheLoadRequest;
+  "app:projection-cache:save": ProjectionCacheSaveRequest;
+  "app:phone-setup:inspect": PhoneSetupRequest;
+  "app:phone-setup:configure": PhoneSetupRequest;
 }
 export interface DesktopInvokeResponseMap {
   "omp:targets:list": TargetListResult;
@@ -528,18 +578,24 @@ export interface DesktopInvokeResponseMap {
   "omp:workspace:root:select": void;
   "omp:workspace:root:choose": WorkspaceRootChooseResult;
   "omp:workspace:project:create": WorkspaceProjectCreateResult;
+  "omp:speech:speak": SpeechResult;
+  "omp:speech:stop": SpeechResult;
   "app:update:get-state": DesktopUpdateState;
   "app:update:check": DesktopUpdateState;
   "app:update:download": DesktopUpdateState;
   "app:update:restart": DesktopUpdateState;
   "app:update:renderer-ready": DesktopUpdateRendererReadyResult;
+  "app:projection-cache:load": ProjectionCacheLoadResult;
+  "app:projection-cache:save": ProjectionCacheSaveResult;
+  "app:phone-setup:inspect": PhoneSetupState;
+  "app:phone-setup:configure": PhoneSetupState;
 }
-export interface RendererServerFrameEvent {
+export interface RendererServerEventEnvelope {
   targetId: string;
-  frame: RendererServerFrame;
+  event: RendererServerEvent;
 }
 export interface DesktopEventPayloadMap {
-  "omp:server-frame": RendererServerFrameEvent;
+  "omp:server-event": RendererServerEventEnvelope;
   "omp:connection-state": ConnectionStateEvent;
   "omp:runtime-error": RuntimeErrorEvent;
   "omp:pair-link": PairLinkEvent;
@@ -631,70 +687,6 @@ function state(value: unknown): ConnectionState {
   )
     throw new Error("invalid state");
   return value as ConnectionState;
-}
-
-const DESKTOP_VERSION_PATTERN =
-  /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z](?:[0-9A-Za-z.-]{0,62}[0-9A-Za-z])?)?$/u;
-
-function desktopVersion(value: unknown, name: string): string {
-  const decoded = controlFree(value, name, 96);
-  if (!DESKTOP_VERSION_PATTERN.test(decoded)) throw new Error(`invalid ${name}`);
-  return decoded;
-}
-
-/** Strictly decode and freeze update state before it crosses either IPC boundary. */
-export function decodeDesktopUpdateState(value: unknown): DesktopUpdateState {
-  const item = object(value, "desktop update state");
-  exact(item, [
-    "version",
-    "currentVersion",
-    "phase",
-    "checkedAt",
-    "availableVersion",
-    "progressPercent",
-    "message",
-  ]);
-  if (item.version !== 1) throw new Error("unsupported desktop update state");
-  if (
-    ![
-      "idle",
-      "checking",
-      "current",
-      "available",
-      "manual",
-      "downloading",
-      "ready",
-      "error",
-    ].includes(item.phase as string)
-  )
-    throw new Error("invalid desktop update phase");
-  if (
-    item.checkedAt !== undefined &&
-    (typeof item.checkedAt !== "number" ||
-      !Number.isSafeInteger(item.checkedAt) ||
-      item.checkedAt < 0)
-  )
-    throw new Error("invalid desktop update checkedAt");
-  if (
-    item.progressPercent !== undefined &&
-    (typeof item.progressPercent !== "number" ||
-      !Number.isFinite(item.progressPercent) ||
-      item.progressPercent < 0 ||
-      item.progressPercent > 100)
-  )
-    throw new Error("invalid desktop update progress");
-  const decoded: DesktopUpdateState = {
-    version: 1,
-    currentVersion: desktopVersion(item.currentVersion, "currentVersion"),
-    phase: item.phase as DesktopUpdatePhase,
-    ...(item.checkedAt === undefined ? {} : { checkedAt: item.checkedAt }),
-    ...(item.availableVersion === undefined
-      ? {}
-      : { availableVersion: desktopVersion(item.availableVersion, "availableVersion") }),
-    ...(item.progressPercent === undefined ? {} : { progressPercent: item.progressPercent }),
-    ...(item.message === undefined ? {} : { message: controlFree(item.message, "message", 512) }),
-  };
-  return Object.freeze(decoded);
 }
 
 export function decodeDesktopUpdateRendererReadyResult(
@@ -843,6 +835,61 @@ function decodeTerminalRequest(
   return { ...common, ...(decoded.reason === undefined ? {} : { reason: decoded.reason }) };
 }
 
+export function decodeSpeechText(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error("invalid speech text");
+  if (utf8ByteLength(value) > MAX_SPEECH_TEXT_BYTES) throw new Error("speech text is too long");
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint === 0 || (codePoint < 0x20 && codePoint !== 0x09 && codePoint !== 0x0a && codePoint !== 0x0d) || (codePoint >= 0x7f && codePoint <= 0x9f)) {
+      throw new Error("speech text contains unsupported control characters");
+    }
+  }
+  return value;
+}
+function projectionCacheSerialized(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || utf8ByteLength(value) > MAX_PROJECTION_CACHE_BYTES)
+    throw new Error("invalid projection cache value");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("invalid projection cache value");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("invalid projection cache value");
+  const root = object(parsed, "projection cache");
+  const data = root.data;
+  if (
+    root.kind !== "t4-code-projection" ||
+    root.version !== 1 ||
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data)
+  )
+    throw new Error("invalid projection cache value");
+  return value;
+}
+export function decodeProjectionCacheLoadResult(value: unknown): ProjectionCacheLoadResult {
+  const result = object(value, "projection cache load result");
+  exact(result, ["available", "value"]);
+  const available = result.available;
+  const cacheValue = result.value;
+  if (typeof available !== "boolean" || (cacheValue !== null && typeof cacheValue !== "string"))
+    throw new Error("invalid projection cache load result");
+  if (cacheValue !== null) projectionCacheSerialized(cacheValue);
+  if (!available && cacheValue !== null) throw new Error("invalid projection cache load result");
+  return Object.freeze({ available, value: cacheValue });
+}
+export function decodeProjectionCacheSaveResult(value: unknown): ProjectionCacheSaveResult {
+  const result = object(value, "projection cache save result");
+  exact(result, ["saved"]);
+  const saved = result.saved;
+  if (typeof saved !== "boolean") throw new Error("invalid projection cache save result");
+  return Object.freeze({ saved });
+}
+export function decodeProjectionCacheSaveRequestValue(value: unknown): string {
+  return projectionCacheSerialized(value);
+}
 export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest {
   const frame = inputObject(input);
   exact(frame, ["channel", "payload"]);
@@ -889,6 +936,12 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
         if (!/^\d{6}$/u.test(code)) throw new Error("invalid pairing code");
         return { channel, payload: { targetId: target(payload.targetId), code } };
       }
+    case "omp:speech:speak":
+      exact(payload, ["text"]);
+      return { channel, payload: { text: decodeSpeechText(payload.text) } };
+    case "omp:speech:stop":
+      exact(payload, []);
+      return { channel, payload: {} };
     case "omp:bootstrap":
     case "omp:pair-links:drain":
     case "omp:service:inspect":
@@ -908,6 +961,8 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "app:update:download":
     case "app:update:restart":
     case "app:update:renderer-ready":
+    case "app:phone-setup:inspect":
+    case "app:phone-setup:configure":
       exact(payload, []);
       return { channel, payload: {} };
     case "omp:workspace:root:select":
@@ -916,6 +971,12 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:workspace:project:create":
       exact(payload, ["name"]);
       return { channel, payload: { name: controlFree(payload.name, "name", 81) } };
+    case "app:projection-cache:load":
+      exact(payload, []);
+      return { channel, payload: {} };
+    case "app:projection-cache:save":
+      exact(payload, ["value"]);
+      return { channel, payload: { value: projectionCacheSerialized(payload.value) } };
     case "omp:command":
       exact(payload, ["targetId", "intent"]);
       {
@@ -951,17 +1012,6 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
   }
   throw new Error("unsupported desktop channel");
 }
-function pairLink(value: unknown): PairLinkEvent {
-  const item = object(value, "pair link");
-  exact(item, ["hostHint", "code", "issuedAt"]);
-  const hostHint = controlFree(item.hostHint, "hostHint", 128);
-  const code = controlFree(item.code, "code", 6);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(hostHint) || !/^\d{6}$/u.test(code))
-    throw new Error("invalid pair link");
-  if (typeof item.issuedAt !== "number" || !Number.isFinite(item.issuedAt) || item.issuedAt < 0)
-    throw new Error("invalid pair link issuedAt");
-  return { hostHint, code, issuedAt: item.issuedAt };
-}
 export function decodeDesktopEvent(input: unknown): DesktopEvent {
   const frame = inputObject(input);
   exact(frame, ["channel", "payload"]);
@@ -969,12 +1019,28 @@ export function decodeDesktopEvent(input: unknown): DesktopEvent {
     throw new Error("unknown channel");
   const channel = frame.channel as DesktopEventChannel;
   const payload = object(frame.payload, "payload");
-  if (channel === "omp:server-frame") {
-    exact(payload, ["targetId", "frame"]);
-    const serverFrame = decodeServerFrame(payload.frame);
-    if (serverFrame.type === "pair.ok")
+  if (channel === "omp:server-event") {
+    exact(payload, ["targetId", "event"]);
+    const rawEvent = object(payload.event, "event");
+    exact(rawEvent, ["kind", "payload"]);
+    const eventPayload = object(rawEvent.payload, "event.payload");
+    if ("v" in eventPayload || "type" in eventPayload) {
+      throw new Error("wire envelope fields cannot cross renderer IPC");
+    }
+    const kind = controlFree(rawEvent.kind, "event.kind", 128);
+    if (kind === "pair.ok")
       throw new Error("pair credentials cannot cross renderer IPC");
-    return { channel, payload: { targetId: target(payload.targetId), frame: serverFrame } };
+    const event = Object.freeze({
+      kind,
+      payload: Object.freeze(eventPayload),
+    }) as RendererServerEvent;
+    return {
+      channel,
+      payload: {
+        targetId: target(payload.targetId),
+        event,
+      },
+    };
   }
   if (channel === "omp:connection-state") {
     exact(payload, ["targetId", "state"]);
@@ -983,7 +1049,7 @@ export function decodeDesktopEvent(input: unknown): DesktopEvent {
       payload: { targetId: target(payload.targetId), state: state(payload.state) },
     };
   }
-  if (channel === "omp:pair-link") return { channel, payload: pairLink(payload) };
+  if (channel === "omp:pair-link") return { channel, payload: decodePairLinkEvent(payload) };
   if (channel === "app:update:state") {
     return { channel, payload: decodeDesktopUpdateState(payload) };
   }

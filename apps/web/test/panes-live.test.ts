@@ -2,7 +2,7 @@
 // Review, and Files pane families; cross-session frames never leak; replays
 // stay stable; reconnects preserve prior safe projection; unsafe paths are
 // hidden; and every pane action leaves as an exact, gated typed command.
-import { applyPublicFrame, createProjectionSnapshot } from "@t4-code/client";
+import { OMP_RUNTIME_INTEGRATION, applyPublicFrame, createProjectionSnapshot } from "@t4-code/client";
 import type {
   DesktopHostMetadata,
   DesktopRuntimeSnapshot,
@@ -31,8 +31,20 @@ import {
   type SessionSnapshotFrame,
   type DurableEntry,
 } from "@t4-code/protocol";
-import type { CommandIntent, CommandResult } from "@t4-code/protocol/desktop-ipc";
+import {
+  rendererServerEventFromFrame,
+  type CommandIntent,
+  type CommandResult,
+  type ConfirmRequest,
+  type ConfirmResult,
+  type RendererServerEventEnvelope,
+} from "@t4-code/protocol/desktop-ipc";
 import { describe, expect, it } from "vite-plus/test";
+import {
+  agentCancelAvailability,
+  cancelAgentFromView,
+  deriveAgentViewGroups,
+} from "../src/features/agent-view/model.ts";
 
 import {
   createLiveInspectorStore,
@@ -163,6 +175,7 @@ function responseFrame(
   requestId: string,
   ok: boolean,
   result?: Record<string, unknown>,
+  errorCode = "denied",
 ): ResultFrame {
   return {
     v: PROTOCOL_VERSION,
@@ -173,8 +186,26 @@ function responseFrame(
     sessionId: brandSessionId(SESSION),
     ok,
     ...(result === undefined ? {} : { result }),
-    ...(ok ? {} : { error: { code: "denied", message: "The host said no." } }),
+    ...(ok ? {} : { error: { code: errorCode, message: "The host said no." } }),
   };
+}
+
+function previewFrame(
+  type: "preview.launch" | "preview.navigation",
+  seq: number,
+  url: string,
+): ProjectionFrame {
+  return {
+    v: PROTOCOL_VERSION,
+    type,
+    hostId: brandHostId(HOST),
+    sessionId: brandSessionId(SESSION),
+    previewId: "preview-1",
+    state: "ready",
+    url,
+    revision: brandRevision(`preview-${seq}`),
+    cursor: { epoch: "preview-epoch", seq },
+  } as ProjectionFrame;
 }
 
 function gapFrame(): GapFrame {
@@ -254,18 +285,43 @@ function withInventory(projection: ProjectionSnapshot): ProjectionSnapshot {
   return { ...projection, sessionIndex, sessionIndexMetadata };
 }
 
+interface VoidDeferred {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+}
+
 class FakeRuntime implements LiveInspectorRuntime {
   commands: CommandIntent[] = [];
   targets: string[] = [];
+  confirms: ConfirmRequest[] = [];
   failCommands = false;
+  commandResult: Pick<CommandResult, "accepted" | "result" | "error"> = { accepted: true };
+  challengeAgentCancellation = false;
+  holdAgentCancelConfirmations = false;
+  onAgentCancelChallenge: (() => void) | null = null;
   private snapshotValue: DesktopRuntimeSnapshot;
   private readonly listeners = new Set<(snapshot: DesktopRuntimeSnapshot) => void>();
+  private readonly eventListeners = new Set<(event: RendererServerEventEnvelope) => void>();
   private readonly settled: Promise<unknown>[] = [];
   private requestCounter = 0;
+  private readonly pendingAgentCancels = new Map<
+    string,
+    {
+      readonly gate: VoidDeferred;
+      readonly targetId: string;
+      readonly requestId: string;
+      readonly commandId: string;
+      readonly hostId: string;
+      readonly sessionId: string;
+    }
+  >();
+  private readonly heldAgentCancelConfirmations = new Map<string, VoidDeferred>();
+  private readonly agentCancelConfirmationStarted: VoidDeferred = Promise.withResolvers<void>();
 
   constructor(options: FakeRuntimeOptions = {}) {
     this.snapshotValue = {
       version: 1,
+      integration: OMP_RUNTIME_INTEGRATION,
       platform: "linux",
       desktopVersion: "test",
       startState: "started",
@@ -291,6 +347,14 @@ class FakeRuntime implements LiveInspectorRuntime {
     return () => this.listeners.delete(listener);
   }
 
+  subscribeEvents(
+    _filter: unknown,
+    listener: (event: RendererServerEventEnvelope) => void,
+  ): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   command(targetId: string, intent: CommandIntent): Promise<CommandResult> {
     this.targets.push(targetId);
     this.commands.push(intent);
@@ -300,14 +364,80 @@ class FakeRuntime implements LiveInspectorRuntime {
       return failure;
     }
     this.requestCounter += 1;
+    const requestId = `req-${this.requestCounter}`;
+    const commandId = `cmd-${this.requestCounter}`;
+    if (this.challengeAgentCancellation && intent.command === "agent.cancel") {
+      if (intent.sessionId === undefined) throw new Error("agent.cancel requires a session");
+      const gate = Promise.withResolvers<void>();
+      const confirmationId = `confirm-agent-cancel-${this.requestCounter}`;
+      this.pendingAgentCancels.set(confirmationId, {
+        gate,
+        targetId,
+        requestId,
+        commandId,
+        hostId: String(intent.hostId),
+        sessionId: String(intent.sessionId),
+      });
+      const result = gate.promise.then<CommandResult>(() => ({
+        targetId,
+        requestId,
+        commandId,
+        ...this.commandResult,
+      }));
+      this.settled.push(result);
+      this.emitServerFrame({
+        v: PROTOCOL_VERSION,
+        type: "confirmation",
+        confirmationId: confirmationId as never,
+        commandId: brandCommandId(commandId),
+        hostId: intent.hostId,
+        sessionId: intent.sessionId,
+        commandHash: "sha256:agent-cancel",
+        revision: intent.expectedRevision ?? brandRevision("missing"),
+        expiresAt: "2999-01-01T00:00:00.000Z",
+        summary: "agent.cancel",
+      });
+      this.onAgentCancelChallenge?.();
+      return result;
+    }
     const result = Promise.resolve<CommandResult>({
       targetId,
-      requestId: `req-${this.requestCounter}`,
-      commandId: `cmd-${this.requestCounter}`,
-      accepted: true,
+      requestId,
+      commandId,
+      ...this.commandResult,
     });
     this.settled.push(result);
     return result;
+  }
+
+  async confirm(request: ConfirmRequest): Promise<ConfirmResult> {
+    this.confirms.push(request);
+    const confirmationId = String(request.confirmationId);
+    const pending = this.pendingAgentCancels.get(confirmationId);
+    if (
+      pending === undefined ||
+      pending.targetId !== request.targetId ||
+      pending.commandId !== String(request.commandId) ||
+      pending.hostId !== String(request.hostId) ||
+      pending.sessionId !== String(request.sessionId)
+    ) {
+      throw new Error("confirmation did not match a pending agent cancellation");
+    }
+    this.agentCancelConfirmationStarted.resolve();
+    if (this.holdAgentCancelConfirmations) {
+      const held = Promise.withResolvers<void>();
+      this.heldAgentCancelConfirmations.set(confirmationId, held);
+      await held.promise;
+    }
+    this.pendingAgentCancels.delete(confirmationId);
+    pending.gate.resolve();
+    return {
+      targetId: request.targetId,
+      requestId: "confirm-request",
+      confirmationId: request.confirmationId,
+      commandId: request.commandId,
+      accepted: true,
+    };
   }
 
   setProjection(projection: ProjectionSnapshot, options: { inventory?: boolean } = {}): void {
@@ -333,6 +463,22 @@ class FakeRuntime implements LiveInspectorRuntime {
     await Promise.resolve();
   }
 
+  releaseAgentCancelConfirmations(): void {
+    for (const held of this.heldAgentCancelConfirmations.values()) held.resolve();
+    this.heldAgentCancelConfirmations.clear();
+  }
+
+  waitForAgentCancelConfirmation(): Promise<void> {
+    return this.agentCancelConfirmationStarted.promise;
+  }
+
+  private emitServerFrame(
+    frame: Parameters<typeof rendererServerEventFromFrame>[0],
+  ): void {
+    const event = { targetId: "local", event: rendererServerEventFromFrame(frame) };
+    for (const listener of this.eventListeners) listener(event);
+  }
+
   private emit(): void {
     for (const listener of this.listeners) listener(this.snapshotValue);
   }
@@ -346,6 +492,7 @@ const AGENT_CATALOG: CatalogFrame = {
   items: [
     { id: brandCatalogId("agent.cancel"), kind: "command", name: "agent.cancel" },
     { id: brandCatalogId("review.apply"), kind: "command", name: "review.apply" },
+    { id: brandCatalogId("files.write"), kind: "command", name: "files.write" },
   ],
 };
 
@@ -437,6 +584,26 @@ describe("live projection populates each family", () => {
     expect(store.getState().activity).toHaveLength(3);
     const kinds = store.getState().activity.map((entry) => entry.kind);
     expect(kinds).toEqual(["tool", "system", "error"]);
+  });
+
+  it("adds sanitized preview activity once across projection replays", () => {
+    const fake = new FakeRuntime();
+    const projection = project([
+      previewFrame("preview.launch", 1, "https://preview.test/launch?token=never#secret"),
+      previewFrame("preview.navigation", 2, "https://preview.test/next?token=never#secret"),
+    ]);
+    fake.setProjection(projection);
+    const store = createLiveInspectorStore(fake, VIEW_ID);
+    expect(store.getState().activity.map((entry) => entry.title)).toEqual([
+      "Browser preview launched",
+      "Browser preview navigated",
+    ]);
+    const exported = JSON.stringify(store.getState().activity);
+    expect(exported).not.toContain("token=never");
+    expect(exported).not.toContain("#secret");
+
+    fake.setProjection(projection);
+    expect(store.getState().activity).toHaveLength(2);
   });
 
   it("review rows come from review frames and never fabricate a diff", () => {
@@ -661,6 +828,7 @@ describe("live projection isolation and stability", () => {
 describe("live pane actions", () => {
   it("agent cancel sends the exact typed intent with the session revision", async () => {
     const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
     fake.setProjection(
       project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
     );
@@ -684,6 +852,16 @@ describe("live pane actions", () => {
         expectedRevision: "rev-7",
       },
     ]);
+    expect(fake.confirms).toEqual([
+      {
+        targetId: "local",
+        confirmationId: "confirm-agent-cancel-1",
+        commandId: "cmd-1",
+        hostId: HOST,
+        sessionId: SESSION,
+        decision: "approve",
+      },
+    ]);
   });
 
   it("cancel without the capability is disabled with a reason and sends nothing", async () => {
@@ -702,6 +880,34 @@ describe("live pane actions", () => {
     store.getState().confirmControl();
     await fake.settle();
     expect(fake.commands).toEqual([]);
+  });
+
+  it("offline and stale pane cancellation paths send nothing", async () => {
+    const offline = new FakeRuntime({ catalog: AGENT_CATALOG, connected: false });
+    offline.setProjection(project([snapshotFrame("rev-7"), agentFrame("agent-1")]));
+    const offlineStore = createLiveInspectorStore(offline, VIEW_ID);
+    offlineStore.getState().requestControl({
+      sessionId: VIEW_ID,
+      agentId: "agent-1",
+      agentTitle: "Worker",
+      action: "cancel",
+    });
+    offlineStore.getState().confirmControl();
+    await offline.settle();
+    expect(offline.commands).toEqual([]);
+
+    const stale = new FakeRuntime({ catalog: AGENT_CATALOG });
+    stale.setProjection(project([agentFrame("agent-1")]), { inventory: false });
+    const staleStore = createLiveInspectorStore(stale, VIEW_ID);
+    staleStore.getState().requestControl({
+      sessionId: VIEW_ID,
+      agentId: "agent-1",
+      agentTitle: "Worker",
+      action: "cancel",
+    });
+    staleStore.getState().confirmControl();
+    await stale.settle();
+    expect(stale.commands).toEqual([]);
   });
 
   it("a host catalog veto disables the action with the host's own reason", () => {
@@ -743,6 +949,7 @@ describe("live pane actions", () => {
     };
     expect(store.getState().actions.agentCancel).toEqual(expected);
     expect(store.getState().actions.reviewApply).toEqual(expected);
+    expect(store.getState().actions.fileWrite).toEqual(expected);
   });
 
   it("steer, wake, and discard have no wire command: disabled, honest, silent", async () => {
@@ -793,6 +1000,93 @@ describe("live pane actions", () => {
     expect(store.getState().review.files[0]?.applyState).toBe("applied");
   });
 
+  it("file save sends revision-gated text and settles from its final command result", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    const base = project([
+      snapshotFrame("rev-3"),
+      fileFrame("src/app.ts", "const value = 1;\n"),
+    ]);
+    fake.setProjection(base);
+    const store = createLiveInspectorStore(fake, VIEW_ID);
+    expect(store.getState().actions.fileWrite.enabled).toBe(true);
+
+    store.getState().selectFile("src/app.ts");
+    store.getState().startFileEdit("src/app.ts");
+    store.getState().updateFileDraft("src/app.ts", "const value = 2;\n");
+    store.getState().saveFile("src/app.ts");
+    await fake.settle();
+
+    expect(fake.commands).toEqual([
+      {
+        hostId: HOST,
+        sessionId: SESSION,
+        command: "files.write",
+        args: { path: "src/app.ts", content: "const value = 2;\n" },
+        expectedRevision: "rev-3",
+      },
+    ]);
+    expect(store.getState().files.draftsByPath["src/app.ts"]).toBeUndefined();
+    expect(store.getState().files.preview).toBe("loading");
+
+    fake.setProjection(
+      project(
+        [snapshotFrame("rev-4"), fileFrame("src/app.ts", "const value = 2;\n")],
+        base,
+      ),
+    );
+    expect(store.getState().files.preview).toMatchObject({ text: "const value = 2;\n" });
+
+    store.getState().startFileEdit("src/app.ts");
+    store.getState().updateFileDraft("src/app.ts", "const value = 3;\n");
+    store.getState().saveFile("src/app.ts");
+    await fake.settle();
+    expect(fake.commands[1]?.expectedRevision).toBe("rev-4");
+  });
+
+  it("pins a file save to the revision that produced its draft", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    const base = project([
+      snapshotFrame("rev-3"),
+      fileFrame("src/app.ts", "const value = 1;\n"),
+    ]);
+    fake.setProjection(base);
+    const store = createLiveInspectorStore(fake, VIEW_ID);
+
+    store.getState().selectFile("src/app.ts");
+    store.getState().startFileEdit("src/app.ts");
+    store.getState().updateFileDraft("src/app.ts", "const value = 2;\n");
+    fake.setProjection(project([snapshotFrame("rev-4")], base));
+    store.getState().saveFile("src/app.ts");
+    await fake.settle();
+
+    expect(fake.commands[0]?.expectedRevision).toBe("rev-3");
+  });
+
+  it("a stale file save preserves the draft as a conflict", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    const base = project([
+      snapshotFrame("rev-3"),
+      fileFrame("src/app.ts", "before\n"),
+    ]);
+    fake.setProjection(base);
+    const store = createLiveInspectorStore(fake, VIEW_ID);
+    fake.commandResult = {
+      accepted: false,
+      error: { code: "stale_revision", message: "revision changed" },
+    };
+    store.getState().selectFile("src/app.ts");
+    store.getState().startFileEdit("src/app.ts");
+    store.getState().updateFileDraft("src/app.ts", "mine\n");
+    store.getState().saveFile("src/app.ts");
+    await fake.settle();
+
+    expect(store.getState().files.draftsByPath["src/app.ts"]).toMatchObject({
+      text: "mine\n",
+      status: "conflict",
+    });
+    expect(fake.commands).toHaveLength(1);
+  });
+
   it("a denied review apply keeps the row pending", async () => {
     const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
     const base = project([
@@ -839,5 +1133,221 @@ describe("live pane actions", () => {
     const apply = store.getState().actions.reviewApply;
     expect(apply.enabled).toBe(false);
     expect(apply.reason).toBe("Waiting for this session's latest state.");
+  });
+});
+
+describe("global Agent View", () => {
+  it("groups loaded agents and preserves lifecycle corpus detail", () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.setProjection(
+      project([
+        snapshotFrame("rev-7"),
+        agentFrame("agent-1", {
+          state: "parked",
+          progress: 0.5,
+          detail: {
+            title: "Research worker",
+            description: "Compare persistence architectures",
+            resumable: true,
+            model: "test-model",
+            contextUsage: { used: 4_000, limit: 8_000 },
+          },
+        }),
+      ]),
+    );
+
+    const groups = deriveAgentViewGroups(fake.getSnapshot());
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      viewId: VIEW_ID,
+      projectName: "project-1",
+      session: { title: "Session" },
+    });
+    expect(groups[0]?.agents[0]).toMatchObject({
+      task: "Compare persistence architectures",
+      resumable: true,
+      node: {
+        id: "agent-1",
+        title: "Research worker",
+        state: "parked",
+        progress: 0.5,
+        model: "test-model",
+        contextUsed: 4_000,
+        contextLimit: 8_000,
+      },
+    });
+  });
+
+  it("rechecks gates and confirms the revision-bound cancellation challenge", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
+    fake.setProjection(
+      project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const node = group?.agents[0]?.node;
+    expect(group).toBeDefined();
+    expect(node).toBeDefined();
+    if (group === undefined || node === undefined) return;
+    expect(agentCancelAvailability(fake.getSnapshot(), group.viewId, node).enabled).toBe(true);
+
+    await cancelAgentFromView(fake, group.viewId, node);
+    expect(fake.targets).toEqual(["local"]);
+    expect(fake.commands).toEqual([
+      {
+        hostId: HOST,
+        sessionId: SESSION,
+        command: "agent.cancel",
+        args: { agentId: "agent-1" },
+        expectedRevision: "rev-7",
+      },
+    ]);
+    expect(fake.confirms).toEqual([
+      {
+        targetId: "local",
+        confirmationId: "confirm-agent-cancel-1",
+        commandId: "cmd-1",
+        hostId: HOST,
+        sessionId: SESSION,
+        decision: "approve",
+      },
+    ]);
+
+    fake.setConnection("disconnected");
+    await expect(cancelAgentFromView(fake, group.viewId, node)).rejects.toThrow(
+      "This host is offline right now.",
+    );
+    expect(fake.commands).toHaveLength(1);
+  });
+
+  it("does not approve after the revision advances while the agent still runs", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
+    fake.setProjection(
+      project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const node = group?.agents[0]?.node;
+    if (group === undefined || node === undefined) throw new Error("expected a projected agent");
+    fake.onAgentCancelChallenge = () =>
+      fake.setProjection(
+        project([snapshotFrame("rev-8"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+      );
+
+    await expect(cancelAgentFromView(fake, group.viewId, node)).rejects.toThrow(
+      "The session changed before agent cancellation could be confirmed.",
+    );
+    expect(fake.commands).toHaveLength(1);
+    expect(fake.confirms).toHaveLength(0);
+  });
+
+  it("does not approve after the connection drops during confirmation", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
+    fake.setProjection(
+      project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const node = group?.agents[0]?.node;
+    if (group === undefined || node === undefined) throw new Error("expected a projected agent");
+    fake.onAgentCancelChallenge = () => fake.setConnection("disconnected");
+
+    await expect(cancelAgentFromView(fake, group.viewId, node)).rejects.toThrow(
+      "This host is offline right now.",
+    );
+    expect(fake.commands).toHaveLength(1);
+    expect(fake.confirms).toHaveLength(0);
+  });
+
+  it("rejects when the confirmed cancellation command is not accepted", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
+    fake.commandResult = {
+      accepted: false,
+      error: { code: "operation_failed", message: "cancellation failed" },
+    };
+    fake.setProjection(
+      project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const node = group?.agents[0]?.node;
+    if (group === undefined || node === undefined) throw new Error("expected a projected agent");
+
+    await expect(cancelAgentFromView(fake, group.viewId, node)).rejects.toThrow(
+      "The host did not accept this cancellation request.",
+    );
+    expect(fake.commands).toHaveLength(1);
+    expect(fake.confirms).toHaveLength(1);
+  });
+
+  it("serializes concurrent same-session cancellations around their own challenges", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.challengeAgentCancellation = true;
+    fake.holdAgentCancelConfirmations = true;
+    fake.setProjection(
+      project([
+        snapshotFrame("rev-7"),
+        agentFrame("agent-1", { detail: { title: "First" } }),
+        agentFrame("agent-2", { detail: { title: "Second" } }),
+      ]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const first = group?.agents[0]?.node;
+    const second = group?.agents[1]?.node;
+    if (group === undefined || first === undefined || second === undefined) {
+      throw new Error("expected two projected agents");
+    }
+
+    const firstCancel = cancelAgentFromView(fake, group.viewId, first);
+    const secondCancel = cancelAgentFromView(fake, group.viewId, second);
+    try {
+      await fake.waitForAgentCancelConfirmation();
+      expect(fake.commands).toHaveLength(1);
+      expect(fake.confirms).toHaveLength(1);
+    } finally {
+      fake.holdAgentCancelConfirmations = false;
+      fake.releaseAgentCancelConfirmations();
+    }
+    await Promise.all([firstCancel, secondCancel]);
+
+    expect(fake.commands.map((intent) => intent.args)).toEqual([
+      { agentId: "agent-1" },
+      { agentId: "agent-2" },
+    ]);
+    expect(fake.confirms.map((request) => [request.confirmationId, request.commandId])).toEqual([
+      ["confirm-agent-cancel-1", "cmd-1"],
+      ["confirm-agent-cancel-2", "cmd-2"],
+    ]);
+  });
+
+  it("rejects a stale row after its agent leaves the live projection", async () => {
+    const fake = new FakeRuntime({ catalog: AGENT_CATALOG });
+    fake.setProjection(
+      project([snapshotFrame("rev-7"), agentFrame("agent-1", { detail: { title: "Worker" } })]),
+    );
+    const group = deriveAgentViewGroups(fake.getSnapshot())[0];
+    const node = group?.agents[0]?.node;
+    if (group === undefined || node === undefined) throw new Error("expected a projected agent");
+
+    fake.setProjection(
+      project([
+        snapshotFrame("rev-8"),
+        agentFrame("agent-1", { detail: { title: "Worker" }, state: "cancelled" }),
+      ]),
+    );
+    expect(agentCancelAvailability(fake.getSnapshot(), group.viewId, node)).toEqual({
+      enabled: false,
+      reason: "This agent has already stopped.",
+    });
+
+    fake.setProjection(project([snapshotFrame("rev-9")]));
+    expect(agentCancelAvailability(fake.getSnapshot(), group.viewId, node)).toEqual({
+      enabled: false,
+      reason: "This agent is no longer available.",
+    });
+    await expect(cancelAgentFromView(fake, group.viewId, node)).rejects.toThrow(
+      "This agent is no longer available.",
+    );
+    expect(fake.commands).toHaveLength(0);
   });
 });

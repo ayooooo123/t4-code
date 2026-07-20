@@ -3,6 +3,7 @@ const runtimeExternalDependencies = [
   "node_modules/electron-updater/**/*",
   "node_modules/ws/**/*",
 ];
+const signedMacBuild = process.env.T4_MACOS_SIGNED_BUILD === "1";
 
 export const linuxUpdatePublish = {
   provider: "github",
@@ -31,6 +32,7 @@ const config = {
   ],
   extraResources: [
     { from: "apps/web/dist", to: "web" },
+    { from: "packages/host-daemon/dist/t4-host", to: "runtime/t4-host" },
     { from: "LICENSE", to: "LICENSE" },
   ],
   protocols: [{ name: "T4 Code", schemes: ["t4-code"] }],
@@ -46,10 +48,25 @@ const config = {
   mac: {
     category: "public.app-category.developer-tools",
     icon: "apps/desktop/build/icon.png",
-    // The public macOS build is intentionally unsigned and unnotarized. Keep
-    // it on the explicit-download path until there is an honest signed update
-    // channel; do not emit latest-mac.yml for electron-updater.
+    identity: signedMacBuild ? undefined : null,
+    hardenedRuntime: signedMacBuild,
+    gatekeeperAssess: false,
+    entitlements: signedMacBuild ? "apps/desktop/build/entitlements.mac.plist" : undefined,
+    entitlementsInherit: signedMacBuild
+      ? "apps/desktop/build/entitlements.mac.plist"
+      : undefined,
+    sign: signedMacBuild ? "scripts/sign-macos.mjs" : undefined,
+    notarize: signedMacBuild,
+    // The first signed release remains an explicit GitHub download. Keep the
+    // updater feed disabled until signed-to-signed update migration has its
+    // own release proof.
     publish: [],
+    extraResources: [
+      { from: ".artifacts/omp-runtime", to: "runtime" },
+      { from: "scripts/tailnet-gateway.mjs", to: "gateway/tailnet-gateway.mjs" },
+      { from: "scripts/tailnet-service.mjs", to: "gateway/tailnet-service.mjs" },
+      { from: "apps/desktop/node_modules/ws", to: "node_modules/ws" },
+    ],
     target: [
       { target: "dmg", arch: ["arm64"] },
       { target: "zip", arch: ["arm64"] },

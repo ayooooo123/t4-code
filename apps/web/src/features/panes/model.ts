@@ -110,7 +110,13 @@ export interface ActivityEntry {
   readonly shellOutput: string | null;
 }
 
-export type ReviewFileStatus = "added" | "modified" | "deleted" | "renamed";
+export type ReviewFileStatus =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "untracked";
 export type ReviewFileKind = "text" | "binary" | "huge" | "missing";
 export type ReviewApplyState = "pending" | "applied" | "discarded";
 
@@ -143,7 +149,12 @@ export interface FileTreeNode {
 }
 
 export type FilePreview =
-  | { readonly kind: "code"; readonly path: string; readonly text: string; readonly truncated: boolean }
+  | {
+      readonly kind: "code";
+      readonly path: string;
+      readonly text: string;
+      readonly truncated: boolean;
+    }
   | { readonly kind: "image"; readonly path: string; readonly src: string }
   | { readonly kind: "binary"; readonly path: string; readonly sizeBytes: number }
   | { readonly kind: "diagnostic"; readonly path: string; readonly message: string }
@@ -187,6 +198,7 @@ export interface InspectorActionAvailability {
   readonly agentWake: PaneActionAvailability;
   readonly reviewApply: PaneActionAvailability;
   readonly reviewDiscard: PaneActionAvailability;
+  readonly fileWrite: PaneActionAvailability;
 }
 
 const AVAILABLE: PaneActionAvailability = Object.freeze({ enabled: true, reason: null });
@@ -198,4 +210,5 @@ export const ALL_ACTIONS_AVAILABLE: InspectorActionAvailability = Object.freeze(
   agentWake: AVAILABLE,
   reviewApply: AVAILABLE,
   reviewDiscard: AVAILABLE,
+  fileWrite: AVAILABLE,
 });

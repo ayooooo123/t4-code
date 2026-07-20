@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 
+import { makeCanonicalTemporaryDirectory } from "./test-temporary-directory.mjs";
+
 const repoRoot = resolve(import.meta.dirname, "..");
 const maintainerRoot = resolve(repoRoot, "ops/t4-maintainer");
+const bashPath = "/bin/bash";
 
 async function source(name) {
   return readFile(resolve(maintainerRoot, name), "utf8");
@@ -49,9 +52,102 @@ test("maintainer shell entrypoints remain syntactically valid", async () => {
     "validate.sh",
   ]) {
     const path = resolve(maintainerRoot, name);
-    const result = spawnSync("bash", ["-n", path], { encoding: "utf8" });
+    const result = spawnSync(bashPath, ["-n", path], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr || result.stdout);
   }
+});
+
+test("runner preflights the configured date helper before creating state", async () => {
+  const scratch = await makeCanonicalTemporaryDirectory("t4-maintainer-date-");
+  const stateRoot = join(scratch, "state");
+  const missingDate = join(scratch, "missing-date");
+  await mkdir(stateRoot, { mode: 0o700 });
+  try {
+    const result = spawnSync(bashPath, [resolve(maintainerRoot, "run.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        T4_MAINTAINER_DATE: missingDate,
+        T4_MAINTAINER_ROOT: stateRoot,
+      },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, new RegExp(`required command is unavailable: ${missingDate}`, "u"));
+    await assert.rejects(access(join(stateRoot, "state")));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("runner preflights the Linux Sol privilege runner before creating state", async () => {
+  const scratch = await makeCanonicalTemporaryDirectory("t4-maintainer-setpriv-");
+  const stateRoot = join(scratch, "maintainer");
+  const bin = join(scratch, "bin");
+  const realpath = join(bin, "realpath");
+  const uname = join(stateRoot, "uname");
+  const missingSetpriv = join(stateRoot, "missing-setpriv");
+  await mkdir(stateRoot, { mode: 0o700 });
+  await mkdir(bin, { mode: 0o700 });
+  for (const command of [
+    "curl",
+    "dpkg",
+    "dpkg-query",
+    "flock",
+    "gh",
+    "git",
+    "jq",
+    "sha256sum",
+    "systemctl",
+  ]) {
+    await writeFile(join(bin, command), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  await writeFile(
+    realpath,
+    `#!/bin/sh
+[ "\${1:-}" = "-e" ] && shift
+[ "\${1:-}" = "--" ] && shift
+exec "$T4_TEST_NODE" -e 'const fs=require("node:fs");process.stdout.write(fs.realpathSync.native(process.argv[1])+"\\n")' "$1"
+`,
+    { mode: 0o700 },
+  );
+  await writeFile(uname, "#!/bin/sh\nprintf 'Linux\\n'\n", { mode: 0o700 });
+  try {
+    const result = spawnSync(bashPath, [resolve(maintainerRoot, "run.sh")], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:/usr/bin:/bin`,
+        T4_TEST_NODE: process.execPath,
+        T4_MAINTAINER_TEST_MODE: "1",
+        T4_MAINTAINER_ROOT: stateRoot,
+        T4_MAINTAINER_UNAME: uname,
+        T4_MAINTAINER_OMP: bashPath,
+        T4_MAINTAINER_NODE: process.execPath,
+        T4_MAINTAINER_SETPRIV: missingSetpriv,
+      },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /test privilege runner must exist and be canonical/u);
+    await assert.rejects(access(join(stateRoot, "state")));
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("direct deployer preflights every configured command used during cutover", async () => {
+  const deployer = await source("deploy-local.sh");
+  assert.match(
+    deployer,
+    /for command in[\s\S]*"\$DPKG_QUERY" "\$DPKG" "\$DPKG_DEB" "\$SHA256SUM" "\$SYSTEMCTL" "\$INSTALL" "\$SYNC"[\s\S]*require_command "\$command"/u,
+  );
+});
+
+test("runner warns when delivered blocker dedupe state cannot be persisted", async () => {
+  const runner = await source("run.sh");
+  assert.match(
+    runner,
+    /Hermes delivery succeeded but notification dedupe state could not be persisted/u,
+  );
 });
 
 test("installer and validator ship every deterministic verification helper", async () => {
@@ -84,9 +180,19 @@ test("installer and validator ship every deterministic verification helper", asy
     validator,
     /install -m 0600 "\$SCRIPT_DIR\/\.\.\/\.\.\/scripts\/inspect-linux-update\.mjs"/u,
   );
+  assert.match(installer, /--stage-only/u);
+  assert.ok(installer.indexOf("systemctl --user daemon-reload") < installer.indexOf("stage_only == true"));
+  const runner = await source("run.sh");
+  assert.match(runner, /NOTIFY_SECRET_FILE=\$\{T4_MAINTAINER_HERMES_SECRET_FILE:-"\$MAINTAINER_ROOT\/secrets\/hermes-webhook\.secret"\}/u);
+  assert.match(runner, /publication_gate \|\| \{\s+local gate_status=\$\?/u);
+  assert.match(runner, /--profile t4-maintainer[\s\S]*--model openai-codex\/gpt-5\.6-sol[\s\S]*--thinking max[\s\S]*--approval-mode yolo/u);
 });
 
 test("reinstall waits for the active maintainer lock before replacing its bundle", async (t) => {
+  if (spawnSync("flock", ["--version"], { stdio: "ignore" }).error?.code === "ENOENT") {
+    t.skip("flock semantics are verified on Linux");
+    return;
+  }
   const root = await mkdtemp(join(tmpdir(), "t4-maintainer-install-lock-"));
   const home = join(root, "home");
   const maintainer = join(root, "maintainer");
@@ -101,7 +207,20 @@ test("reinstall waits for the active maintainer lock before replacing its bundle
   await mkdir(bin, { recursive: true });
   await writeFile(join(libexec, "run.sh"), "old-run\n");
   await writeFile(token, "test-token\n", { mode: 0o600 });
-  for (const command of ["bun", "gh", "omp", "systemctl", "systemd-analyze"]) {
+  for (const command of [
+    "apt-get",
+    "bun",
+    "dpkg",
+    "dpkg-deb",
+    "dpkg-query",
+    "gh",
+    "omp",
+    "realpath",
+    "sha256sum",
+    "sudo",
+    "systemctl",
+    "systemd-analyze",
+  ]) {
     const commandPath = join(bin, command);
     await writeFile(commandPath, "#!/usr/bin/env bash\nexit 1\n");
     await chmod(commandPath, 0o700);
@@ -112,7 +231,7 @@ test("reinstall waits for the active maintainer lock before replacing its bundle
   await chmod(join(bin, "systemd-analyze"), 0o700);
 
   const holder = spawn(
-    "/usr/bin/bash",
+    bashPath,
     ["-c", 'exec 8>"$1"; flock 8; printf "ready\\n"; read -r _', "holder", lock],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
@@ -127,7 +246,7 @@ test("reinstall waits for the active maintainer lock before replacing its bundle
   });
 
   let stderr = "";
-  const installer = spawn("/usr/bin/bash", [resolve(maintainerRoot, "install.sh")], {
+  const installer = spawn(bashPath, [resolve(maintainerRoot, "install.sh")], {
     env: {
       ...process.env,
       HOME: home,
@@ -192,11 +311,12 @@ test("runner gives Sol the requested model, tools, and release ownership", async
   assert.match(runner, /--model openai-codex\/gpt-5\.6-sol/u);
   assert.match(runner, /--thinking max/u);
   assert.match(runner, /--approval-mode yolo/u);
+  assert.match(runner, /"\$SETPRIV" --no-new-privs -- "\$OMP"/u);
   assert.doesNotMatch(runner, /--no-tools|--tools=|--no-pty|\bbwrap\b/u);
   for (const responsibility of [
     "`lyc-aon/oh-my-pi` fork",
     "wrapper has already synchronized",
-    "Merge the exact official `vX.Y.Z` base into the durable `t4code/main` product branch",
+    "merge the exact official `vX.Y.Z` base into the durable `t4code/main` product branch",
     "reachable from `t4code/main`",
     "Use `$T4_ATOMIC_PUBLISH_HELPER` as the only OMP publication path",
     "atomic three-ref transaction",
@@ -205,6 +325,14 @@ test("runner gives Sol the requested model, tools, and release ownership", async
     "complete release gate",
     "Verify the public GitHub release",
     "deterministic wrapper will install the verified compatibility pair",
+    "`$T4_MAINTENANCE_DEFERRAL_FILE`",
+    "`t4-main-changed`",
+    "`release-critical-pr`",
+    "`classification-incomplete`",
+    "Never use `sudo`",
+    "never install, remove, upgrade, or downgrade a host package",
+    "The deterministic wrapper and `deploy-local.sh` alone own host mutation",
+    "Reuse the highest existing revision only when all of those facts exactly match",
   ]) {
     assert.ok(prompt.includes(responsibility), `maintainer prompt is missing: ${responsibility}`);
   }
@@ -298,13 +426,17 @@ test("public verification requires exact GitHub provenance despite admin bypass 
       '.path == ".github/workflows/ci.yml"',
       '.name == "Release app builds"',
       '.path == ".github/workflows/release.yml"',
-      '.name == "Deploy project site"',
       '.path == ".github/workflows/deploy-site.yml"',
       ".head_branch == $tag",
       '.status == "completed"',
       '.conclusion == "success"',
     ],
     "exact-commit workflow verification",
+  );
+  assert.doesNotMatch(
+    workflows,
+    /\.name == "Deploy project site"/u,
+    "site workflow identity must use the stable path because run-name is dynamic",
   );
 
   const assets = shellFunction(runner, "release_assets_are_public");
@@ -402,7 +534,7 @@ test("pending publication is atomic and gates local deployment before processed 
 
   const durableReplace = shellFunction(runner, "durable_replace");
   assertOrdered(durableReplace, [
-    'chmod 600 -- "$temporary"',
+    'chmod 600 "$temporary"',
     '"$SYNC" -f "$temporary"',
     'mv -f -- "$temporary" "$target"',
     '"$SYNC" -f "$target_dir"',
@@ -437,7 +569,7 @@ test("pending publication is atomic and gates local deployment before processed 
 
   const main = shellFunction(runner, "main");
   assertOrdered(main, ["deploy_pending_publication", "run_live_maintenance"]);
-  assert.match(live, /"\$OMP" \\\n[\s\S]*--model openai-codex\/gpt-5\.6-sol/u);
+  assert.match(live, /invoke_sol \\\n[\s\S]*--model openai-codex\/gpt-5\.6-sol/u);
 });
 
 test("processed state is a receipt, not permission to ignore live workstation drift", async () => {
@@ -451,7 +583,7 @@ test("processed state is a receipt, not permission to ignore live workstation dr
       'recorded_omp_target == "$OMP_TARGET"',
       '$SHA256SUM "$OMP_TARGET"',
       '--property MainPID --value',
-      '/proc/$app_pid/exe',
+      '$PROC_ROOT/$app_pid/exe',
       '"$OMP_TARGET" appserver status --json',
       '.state == "running"',
       ".health.ok == true",
@@ -613,14 +745,14 @@ test("local cutover binds public mirror, live drain, exposure, and gateway ident
     ],
     "clean fork main and exact base-tag mirror gate",
   );
-  assert.match(deployment, /\[\[ \$\(uname -s\) == Linux \]\]/u);
+  assert.match(deployment, /\[\[ \$\("\$UNAME" -s\) == Linux \]\]/u);
 
   const liveProof = shellFunction(deployment, "prove_installed_drain_contract");
   assertIncludesAll(
     liveProof,
     [
       '--property MainPID --value',
-      '"/proc/$current_pid/exe"',
+      '"$PROC_ROOT/$current_pid/exe"',
       'current_sha == "$expected_sha"',
       'current_sha == "$OMP_CANDIDATE_SHA"',
       'mismatch_host="t4-maintainer-host-$nonce"',
@@ -631,6 +763,26 @@ test("local cutover binds public mirror, live drain, exposure, and gateway ident
       ".health.epoch == $epoch",
     ],
     "installed live drain proof",
+  );
+  const startupProof = shellFunction(deployment, "wait_for_appserver");
+  assertIncludesAll(
+    startupProof,
+    [
+      '-r "$PROC_ROOT/$pid/exe"',
+      '$SHA256SUM "$PROC_ROOT/$pid/exe"',
+      'running_sha == "$installed_sha"',
+    ],
+    "installed appserver executable identity proof",
+  );
+  const rollbackProof = shellFunction(deployment, "prepare_post_exposure_rollback");
+  assertIncludesAll(
+    rollbackProof,
+    [
+      '-r "$PROC_ROOT/$current_pid/exe"',
+      '$SHA256SUM "$PROC_ROOT/$current_pid/exe"',
+      'current_sha == "$($SHA256SUM "$OMP_TARGET"',
+    ],
+    "post-exposure rollback executable identity proof",
   );
 
   const cutover = deployment.slice(deployment.indexOf("MUTATION_STARTED=true"));
@@ -794,8 +946,9 @@ test("local deployment prepares everything before mutation and writes proof last
     '$SUDO -n "$APT_GET" install -y --reinstall --allow-downgrades "$TARGET_DEB"',
     'dpkg_verification=$($DPKG -V "$T4_PACKAGE")',
     '"$SYNC" -f "$T4_EXECUTABLE"',
-    '$NODE "$T4_RUNTIME_ROOT/scripts/tailnet-service.mjs" install',
+    "GATEWAY_INSTALL_ARGS=(",
     "--defer-start",
+    '"$NODE" "${GATEWAY_INSTALL_ARGS[@]}"',
     '"$SYNC" -f "$GATEWAY_CONFIG"',
     '"$SYNC" -f "$(dirname -- "$GATEWAY_CONFIG")"',
     '"$SYNC" -f "$(dirname -- "$GATEWAY_UNIT")"',
@@ -965,8 +1118,9 @@ test("processed state accepts only a complete post-cutover health receipt", asyn
   );
   const gatewayCutover = deployment.slice(deployment.indexOf("MUTATION_STARTED=true"));
   assertOrdered(gatewayCutover, [
-    '$NODE "$T4_RUNTIME_ROOT/scripts/tailnet-service.mjs" install',
+    "GATEWAY_INSTALL_ARGS=(",
     "--defer-start",
+    '"$NODE" "${GATEWAY_INSTALL_ARGS[@]}"',
     "before-gateway-exposure",
     'write_transaction_marker gateway-exposure-starting',
     '$NODE "$T4_RUNTIME_ROOT/scripts/tailnet-service.mjs" start',

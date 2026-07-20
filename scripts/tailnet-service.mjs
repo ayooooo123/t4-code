@@ -13,6 +13,7 @@ export const DEFAULT_GATEWAY_PORT = 4_194;
 const CONFIG_VERSION = 1;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_TEXT = 4_096;
+const PROFILE_ROUTES_ENVIRONMENT_KEY = "T4_PROFILE_ROUTES";
 const CAPACITOR_NATIVE_ORIGINS = Object.freeze(["https://localhost", "capacitor://localhost"]);
 
 function fail(message) {
@@ -54,6 +55,14 @@ function deploymentIdentity(value) {
     fail("deployment identity must be sha256 followed by exactly 64 lowercase hexadecimal characters");
   }
   return identity;
+}
+
+export function parseProfileRoutesOption(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    fail("--profile-routes must be valid JSON");
+  }
 }
 
 function platformName(platform) {
@@ -126,9 +135,29 @@ export function servicePaths({
   };
 }
 
+function profileRoutes(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 64) fail("profile routes must be an array");
+  const ids = new Set();
+  const routes = value.map((route) => {
+    if (route === null || typeof route !== "object" || Array.isArray(route)) fail("profile route is invalid");
+    const id = cleanText(route.id, "profile id", 64);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(id) || id === "default" || ids.has(id)) fail("profile id is invalid");
+    ids.add(id);
+    const appSocket = absolutePath(route.appSocket, "profile appserver socket");
+    const serviceUnit = route.serviceUnit === undefined ? undefined : cleanText(route.serviceUnit, "profile service unit", 128);
+    if (serviceUnit !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$/u.test(serviceUnit) || serviceUnit.includes(".."))) fail("profile service unit is invalid");
+    if (route.startEnabled !== undefined && typeof route.startEnabled !== "boolean") fail("profile startEnabled is invalid");
+    return { id, appSocket, ...(serviceUnit === undefined ? {} : { serviceUnit }), startEnabled: route.startEnabled === true };
+  });
+  if (`${PROFILE_ROUTES_ENVIRONMENT_KEY}=${JSON.stringify(routes)}`.length > MAX_TEXT) fail("profile routes are too large");
+  return routes;
+}
+
 export function validateServiceConfig(input) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) fail("service config is invalid");
   const sourceRoot = absolutePath(input.sourceRoot, "source root");
+  const routes = profileRoutes(input.profileRoutes);
   const config = {
     version: CONFIG_VERSION,
     sourceRoot,
@@ -141,6 +170,8 @@ export function validateServiceConfig(input) {
     port: gatewayPort(input.port ?? DEFAULT_GATEWAY_PORT),
     label: cleanText(input.label ?? "OMP on this Tailnet host", "host label", 128),
     deploymentIdentity: deploymentIdentity(input.deploymentIdentity),
+    ...(input.electronRunAsNode === true ? { electronRunAsNode: true } : {}),
+    ...(routes === undefined ? {} : { profileRoutes: routes, startProfiles: input.startProfiles === true }),
   };
   if (input.version !== undefined && input.version !== CONFIG_VERSION) fail("service config version is unsupported");
   return config;
@@ -158,7 +189,6 @@ function escapeXml(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
 }
-
 function gatewayEnvironment(config) {
   return {
     T4_ALLOWED_ORIGIN: config.allowedOrigin,
@@ -169,6 +199,13 @@ function gatewayEnvironment(config) {
     T4_APP_SERVER_SOCKET: config.appSocket,
     T4_HOST_LABEL: config.label,
     T4_DEPLOYMENT_IDENTITY: config.deploymentIdentity,
+    ...(config.electronRunAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+    ...(config.profileRoutes === undefined
+      ? {}
+      : {
+          [PROFILE_ROUTES_ENVIRONMENT_KEY]: JSON.stringify(config.profileRoutes),
+          T4_ENABLE_PROFILE_STARTS: config.startProfiles === true ? "1" : "0",
+        }),
   };
 }
 
@@ -325,7 +362,7 @@ async function readOptional(path) {
   }
 }
 
-async function writeAtomic(path, content) {
+async function writeAtomic(path, content, mode = 0o600) {
   const existing = await readOptional(path);
   void existing;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -333,7 +370,7 @@ async function writeAtomic(path, content) {
   const handle = await open(
     temporary,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    0o600,
+    mode,
   );
   try {
     await handle.writeFile(content, "utf8");
@@ -343,10 +380,14 @@ async function writeAtomic(path, content) {
   }
   try {
     await rename(temporary, path);
-    await chmod(path, 0o600);
+    await chmod(path, mode);
   } finally {
     await rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+export function serviceFileMode(paths, path) {
+  return paths.platform === "darwin" && path === paths.definition ? 0o644 : 0o600;
 }
 
 function sanitizedOutput(value) {
@@ -356,7 +397,12 @@ function sanitizedOutput(value) {
     .slice(0, 2_048);
 }
 
-async function runCommand(command) {
+export function isTransientLaunchctlBootstrap(command, result) {
+  if (command.argv[0] !== "launchctl" || command.argv[1] !== "bootstrap") return false;
+  return result.code === 37 || /operation already in progress|bootstrap failed:\s*37\b/iu.test(`${result.stdout}\n${result.stderr}`);
+}
+
+async function runCommandOnce(command) {
   return await new Promise((resolvePromise, reject) => {
     const [executable, ...args] = command.argv;
     const child = spawn(executable, args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
@@ -382,6 +428,25 @@ async function runCommand(command) {
       }
     });
   });
+}
+
+async function runCommand(command) {
+  // macOS service removal is asynchronous even after `launchctl bootout` exits.
+  // Retry only launchd's explicit EINPROGRESS response during replacement.
+  const retryDeadline = Date.now() + 3_000;
+  while (true) {
+    const result = await runCommandOnce({ ...command, allowFailure: true });
+    if (result.code === 0) return result;
+    if (isTransientLaunchctlBootstrap(command, result) && Date.now() < retryDeadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+      continue;
+    }
+    if (command.allowFailure !== true) {
+      const executable = command.argv[0];
+      throw new Error(`${executable} exited ${result.code}: ${result.stderr || result.stdout || "no diagnostics"}`);
+    }
+    return result;
+  }
 }
 
 async function runCommands(commands) {
@@ -533,7 +598,7 @@ export function parseCli(argv) {
     }
     if (!flag?.startsWith("--")) fail(`unexpected argument: ${flag}`);
     const key = flag.slice(2).replaceAll(/-([a-z])/gu, (_match, letter) => letter.toUpperCase());
-    if (flag === "--defer-start") {
+    if (flag === "--defer-start" || flag === "--start-profiles" || flag === "--electron-run-as-node") {
       if (key in options) fail(`${flag} was provided more than once`);
       options[key] = true;
       continue;
@@ -546,7 +611,7 @@ export function parseCli(argv) {
   return { command, options };
 }
 
-function validateCliOptions(command, options) {
+export function validateCliOptions(command, options) {
   const allowed =
     command === "install"
       ? new Set([
@@ -557,9 +622,14 @@ function validateCliOptions(command, options) {
           "appSocket",
           "label",
           "deploymentIdentity",
+          "profileRoutes",
+          "startProfiles",
           "deferStart",
+          "electronRunAsNode",
         ])
-      : new Set(["help"]);
+      : command === "status"
+        ? new Set(["help", "deploymentIdentity"])
+        : new Set(["help"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) fail(`unsupported option for ${command}: --${key}`);
   }
@@ -577,9 +647,13 @@ Install options:
   --port PORT           Loopback gateway port (default: 4194)
   --web-root PATH       Built T4 web directory (default: apps/web/dist)
   --app-socket PATH     OMP appserver Unix socket
+  --profile-routes JSON Static named-profile route array
+  --start-profiles       Allow configured named profiles to start on demand
   --label TEXT          Host label shown by T4 Code
   --deployment-identity SHA256:HEX
                         Immutable identity for the exact deployed T4/OMP tuple (required)
+  --electron-run-as-node
+                        Run the gateway with Electron's bundled Node runtime
   --defer-start         Install the definition durably disabled and stopped
 
 This manages only the loopback gateway service. Configure Tailscale Serve separately.
@@ -601,11 +675,18 @@ async function install(options, paths) {
     port: options.port ?? DEFAULT_GATEWAY_PORT,
     label: options.label ?? "OMP on this Tailnet host",
     deploymentIdentity: options.deploymentIdentity,
+    electronRunAsNode: options.electronRunAsNode === true,
+    ...(options.profileRoutes === undefined
+      ? {}
+      : {
+          profileRoutes: parseProfileRoutesOption(options.profileRoutes),
+          startProfiles: options.startProfiles === true,
+        }),
   });
   await preflight(config);
   if (paths.logs !== undefined) await mkdir(paths.logs, { recursive: true, mode: 0o700 });
-  await writeAtomic(paths.config, `${JSON.stringify(config, null, 2)}\n`);
-  await writeAtomic(paths.definition, expectedDefinition(config, paths));
+  await writeAtomic(paths.config, `${JSON.stringify(config, null, 2)}\n`, serviceFileMode(paths, paths.config));
+  await writeAtomic(paths.definition, expectedDefinition(config, paths), serviceFileMode(paths, paths.definition));
   if (options.deferStart === true) {
     await runCommands(supervisorCommands("install-deferred", paths));
     await requireDurablyStoppedSupervisor(paths);
@@ -620,7 +701,7 @@ async function install(options, paths) {
   console.log(`gateway healthy on http://127.0.0.1:${config.port} (${result.activeSessions ?? 0} active sessions)`);
 }
 
-async function inspect(paths) {
+async function inspect(paths, options = {}) {
   let config;
   try {
     config = await loadConfig(paths);
@@ -645,6 +726,9 @@ async function inspect(paths) {
   const supervisorState = supervisorRunning ? "running" : "stopped or failed";
   const enablementState = supervisorEnabled ? "enabled" : "disabled or unknown";
   const definitionState = definition === undefined ? "missing" : definition === expected ? "current" : "drifted";
+  const deploymentIdentityState = options.deploymentIdentity === undefined
+    ? undefined
+    : options.deploymentIdentity === config.deploymentIdentity ? "current" : "stale";
   console.log(`definition: ${definitionState}`);
   console.log(`supervisor: ${supervisorState}`);
   console.log(`enablement: ${enablementState}`);
@@ -652,8 +736,15 @@ async function inspect(paths) {
   console.log(`local URL: http://127.0.0.1:${config.port}`);
   console.log(`allowed origin: ${config.allowedOrigin}`);
   console.log(`native origins: ${config.nativeAllowedOrigins.join(", ")}`);
+  if (deploymentIdentityState !== undefined) console.log(`deployment identity: ${deploymentIdentityState}`);
   if (supervisorResult?.stderr) console.log(`diagnostics: ${supervisorResult.stderr}`);
-  if (definitionState !== "current" || !supervisorRunning || !supervisorEnabled || !healthResult.ok) {
+  if (
+    definitionState !== "current"
+    || !supervisorRunning
+    || !supervisorEnabled
+    || !healthResult.ok
+    || deploymentIdentityState === "stale"
+  ) {
     process.exitCode = 1;
   }
 }
@@ -695,7 +786,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const paths = servicePaths();
   if (command === "install") await install(options, paths);
-  else if (command === "status") await inspect(paths);
+  else if (command === "status") await inspect(paths, options);
   else if (["start", "stop", "restart"].includes(command)) await lifecycle(command, paths);
   else if (command === "uninstall") await uninstall(paths);
   else fail(`unknown command: ${command}\n\n${usage()}`);

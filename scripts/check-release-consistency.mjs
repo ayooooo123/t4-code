@@ -1,9 +1,12 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
+import { load as parseYaml } from "js-yaml";
 
 export const RELEASE_CONTRACT_PATHS = [
   ".github/android-release-identity.json",
+  ".github/macos-release-identity.json",
   ".github/ISSUE_TEMPLATE/bug_report.yml",
   ".github/workflows/ci.yml",
   ".github/workflows/deploy-site.yml",
@@ -11,12 +14,14 @@ export const RELEASE_CONTRACT_PATHS = [
   "electron-builder.config.mjs",
   "README.md",
   "SECURITY.md",
+  "THIRD_PARTY_NOTICES.md",
   "apps/desktop/src/target-manager.ts",
   "apps/site/src/docs/content.ts",
   "apps/site/src/release.ts",
   "apps/web/src/platform/browser-shell-port.ts",
   "compat/omp-app-matrix.json",
   "docs/CURRENT_RELEASE_NOTES.md",
+  "docs/MACOS_SIGNING.md",
   "docs/RELEASE_GATE.md",
   "ops/t4-maintainer/README.md",
   "packages/client/src/omp-client-frames.ts",
@@ -39,6 +44,15 @@ const VERSION_PATTERN = /^\d+\.\d+\.\d+$/u;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const PATCH_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+
+function compareStableVersions(left, right) {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] - rightParts[index];
+  }
+  return 0;
+}
 
 export function expectedReleaseAssetNames(version) {
   return [
@@ -71,9 +85,93 @@ export function loadReleaseContractFiles(repoRoot) {
   );
 }
 
+function rejectDuplicateJsonKeys(source) {
+  let offset = 0;
+
+  function skipWhitespace() {
+    while (offset < source.length && /\s/u.test(source[offset])) offset += 1;
+  }
+
+  function readString() {
+    const start = offset;
+    offset += 1;
+    while (source[offset] !== '"') {
+      if (source[offset] === "\\") offset += 1;
+      offset += 1;
+    }
+    offset += 1;
+    return JSON.parse(source.slice(start, offset));
+  }
+
+  function readValue() {
+    skipWhitespace();
+    if (source[offset] === "{") {
+      readObject();
+    } else if (source[offset] === "[") {
+      readArray();
+    } else if (source[offset] === '"') {
+      readString();
+    } else {
+      while (offset < source.length && !/[,}\]]/u.test(source[offset])) offset += 1;
+    }
+  }
+
+  function readObject() {
+    offset += 1;
+    skipWhitespace();
+    if (source[offset] === "}") {
+      offset += 1;
+      return;
+    }
+
+    const keys = new Set();
+    while (offset < source.length) {
+      skipWhitespace();
+      const key = readString();
+      if (keys.has(key)) throw new SyntaxError(`duplicated mapping key ${JSON.stringify(key)}`);
+      keys.add(key);
+      skipWhitespace();
+      offset += 1;
+      readValue();
+      skipWhitespace();
+      if (source[offset] === ",") {
+        offset += 1;
+        continue;
+      }
+      offset += 1;
+      return;
+    }
+  }
+
+  function readArray() {
+    offset += 1;
+    skipWhitespace();
+    if (source[offset] === "]") {
+      offset += 1;
+      return;
+    }
+
+    while (offset < source.length) {
+      readValue();
+      skipWhitespace();
+      if (source[offset] === ",") {
+        offset += 1;
+        continue;
+      }
+      offset += 1;
+      return;
+    }
+  }
+
+  readValue();
+}
+
 function parseJson(files, path, errors) {
   try {
-    return JSON.parse(files.get(path) ?? "");
+    const source = files.get(path) ?? "";
+    const parsed = JSON.parse(source);
+    rejectDuplicateJsonKeys(source);
+    return parsed;
   } catch (error) {
     errors.push(
       `${path} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
@@ -84,6 +182,79 @@ function parseJson(files, path, errors) {
 
 function requireText(text, expected, path, errors) {
   if (!text.includes(expected)) errors.push(`${path} is missing ${JSON.stringify(expected)}`);
+}
+
+function validateRuntimeMetadata(value, label, matrixPath, errors) {
+  const version = value?.version;
+  const sourceCommit = value?.sourceCommit;
+  const sourceTag = value?.sourceTag;
+  const upstreamTag = value?.upstreamTag;
+  const upstreamCommit = value?.upstreamCommit;
+  const sourceCommitUrl = `${OMP_RUNTIME_REPOSITORY}/commit/${sourceCommit ?? ""}`;
+  const sourceTagUrl = `${OMP_RUNTIME_REPOSITORY}/tree/${sourceTag ?? ""}`;
+  const upstreamTagUrl = `${OMP_UPSTREAM_REPOSITORY}/tree/${upstreamTag ?? ""}`;
+  const upstreamCommitUrl = `${OMP_UPSTREAM_REPOSITORY}/commit/${upstreamCommit ?? ""}`;
+  const prefix = `${matrixPath} ${label}`;
+
+  if (value?.package !== "omp") {
+    errors.push(`${prefix} package must be omp`);
+  }
+  if (typeof version !== "string" || !VERSION_PATTERN.test(version)) {
+    errors.push(`${prefix} version must be a stable x.y.z version`);
+  }
+  if (value?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
+    errors.push(`${prefix} repository must be ${OMP_RUNTIME_REPOSITORY}`);
+  }
+  if (typeof sourceCommit !== "string" || !SHA_PATTERN.test(sourceCommit)) {
+    errors.push(`${prefix} commit must be a lowercase 40-character Git SHA`);
+  }
+  if (value?.sourceUrl !== sourceCommitUrl) {
+    errors.push(`${prefix} URL must be ${sourceCommitUrl}`);
+  }
+  if (
+    typeof version === "string" &&
+    (typeof sourceTag !== "string" ||
+      !new RegExp(`^t4code-${version.replaceAll(".", "\\.")}-appserver-[1-9]\\d*$`, "u").test(
+        sourceTag,
+      ))
+  ) {
+    errors.push(`${prefix} tag must identify the OMP version and appserver revision`);
+  }
+  if (value?.upstreamRepository !== OMP_UPSTREAM_REPOSITORY) {
+    errors.push(`${prefix} upstream repository must be ${OMP_UPSTREAM_REPOSITORY}`);
+  }
+  if (typeof version === "string" && upstreamTag !== `v${version}`) {
+    errors.push(`${prefix} upstream tag must be v${version}`);
+  }
+  if (typeof upstreamCommit !== "string" || !SHA_PATTERN.test(upstreamCommit)) {
+    errors.push(`${prefix} upstream commit must be a lowercase 40-character Git SHA`);
+  }
+  const integrationPatches = value?.integrationPatches;
+  if (
+    !Array.isArray(integrationPatches) ||
+    integrationPatches.length === 0 ||
+    integrationPatches.some(
+      (patch) => typeof patch !== "string" || !PATCH_NAME_PATTERN.test(patch),
+    ) ||
+    new Set(integrationPatches).size !== integrationPatches.length
+  ) {
+    errors.push(`${prefix} integration patches must be unique kebab-case names`);
+  }
+  if (value?.upstreamTagContainsIntegrationPatches !== false) {
+    errors.push(`${prefix} must record that stock upstream lacks the integration patches`);
+  }
+
+  return Object.freeze({
+    version,
+    sourceCommit,
+    sourceTag,
+    upstreamTag,
+    upstreamCommit,
+    sourceCommitUrl,
+    sourceTagUrl,
+    upstreamTagUrl,
+    upstreamCommitUrl,
+  });
 }
 
 export function collectReleaseConsistencyErrors(files, releaseTag) {
@@ -120,7 +291,39 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     typeof androidIdentity?.certificateBaseline?.assetSha256 !== "string" ||
     !SHA256_PATTERN.test(androidIdentity.certificateBaseline.assetSha256)
   ) {
-    errors.push(`${androidIdentityPath} certificate baseline asset must have a lowercase SHA-256 digest`);
+    errors.push(
+      `${androidIdentityPath} certificate baseline asset must have a lowercase SHA-256 digest`,
+    );
+  }
+
+  const macosIdentityPath = ".github/macos-release-identity.json";
+  const macosIdentity = parseJson(files, macosIdentityPath, errors);
+  if (macosIdentity?.schemaVersion !== 1) {
+    errors.push(`${macosIdentityPath} schemaVersion must be 1`);
+  }
+  if (macosIdentity?.bundleId !== "com.lycaonsolutions.t4code") {
+    errors.push(`${macosIdentityPath} bundleId must be com.lycaonsolutions.t4code`);
+  }
+  if (!/^[A-Z0-9]{10}$/u.test(macosIdentity?.teamId ?? "")) {
+    errors.push(`${macosIdentityPath} teamId must be 10 uppercase letters or digits`);
+  }
+  if (
+    typeof macosIdentity?.certificateSha256 !== "string" ||
+    !SHA256_PATTERN.test(macosIdentity.certificateSha256)
+  ) {
+    errors.push(`${macosIdentityPath} certificate must be a lowercase SHA-256 digest`);
+  }
+  if (macosIdentity?.certificateAuthority !== "Developer ID Certification Authority") {
+    errors.push(`${macosIdentityPath} must pin the Developer ID Certification Authority`);
+  }
+  if (macosIdentity?.architecture !== "arm64") {
+    errors.push(`${macosIdentityPath} architecture must be arm64`);
+  }
+  if (!/^v\d+\.\d+\.\d+$/u.test(macosIdentity?.firstSignedReleaseTag ?? "")) {
+    errors.push(`${macosIdentityPath} firstSignedReleaseTag must be vX.Y.Z`);
+  }
+  if (macosIdentity?.notarizationRequired !== true) {
+    errors.push(`${macosIdentityPath} must require notarization`);
   }
 
   const packagePaths = [...files.keys()]
@@ -154,14 +357,19 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     errors.push(`${matrixPath} desktop version must be ${version}`);
   }
 
-  // The compatibility matrix is the release's provenance authority. These
-  // checks validate its shape and internal relationships; the cross-surface
-  // checks below ensure the site, README, and release notes match it.
+  // The compatibility matrix records both the current vendored contract and
+  // immutable provenance for the published release surfaces.
   const appWire = matrix?.appWire;
   const appWireVersion = appWire?.version;
   const appWireSourceCommit = typeof appWire?.sourceCommit === "string" ? appWire.sourceCommit : "";
   const appWireSourceTree =
     typeof appWire?.sourceTreeHash === "string" ? appWire.sourceTreeHash : "";
+  const publishedAppWire = matrix?.publishedAppWire;
+  const publishedAppWireVersion = publishedAppWire?.version;
+  const publishedAppWireSourceCommit =
+    typeof publishedAppWire?.sourceCommit === "string" ? publishedAppWire.sourceCommit : "";
+  const publishedAppWireSourceTree =
+    typeof publishedAppWire?.sourceTreeHash === "string" ? publishedAppWire.sourceTreeHash : "";
   if (appWire?.package !== "@oh-my-pi/app-wire") {
     errors.push(`${matrixPath} app-wire package must be @oh-my-pi/app-wire`);
   }
@@ -176,6 +384,41 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   }
   if (!SHA_PATTERN.test(appWireSourceTree)) {
     errors.push(`${matrixPath} app-wire source tree must be a lowercase 40-character Git SHA`);
+  }
+  if (publishedAppWire?.package !== "@oh-my-pi/app-wire") {
+    errors.push(`${matrixPath} published app-wire package must be @oh-my-pi/app-wire`);
+  }
+  if (
+    typeof publishedAppWireVersion !== "string" ||
+    !VERSION_PATTERN.test(publishedAppWireVersion)
+  ) {
+    errors.push(`${matrixPath} published app-wire version must be a stable x.y.z version`);
+  }
+  if (publishedAppWire?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
+    errors.push(`${matrixPath} published app-wire repository must be ${OMP_RUNTIME_REPOSITORY}`);
+  }
+  if (!SHA_PATTERN.test(publishedAppWireSourceCommit)) {
+    errors.push(`${matrixPath} published app-wire commit must be a lowercase 40-character Git SHA`);
+  }
+  if (!SHA_PATTERN.test(publishedAppWireSourceTree)) {
+    errors.push(
+      `${matrixPath} published app-wire source tree must be a lowercase 40-character Git SHA`,
+    );
+  }
+  if (releaseTag !== undefined) {
+    for (const [field, currentValue, publishedValue] of [
+      ["package", appWire?.package, publishedAppWire?.package],
+      ["version", appWireVersion, publishedAppWireVersion],
+      ["repository", appWire?.sourceRepository, publishedAppWire?.sourceRepository],
+      ["commit", appWireSourceCommit, publishedAppWireSourceCommit],
+      ["source tree", appWireSourceTree, publishedAppWireSourceTree],
+    ]) {
+      if (publishedValue !== currentValue) {
+        errors.push(
+          `${matrixPath} published app-wire ${field} must match current app-wire for tagged releases`,
+        );
+      }
+    }
   }
   if (
     typeof appWireVersion === "string" &&
@@ -223,69 +466,78 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     errors.push(`${appWireManifestPath} createdAt must be a canonical ISO timestamp`);
   }
 
-  const verifiedRuntime = matrix?.verifiedRuntime;
-  const ompRuntimeVersion = verifiedRuntime?.version;
-  const ompRuntimeCommit = verifiedRuntime?.sourceCommit;
-  const ompRuntimeSourceTag = verifiedRuntime?.sourceTag;
-  const ompUpstreamTag = verifiedRuntime?.upstreamTag;
-  const ompUpstreamCommit = verifiedRuntime?.upstreamCommit;
-  const ompRuntimeCommitUrl = `${OMP_RUNTIME_REPOSITORY}/commit/${ompRuntimeCommit ?? ""}`;
-  const ompRuntimeSourceUrl = `${OMP_RUNTIME_REPOSITORY}/tree/${ompRuntimeSourceTag ?? ""}`;
-  const ompUpstreamTagUrl = `${OMP_UPSTREAM_REPOSITORY}/tree/${ompUpstreamTag ?? ""}`;
-  const ompUpstreamCommitUrl = `${OMP_UPSTREAM_REPOSITORY}/commit/${ompUpstreamCommit ?? ""}`;
+  requireText(
+    files.get("THIRD_PARTY_NOTICES.md") ?? "",
+    `The vendored \`@oh-my-pi/app-wire@${appWireVersion}\` package is packed from the public \`lyc-aon/oh-my-pi\` integration commit \`${appWireSourceCommit}\`, source tree \`${appWireSourceTree}\`; tarball SHA-256 \`${appWire?.tarballSha256}\`; golden corpus SHA-256 \`${appWire?.goldenCorpusSha256}\`.`,
+    "THIRD_PARTY_NOTICES.md",
+    errors,
+  );
 
-  if (verifiedRuntime?.package !== "omp") {
-    errors.push(`${matrixPath} verified runtime package must be omp`);
-  }
-  if (typeof ompRuntimeVersion !== "string" || !VERSION_PATTERN.test(ompRuntimeVersion)) {
-    errors.push(`${matrixPath} verified runtime version must be a stable x.y.z version`);
-  }
-  if (verifiedRuntime?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
-    errors.push(`${matrixPath} verified runtime repository must be ${OMP_RUNTIME_REPOSITORY}`);
-  }
-  if (typeof ompRuntimeCommit !== "string" || !SHA_PATTERN.test(ompRuntimeCommit)) {
-    errors.push(`${matrixPath} verified runtime commit must be a lowercase 40-character Git SHA`);
-  }
-  if (verifiedRuntime?.sourceUrl !== ompRuntimeCommitUrl) {
-    errors.push(`${matrixPath} verified runtime URL must be ${ompRuntimeCommitUrl}`);
-  }
+  validateRuntimeMetadata(matrix?.verifiedRuntime, "verified runtime", matrixPath, errors);
+  const publishedRuntime = validateRuntimeMetadata(
+    matrix?.publishedRuntime,
+    "published runtime",
+    matrixPath,
+    errors,
+  );
   if (
-    typeof ompRuntimeVersion === "string" &&
-    (typeof ompRuntimeSourceTag !== "string" ||
-      !new RegExp(
-        `^t4code-${ompRuntimeVersion.replaceAll(".", "\\.")}-appserver-[1-9]\\d*$`,
-        "u",
-      ).test(ompRuntimeSourceTag))
+    releaseTag !== undefined &&
+    !isDeepStrictEqual(matrix?.publishedRuntime, matrix?.verifiedRuntime)
   ) {
     errors.push(
-      `${matrixPath} verified runtime tag must identify the OMP version and appserver revision`,
+      `${matrixPath} published runtime must exactly match current verified runtime for tagged releases`,
     );
   }
-  if (verifiedRuntime?.upstreamRepository !== OMP_UPSTREAM_REPOSITORY) {
-    errors.push(`${matrixPath} upstream repository must be ${OMP_UPSTREAM_REPOSITORY}`);
+  if (releaseTag !== undefined) {
+    for (const [field, currentValue, publishedValue] of [
+      ["package", matrix?.verifiedRuntime?.package, matrix?.publishedRuntime?.package],
+      ["version", matrix?.verifiedRuntime?.version, matrix?.publishedRuntime?.version],
+      [
+        "repository",
+        matrix?.verifiedRuntime?.sourceRepository,
+        matrix?.publishedRuntime?.sourceRepository,
+      ],
+      ["commit", matrix?.verifiedRuntime?.sourceCommit, matrix?.publishedRuntime?.sourceCommit],
+      ["URL", matrix?.verifiedRuntime?.sourceUrl, matrix?.publishedRuntime?.sourceUrl],
+      ["tag", matrix?.verifiedRuntime?.sourceTag, matrix?.publishedRuntime?.sourceTag],
+      [
+        "upstream repository",
+        matrix?.verifiedRuntime?.upstreamRepository,
+        matrix?.publishedRuntime?.upstreamRepository,
+      ],
+      ["upstream tag", matrix?.verifiedRuntime?.upstreamTag, matrix?.publishedRuntime?.upstreamTag],
+      [
+        "upstream commit",
+        matrix?.verifiedRuntime?.upstreamCommit,
+        matrix?.publishedRuntime?.upstreamCommit,
+      ],
+      [
+        "integration patches",
+        JSON.stringify(matrix?.verifiedRuntime?.integrationPatches),
+        JSON.stringify(matrix?.publishedRuntime?.integrationPatches),
+      ],
+      [
+        "upstream patch status",
+        matrix?.verifiedRuntime?.upstreamTagContainsIntegrationPatches,
+        matrix?.publishedRuntime?.upstreamTagContainsIntegrationPatches,
+      ],
+    ]) {
+      if (publishedValue !== currentValue) {
+        errors.push(
+          `${matrixPath} published runtime ${field} must match current verified runtime for tagged releases`,
+        );
+      }
+    }
   }
-  if (typeof ompRuntimeVersion === "string" && ompUpstreamTag !== `v${ompRuntimeVersion}`) {
-    errors.push(`${matrixPath} upstream tag must be v${ompRuntimeVersion}`);
-  }
-  if (typeof ompUpstreamCommit !== "string" || !SHA_PATTERN.test(ompUpstreamCommit)) {
-    errors.push(`${matrixPath} upstream commit must be a lowercase 40-character Git SHA`);
-  }
-  const integrationPatches = verifiedRuntime?.integrationPatches;
-  if (
-    !Array.isArray(integrationPatches) ||
-    integrationPatches.length === 0 ||
-    integrationPatches.some(
-      (patch) => typeof patch !== "string" || !PATCH_NAME_PATTERN.test(patch),
-    ) ||
-    new Set(integrationPatches).size !== integrationPatches.length
-  ) {
-    errors.push(
-      `${matrixPath} verified runtime integration patches must be unique kebab-case names`,
-    );
-  }
-  if (verifiedRuntime?.upstreamTagContainsIntegrationPatches !== false) {
-    errors.push(`${matrixPath} must record that stock upstream lacks the integration patches`);
-  }
+  const ompRuntimeVersion = publishedRuntime.version;
+  const ompRuntimeCommit = publishedRuntime.sourceCommit;
+  const ompRuntimeSourceTag = publishedRuntime.sourceTag;
+  const ompUpstreamTag = publishedRuntime.upstreamTag;
+  const ompUpstreamCommit = publishedRuntime.upstreamCommit;
+  const ompRuntimeCommitUrl = publishedRuntime.sourceCommitUrl;
+  const ompRuntimeSourceUrl = publishedRuntime.sourceTagUrl;
+  const ompUpstreamTagUrl = publishedRuntime.upstreamTagUrl;
+  const ompUpstreamCommitUrl = publishedRuntime.upstreamCommitUrl;
 
   const site = files.get("apps/site/src/release.ts") ?? "";
   requireText(
@@ -350,7 +602,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   requireText(
     site,
-    `export const APP_WIRE_VERSION = "${appWireVersion}";`,
+    `export const APP_WIRE_VERSION = "${publishedAppWireVersion}";`,
     "apps/site/src/release.ts",
     errors,
   );
@@ -397,7 +649,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   requireText(
     readme,
-    `T4 Code vendors \`@oh-my-pi/app-wire\` ${appWireVersion} from integration commit [\`${appWireSourceCommit.slice(0, 8)}\`](${OMP_RUNTIME_REPOSITORY}/commit/${appWireSourceCommit}), source tree \`${appWireSourceTree}\`.`,
+    `T4 Code vendors \`@oh-my-pi/app-wire\` ${publishedAppWireVersion} from integration commit [\`${publishedAppWireSourceCommit.slice(0, 8)}\`](${OMP_RUNTIME_REPOSITORY}/commit/${publishedAppWireSourceCommit}), source tree \`${publishedAppWireSourceTree}\`.`,
     "README.md",
     errors,
   );
@@ -425,8 +677,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
 
   const releaseNotes = files.get("docs/CURRENT_RELEASE_NOTES.md") ?? "";
   for (const expected of [
-    `app-wire ${appWireVersion}`,
-    `[${appWireSourceCommit.slice(0, 8)}](${OMP_RUNTIME_REPOSITORY}/commit/${appWireSourceCommit})`,
+    `app-wire ${publishedAppWireVersion}`,
+    `[${publishedAppWireSourceCommit.slice(0, 8)}](${OMP_RUNTIME_REPOSITORY}/commit/${publishedAppWireSourceCommit})`,
     `OMP ${ompRuntimeVersion}`,
     `[${String(ompRuntimeCommit).slice(0, 8)}](${ompRuntimeCommitUrl})`,
     `[${ompRuntimeSourceTag}](${ompRuntimeSourceUrl})`,
@@ -436,9 +688,22 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     requireText(releaseNotes, expected, "docs/CURRENT_RELEASE_NOTES.md", errors);
   }
 
+  const securityPolicy = files.get("SECURITY.md") ?? "";
+  const firstSignedVersion = String(macosIdentity?.firstSignedReleaseTag ?? "").replace(/^v/u, "");
+  const signedRelease = VERSION_PATTERN.test(firstSignedVersion)
+    ? compareStableVersions(version, firstSignedVersion) >= 0
+    : false;
   requireText(
-    files.get("SECURITY.md") ?? "",
-    `The macOS ${expectedTag} build is unsigned and unnotarized`,
+    securityPolicy,
+    signedRelease
+      ? `The macOS ${expectedTag} build is signed with Apple Developer ID and notarized by Apple`
+      : `The macOS ${expectedTag} build is unsigned and unnotarized`,
+    "SECURITY.md",
+    errors,
+  );
+  requireText(
+    securityPolicy,
+    `Starting with ${macosIdentity?.firstSignedReleaseTag ?? "the first signed release"}`,
     "SECURITY.md",
     errors,
   );
@@ -479,16 +744,81 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
 
   const releaseWorkflow = files.get(".github/workflows/release.yml") ?? "";
   const ciWorkflow = files.get(".github/workflows/ci.yml") ?? "";
+  try {
+    const workflow = parseYaml(ciWorkflow);
+    const continuityJob = workflow?.jobs?.["legacy-bridge-continuity"];
+    if (!continuityJob || !Array.isArray(continuityJob.steps)) {
+      errors.push(".github/workflows/ci.yml is missing the legacy-bridge-continuity job");
+    } else {
+      const namedStep = (name) => {
+        const matches = continuityJob.steps.filter((step) => step?.name === name);
+        if (matches.length !== 1) {
+          errors.push(`.github/workflows/ci.yml must contain exactly one ${JSON.stringify(name)} step`);
+          return undefined;
+        }
+        return matches[0];
+      };
+      const authorityStep = namedStep("Resolve pinned OMP authority source");
+      const checkoutStep = namedStep("Check out pinned OMP authority source");
+      const continuityStep = namedStep("Run legacy bridge continuity gate");
+      const uploadStep = namedStep("Upload continuity evidence");
+      const authorityCommands = [
+        `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
+        `test "$source_repository" = "https://github.com/lyc-aon/oh-my-pi"`,
+        `sha="$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)"`,
+        '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]',
+        `echo "repository=lyc-aon/oh-my-pi" >> "$GITHUB_OUTPUT"`,
+        `echo "sha=$sha" >> "$GITHUB_OUTPUT"`,
+      ];
+      for (const command of authorityCommands) {
+        if (!authorityStep?.run?.includes(command))
+          errors.push(`.github/workflows/ci.yml authority step is missing ${JSON.stringify(command)}`);
+      }
+      if (checkoutStep?.with?.repository !== "${{ steps.authority.outputs.repository }}")
+        errors.push(".github/workflows/ci.yml continuity checkout must use the validated repository output");
+      if (checkoutStep?.with?.ref !== "${{ steps.authority.outputs.sha }}")
+        errors.push(".github/workflows/ci.yml continuity checkout must use the validated SHA output");
+      if (checkoutStep?.with?.path !== ".continuity/omp")
+        errors.push(".github/workflows/ci.yml continuity checkout must use .continuity/omp");
+      if (continuityStep?.env?.T4_OMP_SOURCE_DIR !== "${{ github.workspace }}/.continuity/omp")
+        errors.push(".github/workflows/ci.yml continuity gate must target the checked-out OMP source");
+      if (continuityStep?.run !== "pnpm test:legacy-bridge-continuity")
+        errors.push(".github/workflows/ci.yml continuity gate must run the release-bound command");
+      if (
+        uploadStep?.if !== "${{ always() }}" ||
+        uploadStep?.with?.path !== "artifacts/legacy-bridge-continuity/" ||
+        uploadStep?.with?.["if-no-files-found"] !== "error"
+      )
+        errors.push(".github/workflows/ci.yml continuity evidence upload is not fail-closed");
+    }
+  } catch (error) {
+    errors.push(`.github/workflows/ci.yml is invalid YAML: ${error instanceof Error ? error.message : error}`);
+  }
+
   for (const expected of [
     "core:",
+    "legacy-bridge-continuity:",
+    'ref: ${{ github.event.pull_request.head.sha || github.sha }}',
+    `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
+    `test "$source_repository" = "https://github.com/lyc-aon/oh-my-pi"`,
+    `sha="$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)"`,
+    '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]',
+    `echo "repository=lyc-aon/oh-my-pi" >> "$GITHUB_OUTPUT"`,
+    "repository: ${{ steps.authority.outputs.repository }}",
+    "ref: ${{ steps.authority.outputs.sha }}",
+    "T4_OMP_SOURCE_DIR: ${{ github.workspace }}/.continuity/omp",
+    "run: pnpm test:legacy-bridge-continuity",
+    "path: artifacts/legacy-bridge-continuity/",
+    "if-no-files-found: error",
     "tooling:",
     "android-debug:",
     "name: verify",
     "if: ${{ always() }}",
-    "needs: [core, tooling, android-debug]",
-    "test \"$CORE_RESULT\" = success",
-    "test \"$TOOLING_RESULT\" = success",
-    "test \"$ANDROID_RESULT\" = success",
+    "needs: [core, legacy-bridge-continuity, tooling, android-debug]",
+    'test "$CORE_RESULT" = success',
+    'test "$CONTINUITY_RESULT" = success',
+    'test "$TOOLING_RESULT" = success',
+    'test "$ANDROID_RESULT" = success',
     "github.event_name == 'pull_request' && github.ref || github.sha",
     "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
     "actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9",
@@ -573,9 +903,9 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     'WORKFLOW_NAME = "CI"',
     'WORKFLOW_PATH = ".github/workflows/ci.yml"',
     'MAIN_BRANCH = "main"',
-    'run.head_sha === commit',
+    "run.head_sha === commit",
     'run.event === "push"',
-    'run.head_branch === MAIN_BRANCH',
+    "run.head_branch === MAIN_BRANCH",
     'status === "completed" && conclusion === "success"',
     "readBoundedResponseBytes",
   ]) {
@@ -594,7 +924,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   }
   const manifestGenerator = files.get("scripts/generate-release-manifest.mjs") ?? "";
   for (const expected of [
-    'RELEASE_MANIFEST_SCHEMA_VERSION = 1',
+    "RELEASE_MANIFEST_SCHEMA_VERSION = 1",
     'LINUX_UPDATE_METADATA_NAME = "latest-linux.yml"',
     'channel: "stable"',
     "validateLinuxUpdateMetadata",
@@ -630,8 +960,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   for (const expected of [
     "classifyStableReleasePublication",
-    'response.status === 404',
-    'response.status !== 200',
+    "response.status === 404",
+    "response.status !== 200",
     "readBoundedResponseBytes",
     'state: "not-published"',
   ]) {
@@ -662,9 +992,9 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   for (const expected of [
     "dispatchAndWaitForSiteDeployment",
     "body: { ref: tag, inputs: { release_tag: tag, dispatch_nonce: dispatchNonce } }",
-    'run.head_branch === tag',
-    'run.head_sha === commit',
-    'run.display_title === `Deploy project site ${tag} ${dispatchNonce}`',
+    "run.head_branch === tag",
+    "run.head_sha === commit",
+    "run.display_title === `Deploy project site ${tag} ${dispatchNonce}`",
     'exact.conclusion !== "success"',
   ]) {
     requireText(
@@ -748,6 +1078,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   const releaseGate = files.get("docs/RELEASE_GATE.md") ?? "";
   for (const expected of [
     "`testDebugUnitTest`, `assembleDebug`, and `lintDebug`",
+    "pinned Developer ID certificate",
     "exact seven-asset GitHub bundle",
     "defers only when the exact GitHub release lookup returns HTTP 404",
     "writes `/releases/latest.json`",

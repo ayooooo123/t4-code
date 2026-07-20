@@ -7,7 +7,7 @@ network. The remote path is intentionally small:
 phone browser or bundled T4 mobile UI
   -> Tailscale Serve HTTPS/WSS (tailnet only)
   -> T4 gateway on 127.0.0.1:4194
-  -> OMP appserver Unix socket
+  -> t4-host Unix socket
 ```
 
 There is no T4 password in this mode. Tailscale membership and your tailnet
@@ -16,26 +16,44 @@ interface. It accepts WebSocket connections from the exact configured `.ts.net`
 HTTPS origin and the two fixed Capacitor WebView origins described below. No
 token or password is passed through the browser or mobile UI.
 
-> This is a source-hosted feature in the current release. The downloadable
-> desktop packages do not install or manage the Tailnet gateway. Keep the
-> checkout used to install the service in place, or reinstall the service from
-> its new path after moving it.
+The Apple Silicon Mac package contains the gateway. Open **Settings → Hosts**,
+choose **Set up phone access**, and scan the QR code after setup finishes. T4
+Code installs a per-user background service and configures tailnet-only
+Tailscale Serve. The source procedure below remains available for Linux and
+for maintainers who need a custom gateway layout.
 
 ## Prerequisites
 
 - Linux with a systemd user session, or macOS with a logged-in launchd GUI
   session.
-- Node.js 24 and pnpm 11 (the versions declared by this repository).
+- Node.js 24 and pnpm 11 only when using the manual source procedure.
 - Tailscale installed, signed in, and using MagicDNS/HTTPS.
-- A running local OMP appserver. Opening the T4 desktop app normally installs
-  and starts it; `omp appserver status --json` is a direct check.
-- A T4 Code source checkout with dependencies installed.
+- A running local T4 host connected to a compatible OMP bridge. Opening the T4 desktop app normally
+  installs and starts it; the retained `omp appserver status --json` administrative command is a
+  direct check of the stable service socket.
+- A T4 Code source checkout with dependencies installed only for manual setup.
 
 Do not use Tailscale Funnel for this. Funnel is the public-internet product;
 this setup is meant to remain tailnet-only. Tailscale documents the distinction
 and current Serve syntax in its [Serve reference](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
-## Install
+## Automatic Mac setup
+
+1. Install and sign in to Tailscale on the Mac and phone.
+   On iPhone, open the Tailscale profile menu, choose **VPN On Demand**, and
+   set both **Wi-Fi** and **Cellular** to **Always** if you want T4 Code to
+   reconnect without opening Tailscale first. If another VPN uses On Demand,
+   iOS allows only one of them to own that behavior at a time.
+2. Open T4 Code on the Mac and go to **Settings → Hosts**.
+3. Choose **Set up phone access**.
+4. Scan the displayed QR code with the phone camera.
+5. In Safari, optionally choose **Add to Home Screen** for an app icon.
+
+This action is explicit because it changes this Mac's Tailscale Serve
+configuration. It binds only the private tailnet HTTPS address to the gateway
+on `127.0.0.1:4194`; it does not open a LAN listener or enable Funnel.
+
+## Manual source install
 
 Choose the HTTPS port you will open on your tailnet. The examples use `8445`.
 Find this machine's full MagicDNS name with `tailscale status`; it looks like
@@ -79,7 +97,7 @@ The service installer is idempotent. On Linux it writes and enables
 unit. On macOS it installs the matching per-user LaunchAgent. It stores no
 Tailscale key, OMP token, or app password.
 
-If OMP uses a non-default appserver socket, add an absolute path:
+If the T4 host uses a non-default service socket, add an absolute path:
 
 ```bash
 node scripts/tailnet-service.mjs install \
@@ -101,7 +119,7 @@ tailscale serve status
 
 `status` exits nonzero if the installed definition drifted, the supervisor is
 not running and durably enabled, the web build is missing, or the gateway
-cannot reach the OMP socket. A healthy response reports `"web":true` and
+cannot reach the T4 host socket. A healthy response reports `"web":true` and
 `"upstream":true`.
 
 Then, from a different device on the tailnet, open:
@@ -165,6 +183,22 @@ An Origin header identifies the page that opened the WebSocket. It does not
 prove that the caller is the signed T4 APK. Tailscale membership and ACLs remain
 the access boundary, so the gateway must stay behind Tailscale Serve with
 Funnel disabled.
+
+## Named profile routes
+
+The gateway keeps `/v1/ws` as the default route. A deployment may provide a
+static `T4_PROFILE_ROUTES` JSON array with bounded ASCII `id` values, exact
+absolute `appSocket` paths, and optional validated `serviceUnit` names. A named
+profile is reached at `/v1/profiles/<profileId>/ws`; the route table is not
+discovered from the filesystem and unknown IDs are rejected before socket or
+process work.
+
+Profile starts are disabled unless `T4_ENABLE_PROFILE_STARTS=1`. When enabled,
+only an allowlisted route with a service unit may request a fixed supervisor
+start; the gateway never accepts shell text and never stops or restarts a
+profile. Starts are coalesced and rate-limited while the gateway waits a
+bounded time for the existing private socket checks to pass. The T4 host
+still performs its normal device authentication after bridging.
 
 ## Operate and update
 
@@ -248,7 +282,7 @@ removes all of them.
 - Tailscale Serve terminates HTTPS and keeps the route tailnet-only. Do not
   substitute Funnel.
 - Every tailnet identity permitted to reach this node and port can operate the
-  connected OMP appserver. Restrict the node/port with Tailscale ACLs or grants
+  connected T4 host and its OMP sessions. Restrict the node/port with Tailscale ACLs or grants
   if the tailnet has anyone you do not fully trust.
 - The gateway is an operator surface, not a read-only viewer. Treat access as
   equivalent to local access to your OMP sessions.

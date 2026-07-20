@@ -14,7 +14,9 @@ import {
   type InspectorStoreApi,
   resolveDir,
   resolvePreview,
+  resolveFileWriteOutcome,
   resolveReviewOutcome,
+  resolveTurnReview,
 } from "./inspector-store.ts";
 import { classifySessionEvent } from "./activity-log.ts";
 import type {
@@ -632,6 +634,7 @@ export function attach(cursor: Cursor): Replay {
 // 4x4 checker PNG, generated once; identity-free sample pixels.
 const SAMPLE_IMAGE_SRC =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAF0lEQVR4nGP8//8/AwMDEwMDAwMDAwAkBgMBvR9pJAAAAABJRU5ErkJggg==";
+const FIXTURE_FILE_REVISION = "fixture-revision-1";
 
 const FILE_PREVIEWS: Readonly<Record<string, FilePreview>> = {
   "packages/client/src/replay.ts": {
@@ -743,6 +746,8 @@ function seedForSession(sessionId: string): Partial<InspectorState> {
         expanded: {},
         selectedPath: null,
         preview: null,
+        previewRevision: null,
+        draftsByPath: {},
         query: "",
         offline: true,
       },
@@ -758,6 +763,10 @@ function seedForSession(sessionId: string): Partial<InspectorState> {
         selectedPath: STREAM_REVIEW_FILES[0]?.path ?? null,
         view: "unified",
         wrap: false,
+        source: "legacy",
+        turnId: null,
+        loading: false,
+        error: null,
         viewedByPath: { "packages/client/test/replay-fence.test.ts": true },
         draftAnchor: null,
       },
@@ -774,6 +783,10 @@ function seedForSession(sessionId: string): Partial<InspectorState> {
       selectedPath: null,
       view: "unified",
       wrap: false,
+      source: "legacy",
+      turnId: null,
+      loading: false,
+      error: null,
       viewedByPath: {},
       draftAnchor: null,
     },
@@ -789,7 +802,13 @@ function agentsForSession(sessionId: string): readonly AgentNode[] {
   );
 }
 
+/** Shared deterministic agent corpus for fixture-only surfaces such as Agent View. */
+export function fixtureAgentsForSession(sessionId: string): readonly AgentNode[] {
+  return agentsForSession(sessionId);
+}
+
 function fixtureController(api: InspectorStoreApi, clock: () => number): InspectorController {
+  const editedFiles = new Map<string, string>();
   return {
     kind: "fixture",
     performControl(scope) {
@@ -842,6 +861,14 @@ function fixtureController(api: InspectorStoreApi, clock: () => number): Inspect
         ),
       );
     },
+    loadTurnReview(turnId) {
+      queueMicrotask(() => {
+        resolveTurnReview(api, turnId, {
+          files: STREAM_REVIEW_FILES,
+          revision: "fixture-turn-review",
+        });
+      });
+    },
     loadDir(path) {
       queueMicrotask(() => {
         if (api.getState().files.offline) {
@@ -857,13 +884,26 @@ function fixtureController(api: InspectorStoreApi, clock: () => number): Inspect
           resolvePreview(api, { kind: "offline", path });
           return;
         }
+        const edited = editedFiles.get(path);
+        const preview =
+          edited === undefined
+            ? (FILE_PREVIEWS[path] ?? {
+                kind: "diagnostic" as const,
+                path,
+                message: "The host has no readable content at this path.",
+              })
+            : { kind: "code" as const, path, text: edited, truncated: false };
+        resolvePreview(api, preview, preview.kind === "code" ? FIXTURE_FILE_REVISION : null);
+      });
+    },
+    writeFile(path, content) {
+      queueMicrotask(() => {
+        editedFiles.set(path, content);
+        resolveFileWriteOutcome(api, path, "saved");
         resolvePreview(
           api,
-          FILE_PREVIEWS[path] ?? {
-            kind: "diagnostic",
-            path,
-            message: "The host has no readable content at this path.",
-          },
+          { kind: "code", path, text: content, truncated: false },
+          FIXTURE_FILE_REVISION,
         );
       });
     },

@@ -1,4 +1,51 @@
 export { OmpClient, createOmpClient } from "./omp-client-runtime.ts";
+export {
+  OMP_RUNTIME_INTEGRATION,
+  OMP_RUNTIME_KIND,
+  T4_RUNTIME_FEATURES,
+  availableRuntimeFeature,
+  runtimeIdentityKey,
+  unavailableRuntimeFeature,
+} from "./runtime-integration.ts";
+export type {
+  KnownRuntimeFeature,
+  RuntimeFeature,
+  RuntimeFeatureMap,
+  RuntimeFeatureSupport,
+  RuntimeIdentity,
+  RuntimeIntegrationDescriptor,
+  RuntimeIntegrationLevel,
+  RuntimeKind,
+} from "./runtime-integration.ts";
+export type {
+  PreviewCommandTarget,
+  PreviewLaunchIntent,
+  PreviewNavigateIntent,
+  PreviewClickIntent,
+  PreviewScrollIntent,
+  PreviewTypeIntent,
+  PreviewFillIntent,
+  PreviewSelectIntent,
+  PreviewUploadIntent,
+  PreviewPressIntent,
+  PreviewPolicyCheckIntent,
+  PreviewHandoffIntent,
+} from "./omp-client-runtime.ts";
+export { ompAppV1ProtocolProvider } from "./omp-app-v1-protocol-provider.ts";
+export {
+  defaultOmpProtocolProviderRegistry,
+  OmpProtocolProviderRegistry,
+} from "./omp-protocol-provider-registry.ts";
+export type {
+  OmpClientMessage,
+  OmpPairOk,
+  OmpProtocolProvider,
+  OmpResponse,
+  OmpServerEventOf,
+  OmpServerPayload,
+  OmpServerEvent,
+  PublicOmpServerEvent,
+} from "./omp-protocol-provider.ts";
 export { isConfirmationDecisionConsumed } from "./omp-client-response.ts";
 export {
   OmpClientError,
@@ -45,6 +92,7 @@ export {
 export type { ProjectionCacheStore, ProjectionCacheEnvelope } from "./projection-cache.ts";
 export {
   createProjectionSnapshot,
+  applyPublicEvent,
   applyPublicFrame,
   ProjectionStore,
   createProjectionStore,
@@ -54,10 +102,34 @@ export {
   MAX_RETAINED_FILES,
   MAX_RETAINED_FILES_BYTES,
   MAX_RETAINED_FILE_BYTES,
+  MAX_RETAINED_PREVIEWS,
+  MAX_RETAINED_PREVIEW_EVENTS,
 } from "./projection.ts";
+export {
+  PreviewCaptureResource,
+  PreviewLeaseManager,
+  previewKey,
+  PREVIEW_CAPTURE_MAX_BYTES,
+  PREVIEW_CAPTURE_MAX_PIXELS,
+  PREVIEW_CAPTURE_READ_CHUNK_BYTES,
+} from "./preview.ts";
+export type {
+  PreviewIdentity,
+  PreviewLeaseIdentity,
+  PreviewCaptureMetadata,
+  PreviewCaptureReadResult,
+  PreviewCaptureResourceOptions,
+  PreviewLeaseManagerClient,
+  PreviewLeaseManagerOptions,
+} from "./preview.ts";
 export type {
   ProjectionFrame,
+  ProjectionEventFrame,
   ProjectionFreshness,
+  PreviewFreshness,
+  PreviewProjection,
+  PreviewAuthorityProjection,
+  PreviewEventProjection,
   TerminalProjection,
   ResultProjection,
   AgentTranscriptProjection,
@@ -102,6 +174,32 @@ export {
   DesktopRuntimeController,
   createDesktopRuntimeController,
 } from "./desktop-runtime.ts";
+export { deriveAttentionInbox, readSessionAttention } from "./attention-projection.ts";
+export type {
+  AttentionActionability,
+  AttentionActionabilityInputs,
+  AttentionActionStatus,
+  AttentionApprovalItem,
+  AttentionConfirmationItem,
+  AttentionGroup,
+  AttentionIdentity,
+  AttentionInboxItem,
+  AttentionInboxProjection,
+  AttentionInventoryIssue,
+  AttentionInventoryReason,
+  AttentionInventoryState,
+  AttentionNeedsYouItem,
+  AttentionOutcomeItem,
+  AttentionOutcomeKind,
+  AttentionPendingKind,
+  AttentionPlanItem,
+  AttentionQuestionItem,
+  AttentionQuestionOption,
+  AttentionSessionContext,
+  AttentionUnavailableReason,
+  DeriveAttentionInboxOptions,
+  SessionAttentionRead,
+} from "./attention-projection.ts";
 export type {
   DesktopUpdateOpenEvent,
   DesktopUpdatePhase,
@@ -120,14 +218,69 @@ export type {
   DesktopRuntimeStartState,
   DesktopHostMetadata,
   DesktopRuntimeErrorEntry,
-  DesktopFrameFilter,
-  DesktopFrameSubscription,
+  DesktopServerEventFilter,
+  DesktopServerEventSubscription,
   DesktopRuntimeSnapshot,
   DesktopRuntimeSnapshotListener,
   DesktopRuntimeOptions,
+  DesktopRuntimeTimerScheduler,
   DesktopControllerLease,
   DesktopControllerLeaseAcquireResult,
   DesktopControllerLeaseResult,
   DesktopControllerLeaseOperationResult,
   DesktopControllerLeaseOptions,
 } from "./desktop-runtime.ts";
+export {
+  browserErrorMessage,
+  browserMethodIsMutation,
+  isBrowserShellPort,
+  requireExplicitBrowserProfile,
+} from "./browser-runtime-contracts.ts";
+export type {
+  BrowserShellEventListener,
+  BrowserShellPort,
+  BrowserShellSubscription,
+} from "./browser-runtime-contracts.ts";
+export type {
+  BrowserCall,
+  BrowserCallError,
+  BrowserCallResult,
+  BrowserEvent,
+  BrowserMethod,
+  BrowserProfile,
+  OwnerSessionId,
+} from "@t4-code/protocol/browser-ipc";
+export {
+  createTranscriptSearchCoordinator,
+  decodeTranscriptContextResult,
+  decodeTranscriptSearchResult,
+  TranscriptSearchCoordinator,
+  TranscriptSearchError,
+} from "./transcript-search.ts";
+export type {
+  HostedTranscriptSearchItem,
+  TranscriptContextArguments,
+  TranscriptContextResult,
+  TranscriptContextRow,
+  TranscriptSearchArchivedFilter,
+  TranscriptSearchArguments,
+  TranscriptSearchHighlight,
+  TranscriptSearchHostState,
+  TranscriptSearchHostStatus,
+  TranscriptSearchIndexState,
+  TranscriptSearchIndexStatus,
+  TranscriptSearchItem,
+  TranscriptSearchListener,
+  TranscriptSearchOptions,
+  TranscriptSearchResult,
+  TranscriptSearchRole,
+  TranscriptSearchRuntime,
+  TranscriptSearchSnapshot,
+} from "./transcript-search.ts";
+export { readTranscriptPage, TranscriptPageClientError } from "./transcript-page.ts";
+export type {
+  TranscriptPageAddress,
+  TranscriptPageArguments,
+  TranscriptPageResult,
+  TranscriptPageRuntime,
+} from "./transcript-page.ts";

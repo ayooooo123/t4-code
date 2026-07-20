@@ -15,20 +15,28 @@ import {
   sessionId as brandSessionId,
   type Revision,
 } from "@t4-code/protocol";
-import type { CommandIntent, CommandResult } from "@t4-code/protocol/desktop-ipc";
+import type { CommandResult } from "@t4-code/protocol/desktop-ipc";
 
 import { resolveLiveSession } from "../../platform/live-workspace.ts";
-import {
-  presentSessionControl,
-  readSessionControl,
-} from "../session-runtime/session-observer.ts";
+import { presentSessionControl, readSessionControl } from "../session-runtime/session-observer.ts";
 import { sessionWriteLink } from "../session-runtime/session-inventory.ts";
 import {
+  transcriptImageSourceForSession,
+  type TranscriptImageSource,
+} from "../session-runtime/transcript-images.ts";
+import type { TranscriptArtifactReference } from "../transcript/artifact-metadata.ts";
+import { cancelConfirmedAgent, type AgentCancelRuntime } from "../session-runtime/agent-cancel.ts";
+import {
+  beginTurnReviewAction,
   createInspectorStore,
   installInspectorStoreFactory,
   resolveDir,
   resolvePreview,
+  resolveFileWriteOutcome,
+  rejectTurnReviewAction,
   resolveReviewOutcome,
+  resolveTurnReview,
+  resolveTurnReviewOutcome,
   type InspectorController,
   type InspectorStoreApi,
 } from "./inspector-store.ts";
@@ -43,6 +51,11 @@ import {
   sameListing,
   sameReviewFiles,
 } from "./live-projection.ts";
+import {
+  decodeTurnReviewApplyResult,
+  decodeTurnReviewSnapshot,
+  reviewFilesFromTurnSnapshot,
+} from "./turn-review.ts";
 import type {
   AgentNode,
   FileTreeNode,
@@ -56,10 +69,46 @@ import type {
  * tests can drive the seam with recorded snapshots and a scripted command
  * port instead of a full Electron shell.
  */
-export interface LiveInspectorRuntime {
+export interface LiveInspectorRuntime extends AgentCancelRuntime {
   getSnapshot(): DesktopRuntimeSnapshot;
   subscribe(listener: (snapshot: DesktopRuntimeSnapshot) => void): () => void;
-  command(targetId: string, intent: CommandIntent): Promise<CommandResult>;
+}
+
+async function readTurnPatch(
+  source: TranscriptImageSource,
+  reference: TranscriptArtifactReference,
+): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    let settled = false;
+    let release: () => void = () => undefined;
+    let unsubscribe: () => void = () => undefined;
+    const timeout = setTimeout(() => finish(new Error("Turn patch read timed out.")), 30_000);
+    const finish = (outcome: string | Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      unsubscribe();
+      if (outcome instanceof Error) {
+        release();
+        reject(outcome);
+        return;
+      }
+      void fetch(outcome)
+        .then((response) => response.text())
+        .then(resolve, reject)
+        .finally(release);
+    };
+    const inspect = () => {
+      const snapshot = source.getSnapshot(reference);
+      if (snapshot.status === "ready") finish(snapshot.url);
+      else if (snapshot.status === "error" || snapshot.status === "unavailable") {
+        finish(new Error(snapshot.reason));
+      }
+    };
+    unsubscribe = source.subscribe(reference, inspect);
+    release = source.retain(reference);
+    inspect();
+  });
 }
 
 const ENABLED: PaneActionAvailability = Object.freeze({ enabled: true, reason: null });
@@ -143,6 +192,11 @@ export function deriveActionAvailability(
     apply.enabled && !revisionKnown
       ? { enabled: false, reason: "Waiting for this session's latest state." }
       : apply;
+  const write = commandAvailability(snapshot, targetId, hostId, "files.write");
+  const fileWrite =
+    write.enabled && !revisionKnown
+      ? { enabled: false, reason: "Waiting for this session's latest state." }
+      : write;
   const writeGate =
     sessionWriteLink(snapshot, targetId, hostId, sessionId) === "live" ? null : SYNCING_WRITE;
   return {
@@ -151,6 +205,7 @@ export function deriveActionAvailability(
     agentWake: NO_WAKE,
     reviewApply: writeGate !== null && reviewApply.enabled ? writeGate : reviewApply,
     reviewDiscard: NO_DISCARD,
+    fileWrite: writeGate !== null && fileWrite.enabled ? writeGate : fileWrite,
   };
 }
 
@@ -161,6 +216,7 @@ function sameAvailability(a: InspectorActionAvailability, b: InspectorActionAvai
     [a.agentWake, b.agentWake],
     [a.reviewApply, b.reviewApply],
     [a.reviewDiscard, b.reviewDiscard],
+    [a.fileWrite, b.fileWrite],
   ];
   return pairs.every(
     ([left, right]) => left.enabled === right.enabled && left.reason === right.reason,
@@ -224,7 +280,10 @@ export function createLiveInspectorStore(
   /** Directory paths resolved from pushed file frames; refreshed on sync. */
   const frameDirs = new Set<string>();
   const pendingDirs = new Map<string, string>();
-  const pendingPreviews = new Map<string, string>();
+  const pendingPreviews = new Map<
+    string,
+    { readonly path: string; readonly baseRevision: string | null }
+  >();
   const pendingReviewApplies = new Map<string, string>();
   let reviewFiles: readonly ReviewFile[] = [];
   let reviewIdByPath: ReadonlyMap<string, string> = new Map();
@@ -256,6 +315,16 @@ export function createLiveInspectorStore(
     sessionWriteLink(snapshot, address.targetId, address.hostId, address.sessionId) === "live" &&
     sessionControlNow(snapshot) === null;
 
+  const assertAgentCancelWritable = (): void => {
+    const snapshot = runtime.getSnapshot();
+    const support = commandAvailability(snapshot, address.targetId, address.hostId, "agent.cancel");
+    if (!support.enabled) throw new Error(support.reason ?? "Agent cancellation is unavailable.");
+    if (writableNow(snapshot)) return;
+    const control = sessionControlNow(snapshot);
+    if (control !== null) throw new Error(presentSessionControl(control).controlReason);
+    throw new Error(SYNCING_WRITE.reason ?? "This session is still syncing from the host.");
+  };
+
   const sendCommand = (
     command: string,
     args: Record<string, unknown>,
@@ -275,29 +344,70 @@ export function createLiveInspectorStore(
     kind: "desktop",
     performControl(scope) {
       if (scope.action !== "cancel") return;
-      const snapshot = runtime.getSnapshot();
-      if (
-        !commandAvailability(snapshot, address.targetId, address.hostId, "agent.cancel").enabled
-      ) {
-        return;
-      }
-      if (!writableNow(snapshot)) return;
-      void sendCommand("agent.cancel", { agentId: scope.agentId }, true).catch(() => {
+      void cancelConfirmedAgent(runtime, {
+        address,
+        agentId: scope.agentId,
+        assertWritable: assertAgentCancelWritable,
+        currentRevision() {
+          const current = expectedRevision();
+          if (current === undefined) throw new Error("Waiting for this session's latest state.");
+          return String(current);
+        },
+      }).catch(() => {
         // Outcome unknown: never resent. The next agent frame carries truth.
       });
     },
     performReview(action, path) {
-      if (action !== "apply") return;
+      const review = api.getState().review;
       const snapshot = runtime.getSnapshot();
       if (
-        !commandAvailability(snapshot, address.targetId, address.hostId, "review.apply").enabled
+        !commandAvailability(snapshot, address.targetId, address.hostId, "review.apply").enabled ||
+        !writableNow(snapshot)
       ) {
         return;
       }
-      if (!writableNow(snapshot)) return;
-      const reviewId = reviewIdByPath.get(path);
+      if (review.source === "turn" && typeof review.turnId === "string") {
+        const request = { turnId: review.turnId, path, action } as const;
+        const reviewRevision = beginTurnReviewAction(api, request);
+        if (reviewRevision === null) return;
+        const protocolAction = action === "apply" ? "keep" : "discard";
+        void runtime
+          .command(address.targetId, {
+            hostId: wireHostId,
+            sessionId: wireSessionId,
+            command: "review.apply",
+            args: { turnId: request.turnId, path, action: protocolAction },
+            expectedRevision: brandRevision(reviewRevision),
+          })
+          .then((result) => {
+            if (!result.accepted) {
+              rejectTurnReviewAction(api, request, "The host did not confirm this review action.");
+              return;
+            }
+            const outcome = decodeTurnReviewApplyResult(result.result, {
+              turnId: request.turnId,
+              path,
+              action: protocolAction,
+            });
+            resolveTurnReviewOutcome(api, request, {
+              applyState: outcome.state,
+              resultingRevision: outcome.resultingRevision,
+            });
+          })
+          .catch(() => {
+            rejectTurnReviewAction(
+              api,
+              request,
+              "The connection dropped before the host confirmed this review action.",
+            );
+          });
+        return;
+      }
+      if (action !== "apply") return;
       const revisionValue = expectedRevision();
-      if (reviewId === undefined || revisionValue === undefined) return;
+      if (revisionValue === undefined) return;
+      const reviewId = reviewIdByPath.get(path);
+      if (reviewId === undefined) return;
       void runtime
         .command(address.targetId, {
           hostId: wireHostId,
@@ -307,13 +417,52 @@ export function createLiveInspectorStore(
           expectedRevision: revisionValue,
         })
         .then((result) => {
-          // The host decides through its confirmation challenge; only an ok
-          // response frame (matched in sync) flips the row to applied.
           if (result.accepted) pendingReviewApplies.set(result.requestId, path);
         })
         .catch(() => {
           // Outcome unknown: the row stays pending and is never resent.
         });
+    },
+    loadTurnReview(turnId) {
+      const snapshot = runtime.getSnapshot();
+      const readable = commandAvailability(
+        snapshot,
+        address.targetId,
+        address.hostId,
+        "files.diff",
+      );
+      if (!readable.enabled) {
+        resolveTurnReview(api, turnId, {
+          error: readable.reason ?? "This host cannot load turn reviews.",
+        });
+        return;
+      }
+      void sendCommand("files.diff", { turnId }, false)
+        .then(async (result) => {
+          if (!result.accepted) {
+            resolveTurnReview(api, turnId, { error: "The host could not load this turn review." });
+            return;
+          }
+          const review = decodeTurnReviewSnapshot(result.result);
+          if (review.turnId !== turnId) throw new Error("Turn review identity mismatch.");
+          resolveTurnReview(api, turnId, {
+            files: reviewFilesFromTurnSnapshot(review),
+            revision: review.headTree,
+          });
+          if (review.patch === null) return;
+          const source = transcriptImageSourceForSession(address.hostId, address.sessionId);
+          if (source === null) return;
+          const patch = await readTurnPatch(source, review.patch);
+          resolveTurnReview(api, turnId, {
+            files: reviewFilesFromTurnSnapshot(review, patch),
+            revision: review.headTree,
+          });
+        })
+        .catch(() =>
+          resolveTurnReview(api, turnId, {
+            error: "The connection dropped before the host answered.",
+          }),
+        );
     },
     loadDir(path) {
       const snapshot = runtime.getSnapshot();
@@ -343,9 +492,10 @@ export function createLiveInspectorStore(
     },
     loadPreview(path) {
       const snapshot = runtime.getSnapshot();
-      const frame = warmSession(snapshot)?.files.get(path);
+      const warm = warmSession(snapshot);
+      const frame = warm?.files.get(path);
       if (frame !== undefined && frame.content !== undefined) {
-        resolvePreview(api, previewFromFileFrame(frame));
+        resolvePreview(api, previewFromFileFrame(frame), warm?.revision ?? null);
         return;
       }
       if (snapshot.connections.get(address.targetId) !== "connected") {
@@ -359,10 +509,15 @@ export function createLiveInspectorStore(
         "files.read",
       );
       if (readable.enabled) {
+        const readRevision = expectedRevision();
         void sendCommand("files.read", { path }, false)
           .then((result) => {
-            if (result.accepted) pendingPreviews.set(result.requestId, path);
-            else {
+            if (result.accepted) {
+              pendingPreviews.set(result.requestId, {
+                path,
+                baseRevision: readRevision === undefined ? null : String(readRevision),
+              });
+            } else {
               resolvePreview(api, {
                 kind: "diagnostic",
                 path,
@@ -384,7 +539,47 @@ export function createLiveInspectorStore(
         frame !== undefined
           ? previewFromFileFrame(frame)
           : { kind: "diagnostic", path, message: "This host cannot read files from here." },
+        warm?.revision ?? null,
       );
+    },
+    writeFile(path, content, baseRevision) {
+      const snapshot = runtime.getSnapshot();
+      const writable = commandAvailability(
+        snapshot,
+        address.targetId,
+        address.hostId,
+        "files.write",
+      );
+      const revisionValue = baseRevision === null ? undefined : brandRevision(baseRevision);
+      if (
+        !isSafeRelativePath(path) ||
+        !writable.enabled ||
+        !writableNow(snapshot) ||
+        revisionValue === undefined
+      ) {
+        resolveFileWriteOutcome(api, path, "conflict");
+        return;
+      }
+      void runtime
+        .command(address.targetId, {
+          hostId: wireHostId,
+          sessionId: wireSessionId,
+          command: "files.write",
+          args: { path, content },
+          expectedRevision: revisionValue,
+        })
+        .then((result) =>
+          resolveFileWriteOutcome(
+            api,
+            path,
+            result.accepted
+              ? "saved"
+              : result.error?.code === "stale_revision"
+                ? "conflict"
+                : "error",
+          ),
+        )
+        .catch(() => resolveFileWriteOutcome(api, path, "error"));
     },
   });
 
@@ -412,6 +607,7 @@ export function createLiveInspectorStore(
         ...nextAvailability,
         agentCancel: nextAvailability.agentCancel.enabled ? gate : nextAvailability.agentCancel,
         reviewApply: nextAvailability.reviewApply.enabled ? gate : nextAvailability.reviewApply,
+        fileWrite: nextAvailability.fileWrite.enabled ? gate : nextAvailability.fileWrite,
       };
     }
     if (availability === null || !sameAvailability(availability, nextAvailability)) {
@@ -446,7 +642,20 @@ export function createLiveInspectorStore(
     reviewIdByPath = review.reviewIdByPath;
     if (!sameReviewFiles(reviewFiles, review.files)) {
       reviewFiles = review.files;
-      store.setState((state) => ({ review: { ...state.review, files: review.files } }));
+      store.setState((state) =>
+        state.review.source === "turn"
+          ? state
+          : {
+              review: {
+                ...state.review,
+                files: review.files,
+                source: "legacy",
+                turnId: null,
+                loading: false,
+                error: null,
+              },
+            },
+      );
     }
 
     // Settle command answers that arrived as response frames.
@@ -462,7 +671,7 @@ export function createLiveInspectorStore(
         resolveDir(store, path, "error");
       }
     }
-    for (const [requestId, path] of pendingPreviews) {
+    for (const [requestId, pending] of pendingPreviews) {
       const result = warm.results.get(requestId);
       if (result === undefined) continue;
       pendingPreviews.delete(requestId);
@@ -473,8 +682,13 @@ export function createLiveInspectorStore(
       resolvePreview(
         store,
         typeof content === "string"
-          ? { kind: "code", path, text: content, truncated: content.length >= 8192 }
-          : { kind: "diagnostic", path, message: "The host could not read this file." },
+          ? { kind: "code", path: pending.path, text: content, truncated: content.length >= 8192 }
+          : {
+              kind: "diagnostic",
+              path: pending.path,
+              message: "The host could not read this file.",
+            },
+        pending.baseRevision,
       );
     }
     for (const [requestId, path] of pendingReviewApplies) {
@@ -502,11 +716,14 @@ export function createLiveInspectorStore(
     }
 
     // A pushed frame can answer a preview the command path could not.
-    const { selectedPath, preview } = store.getState().files;
-    if (selectedPath !== null && preview === "loading") {
+    const { selectedPath, preview, previewRevision } = store.getState().files;
+    const hasNewPreviewRevision =
+      previewRevision === null ||
+      (warm.revision !== undefined && String(warm.revision) !== previewRevision);
+    if (selectedPath !== null && preview === "loading" && hasNewPreviewRevision) {
       const frame = warm.files.get(selectedPath);
       if (frame !== undefined && frame.content !== undefined) {
-        resolvePreview(store, previewFromFileFrame(frame));
+        resolvePreview(store, previewFromFileFrame(frame), warm.revision ?? null);
       }
     }
   };
@@ -530,6 +747,8 @@ function emptyProjection(): SessionProjection {
     audit: [],
     confirmations: new Map(),
     results: new Map(),
+    previews: new Map(),
+    previewEvents: [],
     freshness: "cached",
     transcriptEventArrivalOrdinal: 0,
     contextMaintenanceEventArrivalOrdinal: 0,

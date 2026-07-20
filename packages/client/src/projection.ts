@@ -1,19 +1,10 @@
 import { isCursor } from "@t4-code/protocol";
 import type {
-  AgentFrame,
-  AgentTranscriptFrame,
-  AuditFrame,
-  ConfirmationChallenge,
   Cursor,
   DurableEntry,
-  FileFrame,
-  GapFrame,
-  LiveEventFrame,
-  ResultFrame,
-  ReviewFrame,
+  OmpServerFrame,
   SessionEvent,
   SessionRef,
-  ServerFrame,
 } from "@t4-code/protocol";
 import { ImmutableSet } from "./immutable-set.ts";
 import { ImmutableMap } from "./immutable-map.ts";
@@ -43,9 +34,90 @@ import {
   retainDurableEntries,
   sanitizeRetainedRecord,
 } from "./transcript-retention.ts";
+import type { PublicOmpServerEvent } from "./omp-protocol-provider.ts";
+import { previewKey, type PreviewCaptureMetadata } from "./preview.ts";
 
-export type ProjectionFrame = Exclude<ServerFrame, Extract<ServerFrame, { type: "pair.ok" }>>;
+export type ProjectionFrame = Exclude<OmpServerFrame, Extract<OmpServerFrame, { type: "pair.ok" }>>;
+type ProjectionEventFrameFromEvent<Event extends PublicOmpServerEvent> =
+  Event extends PublicOmpServerEvent ? Readonly<{ type: Event["kind"] } & Event["payload"]> : never;
+export type ProjectionEventFrame = ProjectionEventFrameFromEvent<PublicOmpServerEvent>;
+type ProjectionInputFrame = ProjectionFrame | ProjectionEventFrame;
+type ProjectionInput<Kind extends ProjectionInputFrame["type"]> = Extract<
+  ProjectionInputFrame,
+  { type: Kind }
+>;
+type ProjectionAgentFrame = ProjectionInput<"agent">;
+type ProjectionAgentTranscriptFrame = ProjectionInput<"agent.transcript">;
+type ProjectionAuditFrame = ProjectionInput<"audit">;
+type ProjectionConfirmationFrame = ProjectionInput<"confirmation">;
+type ProjectionFileFrame = ProjectionInput<"files">;
+type ProjectionGapFrame = ProjectionInput<"gap">;
+type ProjectionLiveEventFrame = ProjectionInput<"event">;
+type ProjectionResultFrame = ProjectionInput<"response">;
+type ProjectionPreviewFrame = Extract<
+  ProjectionInputFrame,
+  {
+    type:
+      | "preview.launch"
+      | "preview.state"
+      | "preview.navigation"
+      | "preview.capture"
+      | "preview.error";
+  }
+>;
+type ProjectionReviewFrame = ProjectionInput<"review">;
 export type ProjectionFreshness = "fresh" | "catching-up" | "cached";
+export type PreviewFreshness = ProjectionFreshness | "stale";
+export type PreviewAction =
+  | "activate"
+  | "navigate"
+  | "back"
+  | "forward"
+  | "reload"
+  | "close"
+  | "capture"
+  | "click"
+  | "fill"
+  | "type"
+  | "press"
+  | "scroll"
+  | "select"
+  | "upload"
+  | "handoff";
+export interface PreviewAuthorityProjection {
+  readonly id: string;
+  readonly label: string;
+  readonly kind: "isolated-session" | "authenticated-profile";
+  readonly requiresExplicitOptIn: boolean;
+}
+export interface PreviewEventProjection {
+  readonly type: "launch" | "navigation" | "capture" | "error";
+  readonly previewId: string;
+  readonly cursor: Cursor;
+  readonly url?: Readonly<{ origin: string; pathname: string; hasQuery: boolean }>;
+  readonly timestamp?: number;
+  readonly captureId?: string;
+  readonly errorCode?: string;
+}
+export interface PreviewProjection {
+  readonly hostId: string;
+  readonly sessionId: string;
+  readonly previewId: string;
+  readonly state?: "launching" | "ready" | "running" | "stopped" | "failed";
+  readonly url?: string;
+  readonly revision: string;
+  readonly cursor: Cursor;
+  readonly title?: string;
+  readonly canGoBack?: boolean;
+  readonly canGoForward?: boolean;
+  readonly viewport?: Readonly<{ width: number; height: number; deviceScaleFactor?: number }>;
+  readonly capture?: PreviewCaptureMetadata;
+  /** Labels and trust class only; no browser credential or profile state. */
+  readonly authority?: PreviewAuthorityProjection;
+  readonly availableActions?: readonly PreviewAction[];
+  readonly error?: Readonly<{ code: string; message: string }>;
+  readonly freshness: PreviewFreshness;
+}
 
 export interface TerminalProjection {
   readonly terminalId: string;
@@ -77,15 +149,19 @@ export interface SessionProjection {
   readonly sessionId: string;
   readonly ref?: SessionRef;
   readonly entries: readonly DurableEntry[];
-  readonly events: readonly LiveEventFrame[];
-  readonly agents: ReadonlyMap<string, AgentFrame>;
+  readonly events: readonly ProjectionLiveEventFrame[];
+  readonly agents: ReadonlyMap<string, ProjectionAgentFrame>;
   readonly agentTranscripts: ReadonlyMap<string, AgentTranscriptProjection>;
   readonly terminals: ReadonlyMap<string, TerminalProjection>;
-  readonly files: ReadonlyMap<string, FileFrame>;
-  readonly reviews: ReadonlyMap<string, ReviewFrame>;
-  readonly audit: readonly AuditFrame[];
-  readonly confirmations: ReadonlyMap<string, ConfirmationChallenge>;
+  readonly files: ReadonlyMap<string, ProjectionFileFrame>;
+  readonly reviews: ReadonlyMap<string, ProjectionReviewFrame>;
+  readonly audit: readonly ProjectionAuditFrame[];
+  readonly confirmations: ReadonlyMap<string, ProjectionConfirmationFrame>;
   readonly results: ReadonlyMap<string, ResultProjection>;
+  /** Preview metadata only. Decoded pixels and object URLs belong to PreviewCaptureResource. */
+  readonly previews: ReadonlyMap<string, PreviewProjection>;
+  /** Bounded, cursor-deduplicated activity metadata for the preview workspace. */
+  readonly previewEvents: readonly PreviewEventProjection[];
   readonly revision?: string;
   readonly cursor?: Cursor;
   readonly epoch?: string;
@@ -101,7 +177,7 @@ export interface SessionProjection {
    * advance this fence, and cache/recovery deliberately resets it.
    */
   readonly contextMaintenanceEventArrivalOrdinal: number;
-  readonly gap?: GapFrame | undefined;
+  readonly gap?: ProjectionGapFrame | undefined;
   readonly historyTruncated?: boolean;
   readonly entryIds: ReadonlySet<string>;
 }
@@ -156,10 +232,14 @@ export interface ProjectionOptions {
   readonly maxFilesBytes?: number;
   /** UTF-8 bytes retained by one file path and its content. */
   readonly maxFileBytes?: number;
+  /** Maximum retained preview metadata records per warm session. */
+  readonly maxPreviews?: number;
+  /** Maximum retained sanitized preview activity records per warm session. */
+  readonly maxPreviewEvents?: number;
 }
 
 export interface ProjectionSubscription {
-  (snapshot: ProjectionSnapshot, frame?: ProjectionFrame): void;
+  (snapshot: ProjectionSnapshot, input?: ProjectionFrame | PublicOmpServerEvent): void;
 }
 
 export const MAX_INDEXED_SESSION_REFS = 1000;
@@ -169,6 +249,8 @@ export const MAX_RETAINED_TERMINAL_BYTES_PER_TERMINAL = 256 * 1024;
 export const MAX_RETAINED_FILES = 256;
 export const MAX_RETAINED_FILES_BYTES = 4 * 1024 * 1024;
 export const MAX_RETAINED_FILE_BYTES = 768 * 1024;
+export const MAX_RETAINED_PREVIEWS = 32;
+export const MAX_RETAINED_PREVIEW_EVENTS = 128;
 const DEFAULT_OPTIONS: Required<ProjectionOptions> = {
   maxWarmSessions: 8,
   maxIndexedSessions: MAX_INDEXED_SESSION_REFS,
@@ -188,13 +270,15 @@ const DEFAULT_OPTIONS: Required<ProjectionOptions> = {
   maxFiles: MAX_RETAINED_FILES,
   maxFilesBytes: MAX_RETAINED_FILES_BYTES,
   maxFileBytes: MAX_RETAINED_FILE_BYTES,
+  maxPreviews: MAX_RETAINED_PREVIEWS,
+  maxPreviewEvents: MAX_RETAINED_PREVIEW_EVENTS,
 };
 const EMPTY_MAP: ReadonlyMap<string, never> = new ImmutableMap<string, never>();
 const UTF8_ENCODER = new TextEncoder();
 const UTF8_DECODER = new TextDecoder();
 /** Immutable projection values make exact byte totals safe to memoize by identity. */
 const TERMINAL_PROJECTION_BYTES = new WeakMap<TerminalProjection, number>();
-const FILE_PROJECTION_BYTES = new WeakMap<FileFrame, number>();
+const FILE_PROJECTION_BYTES = new WeakMap<ProjectionFileFrame, number>();
 
 function positiveOption(value: number | undefined, fallback: number): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : fallback;
@@ -205,10 +289,7 @@ function resolveProjectionOptions(options: ProjectionOptions): Required<Projecti
   return {
     ...merged,
     maxTerminals: positiveOption(options.maxTerminals, DEFAULT_OPTIONS.maxTerminals),
-    maxTerminalBytes: positiveOption(
-      options.maxTerminalBytes,
-      DEFAULT_OPTIONS.maxTerminalBytes,
-    ),
+    maxTerminalBytes: positiveOption(options.maxTerminalBytes, DEFAULT_OPTIONS.maxTerminalBytes),
     maxTerminalBytesPerTerminal: positiveOption(
       options.maxTerminalBytesPerTerminal,
       DEFAULT_OPTIONS.maxTerminalBytesPerTerminal,
@@ -216,6 +297,8 @@ function resolveProjectionOptions(options: ProjectionOptions): Required<Projecti
     maxFiles: positiveOption(options.maxFiles, DEFAULT_OPTIONS.maxFiles),
     maxFilesBytes: positiveOption(options.maxFilesBytes, DEFAULT_OPTIONS.maxFilesBytes),
     maxFileBytes: positiveOption(options.maxFileBytes, DEFAULT_OPTIONS.maxFileBytes),
+    maxPreviews: positiveOption(options.maxPreviews, DEFAULT_OPTIONS.maxPreviews),
+    maxPreviewEvents: positiveOption(options.maxPreviewEvents, DEFAULT_OPTIONS.maxPreviewEvents),
   };
 }
 
@@ -253,7 +336,7 @@ function boundedUniqueEntries(
 }
 function agentTranscriptProjection(
   previous: AgentTranscriptProjection | undefined,
-  frame: AgentTranscriptFrame,
+  frame: ProjectionAgentTranscriptFrame,
   maxEntries: number,
   maxBytes: number,
   maxEntryBytes: number,
@@ -371,15 +454,8 @@ function retainTerminalProjection(
   const replaced = next.get(terminalId);
   if (replaced !== undefined) totalBytes -= terminalProjectionBytes(replaced);
   next.delete(terminalId);
-  const perTerminalLimit = Math.min(
-    options.maxTerminalBytesPerTerminal,
-    options.maxTerminalBytes,
-  );
-  const retained = trimTerminalProjection(
-    terminal,
-    perTerminalLimit,
-    preferredStream,
-  );
+  const perTerminalLimit = Math.min(options.maxTerminalBytesPerTerminal, options.maxTerminalBytes);
+  const retained = trimTerminalProjection(terminal, perTerminalLimit, preferredStream);
   const retainedBytes = terminalProjectionBytes(retained);
   // The id is required to address a terminal. If it cannot fit by itself,
   // dropping the projection is the only way to honor an absolute item budget.
@@ -413,7 +489,7 @@ function retainTerminalProjection(
   return immutableMap(next);
 }
 
-function fileProjectionBytes(file: FileFrame): number {
+function fileProjectionBytes(file: ProjectionFileFrame): number {
   const cached = FILE_PROJECTION_BYTES.get(file);
   if (cached !== undefined) return cached;
   const bytes = utf8Bytes(file.path) + (file.content === undefined ? 0 : utf8Bytes(file.content));
@@ -421,12 +497,12 @@ function fileProjectionBytes(file: FileFrame): number {
   return bytes;
 }
 
-function fileWithoutContent(file: FileFrame): FileFrame {
+function fileWithoutContent(file: ProjectionFileFrame): ProjectionFileFrame {
   const { content: _content, ...metadata } = file;
   return Object.freeze({ ...metadata, truncated: true });
 }
 
-function trimFileProjection(file: FileFrame, maxBytes: number): FileFrame {
+function trimFileProjection(file: ProjectionFileFrame, maxBytes: number): ProjectionFileFrame {
   if (fileProjectionBytes(file) <= maxBytes || file.content === undefined) return file;
   const content = retainedUtf8Head(file.content, Math.max(0, maxBytes - utf8Bytes(file.path)));
   return Object.freeze({ ...file, content, truncated: true });
@@ -434,11 +510,11 @@ function trimFileProjection(file: FileFrame, maxBytes: number): FileFrame {
 
 /** Keep recent content first while retaining older paths as useful tree metadata. */
 function retainFileProjection(
-  files: ReadonlyMap<string, FileFrame>,
+  files: ReadonlyMap<string, ProjectionFileFrame>,
   path: string,
-  file: FileFrame,
+  file: ProjectionFileFrame,
   options: Required<ProjectionOptions>,
-): ReadonlyMap<string, FileFrame> {
+): ReadonlyMap<string, ProjectionFileFrame> {
   const next = new Map(files);
   let totalBytes = 0;
   for (const value of next.values()) totalBytes += fileProjectionBytes(value);
@@ -462,8 +538,7 @@ function retainFileProjection(
   }
   while (totalBytes > options.maxFilesBytes) {
     const oldestWithContent = [...next].find(
-      ([candidatePath, candidate]) =>
-        candidatePath !== path && candidate.content !== undefined,
+      ([candidatePath, candidate]) => candidatePath !== path && candidate.content !== undefined,
     );
     if (oldestWithContent === undefined) break;
     const metadata = fileWithoutContent(oldestWithContent[1]);
@@ -473,10 +548,7 @@ function retainFileProjection(
   const current = next.get(path);
   if (current !== undefined && totalBytes > options.maxFilesBytes) {
     const otherBytes = totalBytes - fileProjectionBytes(current);
-    const trimmed = trimFileProjection(
-      current,
-      Math.max(0, options.maxFilesBytes - otherBytes),
-    );
+    const trimmed = trimFileProjection(current, Math.max(0, options.maxFilesBytes - otherBytes));
     totalBytes += fileProjectionBytes(trimmed) - fileProjectionBytes(current);
     next.set(path, trimmed);
   }
@@ -498,19 +570,19 @@ function retainRestoredSessionResources(
   for (const [terminalId, terminal] of session.terminals) {
     terminals = retainTerminalProjection(terminals, terminalId, terminal, options);
   }
-  let files = immutableMap<string, FileFrame>();
+  let files = immutableMap<string, ProjectionFileFrame>();
   for (const [path, file] of session.files) {
     files = retainFileProjection(files, path, file, options);
   }
   return Object.freeze({ ...session, terminals, files });
 }
 function confirmationsAfterResponse(
-  confirmations: ReadonlyMap<string, ConfirmationChallenge>,
-  frame: ResultFrame,
-): ReadonlyMap<string, ConfirmationChallenge> {
+  confirmations: ReadonlyMap<string, ProjectionConfirmationFrame>,
+  frame: ProjectionResultFrame,
+): ReadonlyMap<string, ProjectionConfirmationFrame> {
   const invalid = frame.error?.code === "confirmation_invalid";
   let changed = false;
-  const next = new Map<string, ConfirmationChallenge>();
+  const next = new Map<string, ProjectionConfirmationFrame>();
   for (const [confirmationKey, challenge] of confirmations) {
     if (String(challenge.commandId) !== String(frame.commandId)) {
       next.set(confirmationKey, challenge);
@@ -544,6 +616,8 @@ function initialSession(
     confirmations: EMPTY_MAP,
     results: EMPTY_MAP,
     freshness,
+    previews: EMPTY_MAP,
+    previewEvents: freezeArray([]),
     transcriptEventArrivalOrdinal: 0,
     contextMaintenanceEventArrivalOrdinal: 0,
   });
@@ -584,6 +658,15 @@ function touch(
   options: Required<ProjectionOptions>,
 ): ProjectionSnapshot {
   const existing = snapshot.sessions.get(sessionKey);
+  if (
+    existing !== undefined &&
+    snapshot.lru.at(-1) === sessionKey &&
+    snapshot.lru.length <= options.maxWarmSessions &&
+    snapshot.activeSessionKey !== undefined &&
+    snapshot.lru.includes(snapshot.activeSessionKey)
+  ) {
+    return snapshot;
+  }
   const lru = [...snapshot.lru.filter((item) => item !== sessionKey), sessionKey];
   let sessions = snapshot.sessions;
   if (existing === undefined)
@@ -612,15 +695,19 @@ function withSession(
   sessionKey: string,
   update: (session: SessionProjection) => SessionProjection,
   options: Required<ProjectionOptions>,
+  arrivalOrdinal?: number,
 ): ProjectionSnapshot {
   const warmed = touch(snapshot, sessionKey, options);
   const current = warmed.sessions.get(sessionKey)!;
   const updated = update(current);
-  if (updated === current) return warmed;
-  return Object.freeze({
-    ...warmed,
-    sessions: mapWith(warmed.sessions, sessionKey, Object.freeze(updated)),
-  });
+  if (updated === current) {
+    if (arrivalOrdinal === undefined || warmed.arrivalOrdinal === arrivalOrdinal) return warmed;
+    return Object.freeze({ ...warmed, arrivalOrdinal });
+  }
+  const sessions = mapWith(warmed.sessions, sessionKey, Object.freeze(updated));
+  return arrivalOrdinal === undefined
+    ? Object.freeze({ ...warmed, sessions })
+    : Object.freeze({ ...warmed, sessions, arrivalOrdinal });
 }
 function updateRoot(
   snapshot: ProjectionSnapshot,
@@ -640,6 +727,175 @@ function cursorState(session: SessionProjection, cursor: Cursor): "accept" | "du
   if (cursor.seq <= session.cursor.seq) return "duplicate";
   return cursor.seq === session.cursor.seq + 1 ? "accept" : "gap";
 }
+function previewCursorState(
+  preview: PreviewProjection | undefined,
+  cursor: Cursor,
+): "accept" | "duplicate" | "gap" {
+  if (preview === undefined) return "accept";
+  if (cursor.epoch !== preview.cursor.epoch) return "gap";
+  if (cursor.seq <= preview.cursor.seq) return "duplicate";
+  return cursor.seq === preview.cursor.seq + 1 ? "accept" : "gap";
+}
+const PREVIEW_ACTIONS: readonly PreviewAction[] = [
+  "activate",
+  "navigate",
+  "back",
+  "forward",
+  "reload",
+  "close",
+  "capture",
+  "click",
+  "fill",
+  "type",
+  "press",
+  "scroll",
+  "select",
+  "upload",
+  "handoff",
+];
+
+function previewAuthority(value: unknown): PreviewAuthorityProjection | undefined {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !("id" in value) ||
+    !("label" in value) ||
+    !("kind" in value) ||
+    !("requiresExplicitOptIn" in value)
+  )
+    return undefined;
+  const { id, label, kind, requiresExplicitOptIn } = value;
+  if (
+    typeof id !== "string" ||
+    id.length === 0 ||
+    id.length > 128 ||
+    typeof label !== "string" ||
+    label.length > 256 ||
+    (kind !== "isolated-session" && kind !== "authenticated-profile") ||
+    typeof requiresExplicitOptIn !== "boolean"
+  )
+    return undefined;
+  return Object.freeze({ id, label, kind, requiresExplicitOptIn });
+}
+
+function previewActions(value: unknown): readonly PreviewAction[] | undefined {
+  if (!Array.isArray(value) || value.length > PREVIEW_ACTIONS.length) return undefined;
+  const actions = value.filter(
+    (action): action is PreviewAction =>
+      typeof action === "string" && PREVIEW_ACTIONS.includes(action as PreviewAction),
+  );
+  return actions.length === value.length && new Set(actions).size === actions.length
+    ? Object.freeze(actions)
+    : undefined;
+}
+
+function previewProjection(
+  frame: ProjectionPreviewFrame,
+  previous: PreviewProjection | undefined,
+): PreviewProjection {
+
+  const hostId = String(frame.hostId);
+  const sessionId = String(frame.sessionId);
+  const previewId = String(frame.previewId);
+  const authority = previewAuthority(frame.authority);
+  const availableActions = previewActions(frame.availableActions);
+  if (frame.type === "preview.error")
+    return Object.freeze({
+      hostId,
+      sessionId,
+      previewId,
+      state: "failed",
+      revision: String(frame.revision),
+      cursor: Object.freeze({ ...frame.cursor }),
+      ...(previous?.url === undefined ? {} : { url: previous.url }),
+      ...(previous?.title === undefined ? {} : { title: previous.title }),
+      ...(previous?.canGoBack === undefined ? {} : { canGoBack: previous.canGoBack }),
+      ...(previous?.canGoForward === undefined ? {} : { canGoForward: previous.canGoForward }),
+      ...(previous?.viewport === undefined ? {} : { viewport: previous.viewport }),
+      ...(previous?.capture === undefined ? {} : { capture: previous.capture }),
+      ...(previous?.authority === undefined ? {} : { authority: previous.authority }),
+      ...(previous?.availableActions === undefined
+        ? {}
+        : { availableActions: previous.availableActions }),
+      error: Object.freeze({ code: frame.code, message: frame.message }),
+      freshness: "fresh",
+    });
+  return Object.freeze({
+    hostId,
+    sessionId,
+    previewId,
+    state: frame.state,
+    url: frame.url,
+    revision: String(frame.revision),
+    cursor: Object.freeze({ ...frame.cursor }),
+    ...(frame.title === undefined ? {} : { title: frame.title }),
+    ...(frame.canGoBack === undefined ? {} : { canGoBack: frame.canGoBack }),
+    ...(frame.canGoForward === undefined ? {} : { canGoForward: frame.canGoForward }),
+    ...(frame.viewport === undefined ? {} : { viewport: Object.freeze({ ...frame.viewport }) }),
+    ...(frame.capture === undefined ? {} : { capture: Object.freeze({ ...frame.capture }) }),
+    ...(authority === undefined ? {} : { authority }),
+    ...(availableActions === undefined ? {} : { availableActions }),
+    ...(frame.type === "preview.state" && frame.error !== undefined
+      ? { error: Object.freeze({ code: "preview_state", message: frame.error }) }
+      : {}),
+    freshness: "fresh",
+  });
+}
+
+function previewActivity(
+  frame: ProjectionPreviewFrame,
+  preview: PreviewProjection,
+): PreviewEventProjection | null {
+  if (frame.type === "preview.state") return null;
+  const type =
+    frame.type === "preview.launch"
+      ? "launch"
+      : frame.type === "preview.navigation"
+        ? "navigation"
+        : frame.type === "preview.capture"
+          ? "capture"
+          : "error";
+  let url: PreviewEventProjection["url"];
+  if (preview.url !== undefined) {
+    try {
+      const parsed = new URL(preview.url);
+      url = Object.freeze({
+        origin: parsed.origin.slice(0, 512),
+        pathname: parsed.pathname.slice(0, 1024),
+        hasQuery: parsed.search.length > 0,
+      });
+    } catch {
+      // The wire decoder rejects malformed URLs; keep defensive projection behavior for stale cache/tests.
+    }
+  }
+  return Object.freeze({
+    type,
+    previewId: preview.previewId,
+    cursor: Object.freeze({ ...preview.cursor }),
+    ...(url === undefined ? {} : { url }),
+    ...(preview.capture === undefined ? {} : { timestamp: preview.capture.capturedAt }),
+    ...(preview.capture === undefined ? {} : { captureId: preview.capture.captureId }),
+    ...(preview.error === undefined ? {} : { errorCode: preview.error.code }),
+  });
+}
+
+function appendPreviewActivity(
+  events: readonly PreviewEventProjection[],
+  event: PreviewEventProjection,
+  max: number,
+): readonly PreviewEventProjection[] {
+  if (
+    events.some(
+      (previous) =>
+        previous.previewId === event.previewId &&
+        previous.cursor.epoch === event.cursor.epoch &&
+        previous.cursor.seq === event.cursor.seq,
+    )
+  )
+    return events;
+  return appendBounded(events, event, max);
+}
 function sessionDeltaCursorIsStale(previous: Cursor | undefined, cursor: Cursor): boolean {
   return previous !== undefined && previous.epoch === cursor.epoch && cursor.seq <= previous.seq;
 }
@@ -658,7 +914,7 @@ function mostRecentSessionKey(sessionIndex: ReadonlyMap<string, SessionRef>): st
   return selected?.key;
 }
 function authoritativeSessionHosts(
-  frame: ProjectionFrame & { readonly type: "sessions" },
+  frame: ProjectionInput<"sessions">,
   refs: readonly SessionRef[],
 ): ReadonlySet<string> {
   const hosts = new Set(refs.map((ref) => String(ref.hostId)));
@@ -668,7 +924,7 @@ function authoritativeSessionHosts(
   return hosts;
 }
 function sessionFrameMetadata(
-  frame: ProjectionFrame & { readonly type: "sessions" },
+  frame: ProjectionInput<"sessions">,
   refs: readonly SessionRef[],
   maxIndexedSessions: number,
   hosts: ReadonlySet<string>,
@@ -701,7 +957,7 @@ function sessionFrameMetadata(
 }
 
 function sessionFrameIsComplete(
-  frame: ProjectionFrame & { readonly type: "sessions" },
+  frame: ProjectionInput<"sessions">,
   refs: readonly SessionRef[],
   maxIndexedSessions: number,
 ): boolean {
@@ -717,7 +973,7 @@ function sessionFrameIsComplete(
   return raw.truncated === false || refs.length < maxIndexedSessions;
 }
 
-function resultProjection(frame: ResultFrame): ResultProjection {
+function resultProjection(frame: ProjectionResultFrame): ResultProjection {
   const output: ResultProjection = {
     requestId: String(frame.requestId),
     ...(frame.commandId === undefined ? {} : { commandId: String(frame.commandId) }),
@@ -730,7 +986,10 @@ function resultProjection(frame: ResultFrame): ResultProjection {
   return Object.freeze(output);
 }
 
-function attachAcknowledgesCurrentCursor(session: SessionProjection, frame: ResultFrame): boolean {
+function attachAcknowledgesCurrentCursor(
+  session: SessionProjection,
+  frame: ProjectionResultFrame,
+): boolean {
   if (
     !frame.ok ||
     frame.command !== "session.attach" ||
@@ -746,9 +1005,9 @@ function attachAcknowledgesCurrentCursor(session: SessionProjection, frame: Resu
   return result.cursor.epoch === session.cursor.epoch && result.cursor.seq === session.cursor.seq;
 }
 
-export function applyPublicFrame(
+function applyProjectionInput(
   snapshot: ProjectionSnapshot,
-  frame: ProjectionFrame,
+  frame: ProjectionInputFrame,
   options: ProjectionOptions = {},
 ): ProjectionSnapshot {
   const config = resolveProjectionOptions(options);
@@ -1096,10 +1355,9 @@ export function applyPublicFrame(
           });
         },
         config,
+        frame.type === "event" ? eventArrivalOrdinal : undefined,
       );
-      return frame.type === "event"
-        ? Object.freeze({ ...next, arrivalOrdinal: eventArrivalOrdinal })
-        : next;
+      return next;
     }
     case "gap": {
       const sessionKey = key(String(frame.hostId), String(frame.sessionId));
@@ -1107,6 +1365,79 @@ export function applyPublicFrame(
         snapshot,
         sessionKey,
         (session) => Object.freeze({ ...session, freshness: "catching-up", gap: frame }),
+        config,
+      );
+    }
+    case "preview.launch":
+    case "preview.state":
+    case "preview.navigation":
+    case "preview.capture":
+    case "preview.error": {
+      const sessionKey = key(String(frame.hostId), String(frame.sessionId));
+      const previewIdentity = {
+        hostId: String(frame.hostId),
+        sessionId: String(frame.sessionId),
+        previewId: String(frame.previewId),
+      };
+      const previewMapKey = previewKey(previewIdentity);
+      const current = snapshot.sessions.get(sessionKey)?.previews.get(previewMapKey);
+      const order = previewCursorState(current, frame.cursor);
+      const baseline = frame.type === "preview.launch" || frame.type === "preview.state";
+      if (!baseline && order === "duplicate") return snapshot;
+      if (order === "gap" && !baseline)
+        return withSession(
+          snapshot,
+          sessionKey,
+          (session) => {
+            const previous = session.previews.get(previewMapKey);
+            return previous === undefined || previous.freshness === "stale"
+              ? session
+              : Object.freeze({
+                  ...session,
+                  previews: mapWith(
+                    session.previews,
+                    previewMapKey,
+                    Object.freeze({ ...previous, freshness: "stale" as const }),
+                    config.maxPreviews,
+                  ),
+                });
+          },
+          config,
+        );
+      if (current !== undefined && current.freshness !== "fresh" && !baseline)
+        return withSession(
+          snapshot,
+          sessionKey,
+          (session) => {
+            const previous = session.previews.get(previewMapKey);
+            return previous === undefined || previous.freshness === "stale"
+              ? session
+              : Object.freeze({
+                  ...session,
+                  previews: mapWith(
+                    session.previews,
+                    previewMapKey,
+                    Object.freeze({ ...previous, freshness: "stale" as const }),
+                    config.maxPreviews,
+                  ),
+                });
+          },
+          config,
+        );
+      const projected = previewProjection(frame, current);
+      const activity = previewActivity(frame, projected);
+      return withSession(
+        snapshot,
+        sessionKey,
+        (session) =>
+          Object.freeze({
+            ...session,
+            previews: mapWith(session.previews, previewMapKey, projected, config.maxPreviews),
+            previewEvents:
+              activity === null
+                ? session.previewEvents
+                : appendPreviewActivity(session.previewEvents, activity, config.maxPreviewEvents),
+          }),
         config,
       );
     }
@@ -1303,12 +1634,6 @@ export function applyPublicFrame(
       // but do not let their old completeness metadata prove that a route is
       // gone until the host sends the next authoritative sessions frame.
       const sessionIndexMetadata = mapWithout(snapshot.sessionIndexMetadata, String(frame.hostId));
-      if (snapshot.epoch === undefined || snapshot.epoch === frame.epoch) {
-        return updateRoot(Object.freeze({ ...snapshot, sessionIndexMetadata }), {
-          epoch: frame.epoch,
-          freshness: "fresh",
-        });
-      }
       const sessions = immutableMap(
         [...snapshot.sessions.entries()].map(
           ([sessionKey, session]) =>
@@ -1316,13 +1641,32 @@ export function applyPublicFrame(
               sessionKey,
               Object.freeze({
                 ...session,
-                freshness: "catching-up",
-                transcriptEventArrivalOrdinal: 0,
-                contextMaintenanceEventArrivalOrdinal: 0,
+                ...(snapshot.epoch === undefined || snapshot.epoch === frame.epoch
+                  ? {}
+                  : {
+                      freshness: "catching-up" as const,
+                      transcriptEventArrivalOrdinal: 0,
+                      contextMaintenanceEventArrivalOrdinal: 0,
+                    }),
+                previews: immutableMap(
+                  [...session.previews.entries()].map(
+                    ([previewMapKey, preview]) =>
+                      [
+                        previewMapKey,
+                        Object.freeze({ ...preview, freshness: "catching-up" as const }),
+                      ] as const,
+                  ),
+                ),
               }),
             ] as const,
         ),
       );
+      if (snapshot.epoch === undefined || snapshot.epoch === frame.epoch) {
+        return updateRoot(Object.freeze({ ...snapshot, sessionIndexMetadata, sessions }), {
+          epoch: frame.epoch,
+          freshness: "fresh",
+        });
+      }
       return Object.freeze({
         ...snapshot,
         sessionIndexMetadata,
@@ -1334,6 +1678,26 @@ export function applyPublicFrame(
     default:
       return snapshot;
   }
+}
+
+export function applyPublicFrame(
+  snapshot: ProjectionSnapshot,
+  frame: ProjectionFrame,
+  options: ProjectionOptions = {},
+): ProjectionSnapshot {
+  return applyProjectionInput(snapshot, frame, options);
+}
+
+export function applyPublicEvent(
+  snapshot: ProjectionSnapshot,
+  event: PublicOmpServerEvent,
+  options: ProjectionOptions = {},
+): ProjectionSnapshot {
+  return applyProjectionInput(
+    snapshot,
+    { ...event.payload, type: event.kind } as ProjectionEventFrame,
+    options,
+  );
 }
 
 export class ProjectionStore {
@@ -1375,6 +1739,23 @@ export class ProjectionStore {
     for (const listener of [...this.listeners]) {
       try {
         listener(next, frame);
+      } catch {
+        /* listener isolation */
+      }
+    }
+    return next;
+  }
+  applyPublicEvent(event: PublicOmpServerEvent): ProjectionSnapshot {
+    if (this.disposed) return this.current;
+    const next = applyPublicEvent(this.current, event, this.options);
+    if (next === this.current) return next;
+    this.mutationGeneration += 1;
+    this.current = next;
+    this.queueCacheSave();
+    // eslint-disable-next-line unicorn/no-useless-spread -- preserve listener snapshot when callbacks may unsubscribe during dispatch.
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(next, event);
       } catch {
         /* listener isolation */
       }
@@ -1438,7 +1819,8 @@ export class ProjectionStore {
   }
   private async drainCacheSaves(): Promise<void> {
     try {
-      while (this.pendingSnapshot !== undefined && !this.disposed) {
+      // Disposal blocks new mutations, but already-coalesced snapshots must still drain.
+      while (this.pendingSnapshot !== undefined) {
         const snapshot = this.pendingSnapshot;
         this.pendingSnapshot = undefined;
         let serialized: string;

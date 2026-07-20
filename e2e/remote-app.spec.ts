@@ -1,10 +1,16 @@
 import { createServer, type Server } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, readFile, stat } from "node:fs/promises";
+import { access, readFile, stat, writeFile } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import { expect, test, type Page } from "@playwright/test";
+import type { SessionRef } from "@t4-code/protocol";
+import {
+  MOBILE_BACKEND_STORAGE_KEY,
+  parseTailnetBackend,
+} from "../apps/web/src/platform/native-mobile-backend.ts";
+import type { ScenarioId } from "../packages/fixture-server/src/index.ts";
 import { installColdMountObserver, readColdMountSamples } from "./cold-mount-observer.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -21,6 +27,11 @@ const SESSION_TITLE = "stream-v1 fixture";
 const MIN_TOUCH_TARGET_PX = 43.99;
 const CONNECTED_COPY =
   "This Tailnet connection is live. Choose a session from the list on the left to inspect it.";
+const DEFAULT_MOBILE_BACKEND = parseTailnetBackend("https://fixture.tailnet.ts.net");
+const PROFILE_MOBILE_BACKEND = parseTailnetBackend(
+  "https://fixture.tailnet.ts.net",
+  "fable-swarm",
+);
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   ".css": "text/css; charset=utf-8",
@@ -131,11 +142,13 @@ class FixtureProcess {
   private controlUrl = "";
   wsUrl = "";
 
+  constructor(private readonly scenario: ScenarioId = "stream-v1") {}
+
   async start(): Promise<void> {
     await access(JITI);
     const child = spawn(JITI, [FIXTURE_PROCESS], {
       cwd: REPO_ROOT,
-      env: process.env,
+      env: { ...process.env, T4_FIXTURE_SCENARIO: this.scenario },
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.child = child;
@@ -195,6 +208,27 @@ class FixtureProcess {
     if (!response.ok) throw new Error(`fixture advance failed: ${response.status}`);
   }
 
+  async state(): Promise<{
+    readonly scenario: ScenarioId;
+    readonly sessions: readonly SessionRef[];
+    readonly clients: number;
+    readonly connections: number;
+  }> {
+    const response = await fetch(`${this.controlUrl}/state`);
+    if (!response.ok) throw new Error(`fixture state failed: ${response.status}`);
+    return (await response.json()) as {
+      readonly scenario: ScenarioId;
+      readonly sessions: readonly SessionRef[];
+      readonly clients: number;
+      readonly connections: number;
+    };
+  }
+
+  async disconnectClients(): Promise<void> {
+    const response = await fetch(`${this.controlUrl}/disconnect`, { method: "POST" });
+    if (!response.ok) throw new Error(`fixture disconnect failed: ${response.status}`);
+  }
+
   async stop(): Promise<void> {
     const child = this.child;
     this.child = null;
@@ -214,10 +248,11 @@ class FixtureProcess {
 }
 
 let fixture: FixtureProcess;
+let profileFixture: FixtureProcess | undefined;
 let web: BuiltWebServer;
 
 test.beforeAll(async () => {
-  fixture = new FixtureProcess();
+  fixture = new FixtureProcess("stream-v1");
   await fixture.start();
   web = new BuiltWebServer(fixture.wsUrl);
   await web.start();
@@ -225,8 +260,74 @@ test.beforeAll(async () => {
 
 test.afterAll(async () => {
   await web?.stop();
-  await fixture?.stop();
+  await Promise.all([fixture?.stop(), profileFixture?.stop()]);
 });
+
+async function installHeadlessAndroidProfiles(page: Page): Promise<FixtureProcess> {
+  const selectedProfileFixture = new FixtureProcess("basic-v1");
+  await selectedProfileFixture.start();
+  profileFixture = selectedProfileFixture;
+  await page.addInitScript(
+    ({
+      defaultBackend,
+      defaultWsUrl,
+      mobileBackendStorageKey,
+      profileBackend,
+      profileWsUrl,
+    }) => {
+      const NativeWebSocket = window.WebSocket;
+      class RoutedWebSocket extends NativeWebSocket {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          const requested = String(url);
+          const routed =
+            requested === defaultBackend.wsUrl
+              ? defaultWsUrl
+              : requested === profileBackend.wsUrl
+                ? profileWsUrl
+                : requested;
+          super(routed, protocols);
+        }
+      }
+      Object.defineProperty(RoutedWebSocket, "CONNECTING", { value: NativeWebSocket.CONNECTING });
+      Object.defineProperty(RoutedWebSocket, "OPEN", { value: NativeWebSocket.OPEN });
+      Object.defineProperty(RoutedWebSocket, "CLOSING", { value: NativeWebSocket.CLOSING });
+      Object.defineProperty(RoutedWebSocket, "CLOSED", { value: NativeWebSocket.CLOSED });
+      window.WebSocket = RoutedWebSocket;
+
+      if (window.localStorage.getItem(mobileBackendStorageKey) === null) {
+        window.localStorage.setItem(
+          mobileBackendStorageKey,
+          JSON.stringify({
+            version: 3,
+            activeEndpointKey: profileBackend.endpointKey,
+            backends: [defaultBackend, profileBackend],
+          }),
+        );
+      }
+      Object.assign(window, {
+        Capacitor: {
+          getPlatform: () => "android",
+          isNativePlatform: () => true,
+          Plugins: {
+            T4SecureStorage: {
+              getCredentials: async () => ({ credentials: null }),
+              setCredentials: async () => undefined,
+              clearCredentials: async () => undefined,
+            },
+          },
+        },
+      });
+    },
+    {
+      defaultBackend: DEFAULT_MOBILE_BACKEND,
+      defaultWsUrl: fixture.wsUrl,
+      mobileBackendStorageKey: MOBILE_BACKEND_STORAGE_KEY,
+      profileBackend: PROFILE_MOBILE_BACKEND,
+      profileWsUrl: selectedProfileFixture.wsUrl,
+    },
+  );
+  return selectedProfileFixture;
+}
 
 async function openConnectedRoot(page: Page): Promise<void> {
   await page.goto(web.url, { waitUntil: "domcontentloaded" });
@@ -269,6 +370,285 @@ async function openSession(page: Page, mobile: boolean): Promise<void> {
 }
 
 test.describe.configure({ mode: "serial" });
+test("routes mobile session creation to the selected profile and preserves both profiles", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const selectedProfileFixture = await installHeadlessAndroidProfiles(page);
+
+  const [defaultBefore, profileBefore] = await Promise.all([
+    fixture.state(),
+    selectedProfileFixture.state(),
+  ]);
+  expect(defaultBefore.scenario).toBe("stream-v1");
+  expect(profileBefore.scenario).toBe("basic-v1");
+  expect(defaultBefore.sessions).toHaveLength(1);
+  expect(profileBefore.sessions).toHaveLength(1);
+
+  await page.goto(web.url, { waitUntil: "domcontentloaded" });
+  await expect(page.getByText(CONNECTED_COPY, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Show session list", exact: true }).click();
+  let rail = page.getByRole("dialog", { name: "Working folders and sessions" });
+  await expect(rail.locator('[data-session-row="host-basic/session-basic"]')).toBeVisible();
+  await expect(rail.locator(`[data-session-row="${SESSION_VIEW_ID}"]`)).toHaveCount(0);
+
+  await rail.getByRole("button", { name: /^New session in /u }).click();
+  await expect(page).toHaveURL(/#\/sessions\//u);
+  await expect(page.getByRole("textbox", { name: "Message the session" })).toBeEnabled();
+  const createdViewId = decodeURIComponent(new URL(page.url()).hash.replace(/^#\/sessions\//u, ""));
+  expect(createdViewId).not.toBe("host-basic/session-basic");
+
+  await expect
+    .poll(async () => (await selectedProfileFixture.state()).sessions.length)
+    .toBe(profileBefore.sessions.length + 1);
+  expect((await fixture.state()).sessions).toHaveLength(defaultBefore.sessions.length);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("textbox", { name: "Message the session" })).toBeEnabled();
+  await page.getByRole("button", { name: "Show session list", exact: true }).click();
+  rail = page.getByRole("dialog", { name: "Working folders and sessions" });
+  await expect(rail.locator(`[data-session-row="${createdViewId}"]`)).toBeVisible();
+
+  await page.getByRole("button", { name: "Close", exact: true }).click();
+  await page.getByRole("button", { name: "T4 hosts", exact: true }).click();
+  const manager = page.getByRole("dialog", { name: "T4 hosts" });
+  const profileItem = manager.getByRole("listitem").filter({ hasText: "Profile · fable-swarm" });
+  await expect(profileItem.getByText("Current", { exact: true })).toBeVisible();
+  const defaultItem = manager.getByRole("listitem").filter({ hasText: "Default profile" });
+  await defaultItem.getByRole("button", { name: "Switch", exact: true }).click();
+
+  await expect(page.getByText(CONNECTED_COPY, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Show session list", exact: true }).click();
+  rail = page.getByRole("dialog", { name: "Working folders and sessions" });
+  await expect(rail.locator(`[data-session-row="${SESSION_VIEW_ID}"]`)).toBeVisible();
+  await expect(rail.locator('[data-session-row="host-basic/session-basic"]')).toHaveCount(0);
+  await expect(rail.locator(`[data-session-row="${createdViewId}"]`)).toHaveCount(0);
+
+  const storedDirectory = await page.evaluate((key) => {
+    const raw = window.localStorage.getItem(key);
+    return raw === null
+      ? null
+      : (JSON.parse(raw) as { activeEndpointKey: string; backends: unknown[] });
+  }, MOBILE_BACKEND_STORAGE_KEY);
+  expect(storedDirectory?.activeEndpointKey).toBe(DEFAULT_MOBILE_BACKEND.endpointKey);
+  expect(storedDirectory?.backends).toHaveLength(2);
+  expect((await selectedProfileFixture.state()).sessions).toHaveLength(
+    profileBefore.sessions.length + 1,
+  );
+});
+
+test("@soak mounts the bounded tail of a 10k history on a phone viewport", async ({ page }) => {
+  test.setTimeout(120_000);
+  const mountStartedAt = performance.now();
+  const historyFixture = new FixtureProcess("history-10k-v1");
+  let historyWeb: BuiltWebServer | undefined;
+  try {
+    await historyFixture.start();
+    historyWeb = new BuiltWebServer(historyFixture.wsUrl);
+    await historyWeb.start();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(historyWeb.url, { waitUntil: "domcontentloaded" });
+    const navigationTiming = await page.evaluate(() => {
+      const navigation = performance.getEntriesByType("navigation")[0] as
+        | PerformanceNavigationTiming
+        | undefined;
+      return { domContentLoaded: navigation?.domContentLoadedEventEnd ?? 0 };
+    });
+    const connectedHandle = await page.waitForFunction(
+      (copy) => {
+        const isVisible = (element: Element) => {
+          const style = getComputedStyle(element);
+          const bounds = element.getBoundingClientRect();
+          return style.display !== "none" && style.visibility !== "hidden" && bounds.width > 0 && bounds.height > 0;
+        };
+        const connected = [...document.querySelectorAll("*")].some(
+          (element) => element.textContent?.trim() === copy && isVisible(element),
+        );
+        return connected ? performance.now() : false;
+      },
+      CONNECTED_COPY,
+      { polling: "raf" },
+    );
+    const connectedAt = await connectedHandle.jsonValue();
+    await connectedHandle.dispose();
+    await expect(page.getByText(CONNECTED_COPY, { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Show session list", exact: true }).click();
+    const rail = page.getByRole("dialog", { name: "Working folders and sessions" });
+    await page.evaluate(() => {
+      const phases: {
+        transcriptVisibleAt?: number;
+        tailAlignedAt?: number;
+        realListVisibleAt?: number;
+        tailPaintedAt?: number;
+      } = {};
+      Object.assign(window, { __t4BrowserPaintPhases: phases });
+      let tailPaintScheduled = false;
+      const isVisible = (element: Element | null) => {
+        if (!(element instanceof HTMLElement)) return false;
+        const style = getComputedStyle(element);
+        const bounds = element.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0"
+          && bounds.width > 0
+          && bounds.height > 0;
+      };
+      const inspect = () => {
+        const transcript = document.querySelector('[role="log"][aria-label="Transcript"]');
+        if (phases.transcriptVisibleAt === undefined && isVisible(transcript)) {
+          phases.transcriptVisibleAt = performance.now();
+        }
+        const realList = transcript?.querySelector(".legend-list-content-container") ?? null;
+        const overlay = transcript?.querySelector("[data-cold-mount-overlay]") ?? null;
+        if (phases.tailAlignedAt === undefined) {
+          const scroller = [...(transcript?.querySelectorAll<HTMLElement>("div") ?? [])].find(
+            (element) => {
+              const { overflowY } = getComputedStyle(element);
+              return overflowY === "auto" || overflowY === "scroll";
+            },
+          );
+          const transcriptRect = transcript?.getBoundingClientRect();
+          const rows = [...(transcript?.querySelectorAll<HTMLElement>("[data-transcript-row]") ?? [])];
+          const rowsInView = transcriptRect !== undefined && rows.some((row) => {
+            const rect = row.getBoundingClientRect();
+            return rect.bottom > transcriptRect.top && rect.top < transcriptRect.bottom;
+          });
+          if (scroller !== undefined && transcriptRect !== undefined) {
+            const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+            const aligned = Math.abs(scroller.scrollTop - maxScroll) <= 1;
+            if (aligned && rowsInView) {
+              phases.tailAlignedAt = performance.now();
+            }
+          }
+        }
+        if (
+          phases.realListVisibleAt === undefined
+          && isVisible(transcript)
+          && overlay === null
+          && isVisible(realList)
+        ) {
+          phases.realListVisibleAt = performance.now();
+        }
+        const tail = [...(transcript?.querySelectorAll("p") ?? [])].find(
+          (paragraph) => paragraph.textContent?.trim() === "message-10000" && isVisible(paragraph),
+        );
+        if (phases.realListVisibleAt !== undefined && tail !== undefined && !tailPaintScheduled) {
+          tailPaintScheduled = true;
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              phases.tailPaintedAt = performance.now();
+            });
+          });
+        }
+        if (phases.tailPaintedAt === undefined) requestAnimationFrame(inspect);
+      };
+      requestAnimationFrame(inspect);
+    });
+    await rail.locator('[data-session-row="host-history/session-history"]').evaluate((element) => {
+      element.addEventListener("click", () => {
+        Object.assign(window, { __t4SessionDomClickAt: performance.now() });
+      }, { capture: true, once: true });
+    });
+    const sessionClickStartedAt = await page.evaluate(() => performance.now());
+    await rail.locator('[data-session-row="host-history/session-history"]').click();
+
+    const transcript = page.getByRole("log", { name: "Transcript" });
+    await expect(transcript).toBeVisible();
+    await expect(transcript.locator("[data-cold-mount-overlay]")).toHaveCount(0);
+    await expect(transcript.getByText("message-10000", { exact: true })).toBeVisible();
+    expect(await transcript.locator("[data-transcript-row]").count()).toBeLessThan(100);
+    const mountDuration = performance.now() - mountStartedAt;
+    const phasesHandle = await page.waitForFunction(
+      () => {
+        const phases = (
+          window as typeof window & {
+            __t4BrowserPaintPhases?: {
+              transcriptVisibleAt?: number;
+              tailAlignedAt?: number;
+              realListVisibleAt?: number;
+              tailPaintedAt?: number;
+            };
+          }
+        ).__t4BrowserPaintPhases;
+        return phases !== undefined
+          && Number.isFinite(phases.transcriptVisibleAt)
+          && Number.isFinite(phases.tailAlignedAt)
+          && Number.isFinite(phases.realListVisibleAt)
+          && Number.isFinite(phases.tailPaintedAt)
+          ? phases
+          : false;
+      },
+      undefined,
+      { polling: "raf" },
+    );
+    const phases = await phasesHandle.jsonValue();
+    await phasesHandle.dispose();
+    if (
+      phases.transcriptVisibleAt === undefined
+      || phases.tailAlignedAt === undefined
+      || phases.realListVisibleAt === undefined
+      || phases.tailPaintedAt === undefined
+    ) {
+      throw new Error("browser paint observer returned incomplete phases");
+    }
+    const sessionDomClickAt = await page.evaluate(() => (
+      window as typeof window & { __t4SessionDomClickAt?: number }
+    ).__t4SessionDomClickAt);
+    if (sessionDomClickAt === undefined) throw new Error("session DOM click timestamp was not captured");
+    const phaseOutput = process.env.T4_PERF_PHASE_OUTPUT;
+    if (phaseOutput !== undefined) {
+      await writeFile(
+        phaseOutput,
+        `${JSON.stringify({
+          mountDuration,
+          navigationDomContentLoaded: navigationTiming.domContentLoaded,
+          connectedAfterDomContentLoaded: connectedAt - navigationTiming.domContentLoaded,
+          sessionClickCommandToDomClick: sessionDomClickAt - sessionClickStartedAt,
+          sessionDomClickToTranscriptVisible: phases.transcriptVisibleAt - sessionDomClickAt,
+          sessionDomClickToTailAligned: phases.tailAlignedAt - sessionDomClickAt,
+          sessionDomClickToRealListVisible: phases.realListVisibleAt - sessionDomClickAt,
+          sessionDomClickToTailPainted: phases.tailPaintedAt - sessionDomClickAt,
+          sessionClickToTranscriptVisible: phases.transcriptVisibleAt - sessionClickStartedAt,
+          sessionClickToTailAligned: phases.tailAlignedAt - sessionClickStartedAt,
+          tailAlignedToRealListVisible: phases.realListVisibleAt - phases.tailAlignedAt,
+          sessionClickToRealListVisible: phases.realListVisibleAt - sessionClickStartedAt,
+          sessionClickToTailPainted: phases.tailPaintedAt - sessionClickStartedAt,
+        })}\n`,
+      );
+    }
+  } finally {
+    await historyWeb?.stop();
+    await historyFixture.stop();
+  }
+});
+
+test("@soak recovers one live phone session across 20 network drops", async ({ page }) => {
+  test.setTimeout(120_000);
+  await page.clock.install();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openSession(page, true);
+  const transcript = page.getByRole("log", { name: "Transcript" });
+  const composer = page.getByRole("textbox", { name: "Message the session" });
+
+  for (let cycle = 1; cycle <= 20; cycle += 1) {
+    const before = await fixture.state();
+    await fixture.disconnectClients();
+    await expect(page.getByText("Offline", { exact: true }).first()).toBeVisible();
+    await page.clock.fastForward(10_000);
+    await expect
+      .poll(async () => (await fixture.state()).connections, {
+        message: `fixture did not accept reconnect ${cycle}`,
+      })
+      .toBeGreaterThan(before.connections);
+    await expect.poll(async () => (await fixture.state()).clients).toBe(1);
+    await expect(transcript).toBeVisible();
+    await expect(
+      transcript.getByText("Hello world", { exact: true }).filter({ visible: true }),
+    ).toHaveCount(1);
+    await expect(composer).toBeEnabled();
+    await expect(page.getByText("Offline", { exact: true })).toHaveCount(0);
+  }
+});
 
 test("settles a typed incompatible desktop inspection and recovers without a stale retry", async ({
   page,
@@ -315,7 +695,7 @@ test("settles a typed incompatible desktop inspection and recovers without a sta
           }
           return inspection;
         },
-        onServerFrame: () => () => undefined,
+        onServerEvent: () => () => undefined,
         onConnectionState: () => () => undefined,
         onRuntimeError: () => () => undefined,
       },
@@ -368,7 +748,7 @@ test("settles a typed incompatible desktop inspection and recovers without a sta
     control.mode = "resolve";
     control.resolvePending?.({ definition: "current", service: "running", diagnostics: "" });
   });
-  await expect(page.getByText("Running", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").getByText("Running", { exact: true })).toBeVisible();
   await page.clock.fastForward(60_000);
   expect(await inspectCalls()).toBe(2);
 });
@@ -411,7 +791,7 @@ test("caps generic desktop inspection retries and clears timers on manual work a
           }
           throw new Error("temporary IPC failure");
         },
-        onServerFrame: () => () => undefined,
+        onServerEvent: () => () => undefined,
         onConnectionState: (
           listener: (event: { targetId: string; state: "connected" }) => void,
         ) => {
@@ -684,6 +1064,144 @@ test("keeps an empty Archived filter selected on the home route", async ({ page 
   ).toHaveAttribute("aria-pressed", "true");
 });
 
+test("opens supporting tools from one workspace menu and toggles the terminal shortcut", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await openSession(page, false);
+
+  const workspace = page.getByRole("button", { name: "Workspace tools", exact: true });
+  await expect(workspace).toBeVisible();
+  await workspace.click();
+  await expect(page.getByText("Open on the right", { exact: true })).toBeVisible();
+  await expect(page.getByText("Open below", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open Agent terminals panel" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Open Activity panel", exact: true }).click();
+  await expect(page.getByRole("complementary", { name: "Activity", exact: true })).toBeVisible();
+  await expect(workspace).toHaveAttribute("aria-pressed", "true");
+
+  await page.keyboard.press("Control+j");
+  await expect(page.getByRole("button", { name: "Close terminal drawer", exact: true })).toBeVisible();
+  await page.keyboard.press("Control+j");
+  await expect(
+    page.getByRole("button", { name: "Close terminal drawer", exact: true }),
+  ).toBeHidden();
+});
+
+test("temporarily hides workspace chrome in focus mode and restores it", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await openSession(page, false);
+
+  const workspace = page.getByRole("button", { name: "Workspace tools", exact: true });
+  await workspace.click();
+  await page.getByRole("button", { name: "Open Activity panel", exact: true }).click();
+  await page.keyboard.press("Control+j");
+  await expect(page.getByRole("complementary", { name: "Activity", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Close terminal drawer", exact: true })).toBeVisible();
+
+  await workspace.click();
+  await page.getByRole("button", { name: "Enter focus mode", exact: true }).click();
+  await expect(page.getByRole("navigation", { name: "Working folders and sessions" })).toBeHidden();
+  await expect(page.getByRole("complementary", { name: "Activity", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Close terminal drawer", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Workspace tools", exact: true })).toBeHidden();
+
+  const exitFocus = page.getByRole("button", { name: "Exit focus mode", exact: true });
+  await expect(exitFocus).toBeVisible();
+  await exitFocus.click();
+  await expect(page.getByRole("navigation", { name: "Working folders and sessions" })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Activity", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Close terminal drawer", exact: true })).toBeVisible();
+
+  await page.keyboard.press("Control+Shift+f");
+  await expect(exitFocus).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(exitFocus).toBeHidden();
+  await page.getByRole("button", { name: "Close Activity", exact: true }).click();
+  await page.getByRole("button", { name: "Close terminal drawer", exact: true }).click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.keyboard.press("Control+Shift+f");
+  await expect(exitFocus).toBeVisible();
+  const exitBox = await exitFocus.boundingBox();
+  expect(exitBox).not.toBeNull();
+  expect(exitBox!.width).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+  expect(exitBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+  await exitFocus.click();
+  await expect(page.getByRole("textbox", { name: "Message the session" })).toBeVisible();
+});
+
+test("shows verified session context and groups command-palette actions", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await openSession(page, false);
+
+  const context = page.getByRole("button", { name: /^Session context:/u });
+  await expect(context).toBeVisible();
+  await context.click();
+  await expect(page.getByText("Host", { exact: true })).toBeVisible();
+  await expect(page.getByText("Model", { exact: true })).toBeVisible();
+  await expect(page.getByText("Connection", { exact: true })).toBeVisible();
+  await expect(page.getByText("Live connection", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "View host health", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.keyboard.press("Control+k");
+  const palette = page.getByRole("dialog", {
+    name: "Search sessions, transcripts, and commands",
+  });
+  await expect(palette.getByText("Recent work", { exact: true })).toBeVisible();
+  await expect(palette.getByText("Workspace", { exact: true })).toBeVisible();
+  await expect(palette.getByText("Navigate", { exact: true })).toBeVisible();
+  await expect(palette.getByText("App", { exact: true })).toBeVisible();
+  await expect(palette.getByLabel("Command menu keyboard help")).toContainText(
+    /Navigate.*Open.*Esc.*Close/u,
+  );
+
+  const search = palette.getByRole("combobox");
+  await search.fill("open terminal");
+  await expect(palette.getByText("Workspace", { exact: true })).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Close terminal drawer", exact: true })).toBeVisible();
+});
+
+test("groups sample settings on desktop and in the mobile category picker", async ({ page }) => {
+  await page.route("**/*", async (route) => {
+    const requestUrl = new URL(route.request().url());
+    const appUrl = new URL(web.url);
+    if (requestUrl.origin === appUrl.origin && requestUrl.pathname === "/") {
+      const response = await route.fetch();
+      const body = (await response.text()).replace(
+        /<script id="t4-backend" type="application\/json">.*?<\/script>/u,
+        "",
+      );
+      await route.fulfill({ body, response });
+      return;
+    }
+    await route.continue();
+  });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(`${web.url}#/settings`, { waitUntil: "domcontentloaded" });
+
+  const sections = page.getByRole("navigation", { name: "Settings sections" });
+  await expect(sections.getByText("Personal", { exact: true })).toBeVisible();
+  await expect(sections.getByText("AI & agents", { exact: true })).toBeVisible();
+  await expect(sections.getByText("Tools", { exact: true })).toBeVisible();
+  await expect(sections.getByText("Integrations", { exact: true })).toBeVisible();
+  await expect(sections.getByText("System", { exact: true })).toBeVisible();
+  await sections.getByRole("button", { name: "Diagnostics", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Diagnostics", exact: true })).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const picker = page.getByLabel("Settings category");
+  await expect(picker).toBeVisible();
+  await expect(picker.locator('optgroup[label="Personal"] option')).toHaveCount(5);
+  await expect(picker.locator('optgroup[label="AI & agents"] option')).toHaveCount(4);
+  await expect(picker.locator('optgroup[label="System"] option')).toHaveCount(2);
+  await picker.selectOption("general");
+  await expect(page.getByRole("heading", { name: "General", exact: true })).toBeVisible();
+});
+
 for (const viewport of [
   { width: 390, height: 844 },
   { width: 390, height: 500 },
@@ -810,9 +1328,9 @@ test("manages a session from a phone and converges another live client", async (
     await page.getByRole("button", { name: "Show session list", exact: true }).click();
     const rail = page.getByRole("dialog", { name: "Working folders and sessions" });
     await expect(rail).toBeVisible();
-    await expect(rail.getByRole("heading", { name: "Working folders", exact: true })).toBeVisible();
+    await expect(rail.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
     await expect(
-      rail.getByText("OMP groups sessions by the folder they were started in.", { exact: true }),
+      rail.getByRole("button", { name: "Open attention inbox", exact: true }),
     ).toBeVisible();
     await expect(rail.getByRole("button", { name: "Current · 1", exact: true })).toBeVisible();
     await expect(rail.getByRole("button", { name: "Archived · 0", exact: true })).toBeVisible();
@@ -1058,5 +1576,50 @@ test("manages a session from a phone and converges another live client", async (
     await expect(reloadedRail.getByRole("button", { name: /^New session in /u })).toBeVisible();
   } finally {
     await observerContext.close();
+  }
+});
+
+test("opens a session-linked browser preview, captures a snapshot, and keeps controls mobile-safe", async ({
+  page,
+}) => {
+  const previewFixture = new FixtureProcess("preview-v1");
+  let previewWeb: BuiltWebServer | undefined;
+  try {
+    await previewFixture.start();
+    previewWeb = new BuiltWebServer(previewFixture.wsUrl);
+    await previewWeb.start();
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(previewWeb.url, { waitUntil: "domcontentloaded" });
+    await expect(page.getByText(CONNECTED_COPY, { exact: true })).toBeVisible();
+    const session = page.locator('[data-session-row="host-preview/session-preview"]');
+    await expect(session).toBeVisible();
+    await session.click();
+
+    const openPreview = page.getByRole("button", {
+      name: "Open browser preview for this session",
+    });
+    await expect(openPreview).toBeVisible();
+    await openPreview.click();
+    await expect(page).toHaveURL(/#\/sessions\/[^/]+\/preview$/u);
+    await expect(page.getByRole("heading", { name: "Browser preview" })).toBeVisible();
+    await expect(page.locator(".surface-subheader").getByText("Ready", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "Recapture" }).click();
+    const snapshot = page.getByRole("img", { name: "Browser preview snapshot: Fixture preview" });
+    await expect(snapshot).toBeVisible();
+    await expect(snapshot).toHaveAttribute("src", /^blob:/u);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByRole("heading", { name: "Browser preview" })).toBeVisible();
+    const recaptureBox = await page.getByRole("button", { name: "Recapture" }).boundingBox();
+    expect(recaptureBox).not.toBeNull();
+    expect(recaptureBox!.height).toBeGreaterThanOrEqual(MIN_TOUCH_TARGET_PX);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+  } finally {
+    await previewWeb?.stop();
+    await previewFixture.stop();
   }
 });

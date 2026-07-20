@@ -3,8 +3,9 @@
 // Every knob is explicit — command verdicts, deferred round-trips, service
 // inspection results — so tests exercise the real controller/runtime code
 // paths with no mocking framework and no invented frames.
-import type { DesktopShellPort } from "@t4-code/client";
+import type { DesktopRuntimeController, DesktopShellPort } from "@t4-code/client";
 import { hostId, type WelcomeFrame } from "@t4-code/protocol";
+import { rendererServerEventFromFrame } from "@t4-code/protocol/desktop-ipc";
 import type {
   BootstrapResult,
   CommandRequest,
@@ -18,7 +19,8 @@ import type {
   DisconnectResult,
   PairRequest,
   PairResult,
-  RendererServerFrameEvent,
+  RendererServerEventEnvelope,
+  RendererServerFrame,
   RuntimeErrorEvent,
   ServiceActionResult,
   ServiceInspection,
@@ -32,6 +34,11 @@ import type {
   TerminalResizeRequest,
   TerminalResult,
 } from "@t4-code/protocol/desktop-ipc";
+
+interface TestServerFrameEnvelope {
+  readonly targetId: string;
+  readonly frame: RendererServerFrame;
+}
 
 export interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -96,6 +103,7 @@ export class FakeShell implements DesktopShellPort {
   readonly commands: CommandRequest[] = [];
   readonly confirms: ConfirmRequest[] = [];
   commandBehavior: CommandBehavior = { kind: "accept" };
+  commandResult: ((request: CommandRequest) => unknown) | undefined;
   confirmBehavior: CommandBehavior = { kind: "accept" };
   bootstrapError: Error | null = null;
   bootstrapCalls = 0;
@@ -107,7 +115,7 @@ export class FakeShell implements DesktopShellPort {
   inspectionError: Error | null = null;
   serviceStartError: Error | null = null;
 
-  private readonly frames = new Set<(event: RendererServerFrameEvent) => void>();
+  private readonly serverEvents = new Set<(event: RendererServerEventEnvelope) => void>();
   private readonly states = new Set<(event: ConnectionStateEvent) => void>();
   private readonly errors = new Set<(event: RuntimeErrorEvent) => void>();
 
@@ -137,6 +145,7 @@ export class FakeShell implements DesktopShellPort {
     this.commands.push(request);
     const behavior = this.commandBehavior;
     const accepted = await this.settle(behavior, "command unreachable");
+    const result = accepted ? this.commandResult?.(request) : undefined;
     return {
       targetId: request.targetId,
       requestId: `req-${this.commands.length}`,
@@ -145,6 +154,7 @@ export class FakeShell implements DesktopShellPort {
       ...(behavior.kind === "reject" && behavior.error !== undefined
         ? { error: behavior.error }
         : {}),
+      ...(result === undefined ? {} : { result }),
       ...(request.intent.command === "prompt.lease.acquire" ? { leaseId: "prompt-lease-fixture" } : {}),
       ...(request.intent.command === "controller.lease.acquire"
         ? { leaseId: "controller-lease-fixture", expiresAt: "2999-01-01T00:00:00.000Z" }
@@ -195,9 +205,9 @@ export class FakeShell implements DesktopShellPort {
     return { completed: true };
   };
 
-  onServerFrame(listener: (event: RendererServerFrameEvent) => void): () => void {
-    this.frames.add(listener);
-    return () => this.frames.delete(listener);
+  onServerEvent(listener: (event: RendererServerEventEnvelope) => void): () => void {
+    this.serverEvents.add(listener);
+    return () => this.serverEvents.delete(listener);
   }
   onConnectionState(listener: (event: ConnectionStateEvent) => void): () => void {
     this.states.add(listener);
@@ -208,8 +218,12 @@ export class FakeShell implements DesktopShellPort {
     return () => this.errors.delete(listener);
   }
 
-  emitFrame(event: RendererServerFrameEvent): void {
-    for (const listener of this.frames) listener(event);
+  emitFrame(event: TestServerFrameEnvelope): void {
+    const envelope = {
+      targetId: event.targetId,
+      event: rendererServerEventFromFrame(event.frame),
+    };
+    for (const listener of this.serverEvents) listener(envelope);
   }
   emitState(event: ConnectionStateEvent): void {
     for (const listener of this.states) listener(event);
@@ -228,4 +242,28 @@ export class FakeShell implements DesktopShellPort {
     if (behavior.kind === "throw") throw new Error(throwMessage);
     return behavior.gate.promise;
   }
+}
+
+export function bindProjectionInventoryResults(
+  shell: FakeShell,
+  controller: DesktopRuntimeController,
+): void {
+  const fallback = shell.commandResult;
+  let sequence = 0;
+  shell.commandResult = (request) => {
+    if (request.intent.command !== "session.list" && request.intent.command !== "host.list") {
+      return fallback?.(request);
+    }
+    const requestedHost = String(request.intent.hostId);
+    const sessions = [...controller.getSnapshot().projection.sessionIndex.values()].filter(
+      (session) => String(session.hostId) === requestedHost,
+    );
+    sequence += 1;
+    return {
+      cursor: { epoch: "session-index-1", seq: sequence },
+      sessions,
+      totalCount: sessions.length,
+      truncated: false,
+    };
+  };
 }

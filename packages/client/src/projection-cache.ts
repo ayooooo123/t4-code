@@ -1,13 +1,5 @@
-import type {
-  AgentFrame,
-  AuditFrame,
-  ConfirmationChallenge,
-  Cursor,
-  DurableEntry,
-  FileFrame,
-  ReviewFrame,
-  SessionRef,
-} from "@t4-code/protocol";
+import type { Cursor, DurableEntry, SessionRef } from "@t4-code/protocol";
+import { MAX_PROJECTION_CACHE_BYTES } from "@t4-code/protocol/desktop-ipc";
 import { MAX_INDEXED_SESSION_REFS } from "./projection.ts";
 import type {
   AgentTranscriptProjection,
@@ -17,13 +9,17 @@ import type {
   SessionIndexMetadata,
   SessionProjection,
   TerminalProjection,
+  PreviewProjection,
+  PreviewAuthorityProjection,
+  PreviewEventProjection,
 } from "./projection.ts";
 import { ImmutableSet } from "./immutable-set.ts";
 import { ImmutableMap } from "./immutable-map.ts";
 import { retainedJsonBytes } from "./transcript-retention.ts";
+import { previewKey, type PreviewCaptureMetadata } from "./preview.ts";
 
-export const PROJECTION_CACHE_VERSION = 1 as const;
-export const MAX_PROJECTION_CACHE_BYTES = 2 * 1024 * 1024;
+export const PROJECTION_CACHE_VERSION = 2 as const;
+export { MAX_PROJECTION_CACHE_BYTES };
 export const MAX_PROJECTION_CACHE_SESSIONS = 8;
 const MAX_PROJECTION_CACHE_TRANSCRIPT_BYTES = Math.floor(MAX_PROJECTION_CACHE_BYTES * 0.75);
 
@@ -39,7 +35,7 @@ export interface ProjectionCacheStore {
 }
 export interface ProjectionCacheEnvelope {
   readonly kind: "t4-code-projection";
-  readonly version: 1;
+  readonly version: 1 | typeof PROJECTION_CACHE_VERSION;
   readonly savedAt: number;
   readonly data: ProjectionCacheData;
 }
@@ -54,19 +50,26 @@ interface ProjectionCacheData {
   readonly epoch?: string;
   readonly freshness: ProjectionFreshness;
 }
+type SessionMapValue<Key extends keyof SessionProjection> =
+  SessionProjection[Key] extends ReadonlyMap<string, infer Value> ? Value : never;
+type ProjectionAgentFrame = SessionMapValue<"agents">;
+type ProjectionFileFrame = SessionMapValue<"files">;
+type ProjectionReviewFrame = SessionMapValue<"reviews">;
+type ProjectionConfirmationFrame = SessionMapValue<"confirmations">;
+type ProjectionAuditFrame = SessionProjection["audit"][number];
 interface SessionProjectionData {
   readonly hostId: string;
   readonly sessionId: string;
   readonly ref?: SessionRef;
   readonly entries: readonly DurableEntry[];
   readonly events: readonly unknown[];
-  readonly agents: Array<[string, AgentFrame]>;
+  readonly agents: Array<[string, ProjectionAgentFrame]>;
   readonly agentTranscripts?: Array<[string, AgentTranscriptProjectionData]>;
   readonly terminals: Array<[string, TerminalProjection]>;
-  readonly files: Array<[string, FileFrame]>;
-  readonly reviews: Array<[string, ReviewFrame]>;
-  readonly audit: readonly AuditFrame[];
-  readonly confirmations: Array<[string, ConfirmationChallenge]>;
+  readonly files: Array<[string, ProjectionFileFrame]>;
+  readonly reviews: Array<[string, ProjectionReviewFrame]>;
+  readonly audit: readonly ProjectionAuditFrame[];
+  readonly confirmations: Array<[string, ProjectionConfirmationFrame]>;
   readonly results: Array<[string, ResultProjection]>;
   readonly revision?: string;
   readonly cursor?: Cursor;
@@ -74,6 +77,25 @@ interface SessionProjectionData {
   readonly freshness: ProjectionFreshness;
   readonly gap?: unknown;
   readonly historyTruncated?: boolean;
+  readonly previews?: Array<[string, PreviewProjectionData]>;
+  readonly previewEvents?: readonly PreviewEventProjection[];
+}
+interface PreviewProjectionData {
+  readonly hostId: string;
+  readonly sessionId: string;
+  readonly previewId: string;
+  readonly state?: PreviewProjection["state"];
+  readonly url?: string;
+  readonly revision: string;
+  readonly cursor: Cursor;
+  readonly title?: string;
+  readonly canGoBack?: boolean;
+  readonly canGoForward?: boolean;
+  readonly viewport?: { width: number; height: number; deviceScaleFactor?: number };
+  readonly capture?: PreviewCaptureMetadata;
+  readonly authority?: PreviewAuthorityProjection;
+  readonly availableActions?: PreviewProjection["availableActions"];
+  readonly error?: { code: string; message: string };
 }
 interface AgentTranscriptProjectionData {
   readonly entries: readonly DurableEntry[];
@@ -126,6 +148,45 @@ function cachedAgentTranscripts(
         : {}),
     },
   ]);
+}
+
+function cachedPreviewUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+function cachedPreviews(
+  previews: ReadonlyMap<string, PreviewProjection>,
+): Array<[string, PreviewProjectionData]> {
+  return [...previews.values()].slice(-32).map((preview) => {
+    const url = cachedPreviewUrl(preview.url);
+    return [
+      previewKey(preview),
+      {
+        hostId: preview.hostId,
+        sessionId: preview.sessionId,
+        previewId: preview.previewId,
+        ...(preview.state === undefined ? {} : { state: preview.state }),
+        ...(url === undefined ? {} : { url }),
+        revision: preview.revision,
+        cursor: { ...preview.cursor },
+        ...(preview.title === undefined ? {} : { title: preview.title }),
+        ...(preview.canGoBack === undefined ? {} : { canGoBack: preview.canGoBack }),
+        ...(preview.canGoForward === undefined ? {} : { canGoForward: preview.canGoForward }),
+        ...(preview.viewport === undefined ? {} : { viewport: { ...preview.viewport } }),
+        ...(preview.capture === undefined ? {} : { capture: { ...preview.capture } }),
+        ...(preview.authority === undefined ? {} : { authority: { ...preview.authority } }),
+        ...(preview.availableActions === undefined
+          ? {}
+          : { availableActions: [...preview.availableActions] }),
+        ...(preview.error === undefined ? {} : { error: { ...preview.error } }),
+      } satisfies PreviewProjectionData,
+    ];
+  });
 }
 
 function cachedEntries(
@@ -181,12 +242,16 @@ export function encodeProjectionCache(snapshot: ProjectionSnapshot, savedAt = Da
           terminals: arrayFromMap(value.terminals),
           files: arrayFromMap(value.files),
           reviews: arrayFromMap(value.reviews),
-          audit: value.audit.slice(-256).map((item) => safeJson(item) as AuditFrame),
+          audit: value.audit.slice(-256).map((item) => safeJson(item) as ProjectionAuditFrame),
           // Confirmation challenges are bound to one live connection on the
           // appserver. Persisting them makes a restarted client offer an approval
           // that the new connection can never consume.
           confirmations: [],
           results: arrayFromMap(value.results),
+          previews: cachedPreviews(value.previews),
+          previewEvents: value.previewEvents
+            .slice(-128)
+            .map((event) => safeJson(event) as PreviewEventProjection),
           ...(value.revision === undefined ? {} : { revision: value.revision }),
           ...(value.cursor === undefined ? {} : { cursor: value.cursor }),
           ...(value.epoch === undefined ? {} : { epoch: value.epoch }),
@@ -267,8 +332,249 @@ function asMap<T>(
   }
   return new ImmutableMap(map);
 }
+
+const PREVIEW_ACTIONS = [
+  "activate",
+  "navigate",
+  "back",
+  "forward",
+  "reload",
+  "close",
+  "capture",
+  "click",
+  "fill",
+  "type",
+  "press",
+  "scroll",
+  "select",
+  "upload",
+  "handoff",
+] as const;
+
+function restoredPreviewAuthority(value: unknown): PreviewAuthorityProjection | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    value.id.length > 128 ||
+    typeof value.label !== "string" ||
+    value.label.length > 256 ||
+    (value.kind !== "isolated-session" && value.kind !== "authenticated-profile") ||
+    typeof value.requiresExplicitOptIn !== "boolean"
+  )
+    throw new Error("invalid preview authority cache");
+  return Object.freeze({
+    id: value.id,
+    label: value.label,
+    kind: value.kind,
+    requiresExplicitOptIn: value.requiresExplicitOptIn,
+  });
+}
+
+function restoredPreviewActions(value: unknown): PreviewProjection["availableActions"] {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > PREVIEW_ACTIONS.length)
+    throw new Error("invalid preview actions cache");
+  if (
+    value.some((action) => typeof action !== "string" || !PREVIEW_ACTIONS.includes(action as never)) ||
+    new Set(value).size !== value.length
+  )
+    throw new Error("invalid preview actions cache");
+  return Object.freeze([...value]) as PreviewProjection["availableActions"];
+}
+
+function restoredPreviewEvents(value: unknown): readonly PreviewEventProjection[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value)) throw new Error("invalid preview event cache");
+  const events: PreviewEventProjection[] = [];
+  for (const raw of value.slice(-128)) {
+    if (
+      !isRecord(raw) ||
+      !["launch", "navigation", "capture", "error"].includes(String(raw.type)) ||
+      typeof raw.previewId !== "string" ||
+      raw.previewId.length === 0
+    )
+      throw new Error("invalid preview event cache");
+    const cursor = raw.cursor;
+    const url = raw.url;
+    const timestamp = raw.timestamp;
+    const captureId = raw.captureId;
+    const errorCode = raw.errorCode;
+    if (!isRecord(cursor)) throw new Error("invalid preview event cache");
+    const cursorEpoch = cursor.epoch;
+    const cursorSeq = cursor.seq;
+    if (
+      typeof cursorEpoch !== "string" ||
+      typeof cursorSeq !== "number" ||
+      !Number.isSafeInteger(cursorSeq) ||
+      cursorSeq < 0
+    )
+      throw new Error("invalid preview event cache");
+    let savedUrl: PreviewEventProjection["url"];
+    if (url !== undefined) {
+      if (!isRecord(url)) throw new Error("invalid preview event URL");
+      const origin = url.origin;
+      const pathname = url.pathname;
+      const hasQuery = url.hasQuery;
+      if (
+        typeof origin !== "string" ||
+        typeof pathname !== "string" ||
+        typeof hasQuery !== "boolean" ||
+        origin.length > 512 ||
+        pathname.length > 1024
+      )
+        throw new Error("invalid preview event URL");
+      savedUrl = Object.freeze({ origin, pathname, hasQuery });
+    }
+    if (
+      (timestamp !== undefined &&
+        (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp) || timestamp < 0)) ||
+      (captureId !== undefined && (typeof captureId !== "string" || captureId.length > 256)) ||
+      (errorCode !== undefined && (typeof errorCode !== "string" || errorCode.length > 256))
+    )
+      throw new Error("invalid preview event cache");
+    events.push(
+      Object.freeze({
+        type: raw.type as PreviewEventProjection["type"],
+        previewId: raw.previewId,
+        cursor: Object.freeze({ epoch: cursorEpoch, seq: cursorSeq }),
+        ...(savedUrl === undefined ? {} : { url: savedUrl }),
+        ...(timestamp === undefined ? {} : { timestamp }),
+        ...(captureId === undefined ? {} : { captureId }),
+        ...(errorCode === undefined ? {} : { errorCode }),
+      }),
+    );
+  }
+  return Object.freeze(events);
+}
 function identity<T extends Record<string, unknown>>(value: T): T {
   return Object.freeze(safeJson(value) as T);
+}
+function restoredPreviews(
+  value: unknown,
+  hostId: string,
+  sessionId: string,
+): ReadonlyMap<string, PreviewProjection> {
+  if (value === undefined) return new ImmutableMap<string, PreviewProjection>();
+  if (!Array.isArray(value)) throw new Error("invalid preview cache");
+  const previews = new Map<string, PreviewProjection>();
+  for (const pair of value.slice(-32)) {
+    if (
+      !Array.isArray(pair) ||
+      pair.length !== 2 ||
+      typeof pair[0] !== "string" ||
+      !isRecord(pair[1])
+    )
+      throw new Error("invalid preview cache entry");
+    const raw = pair[1];
+    const previewId = raw.previewId;
+    const revision = raw.revision;
+    const cursor = raw.cursor;
+    if (
+      raw.hostId !== hostId ||
+      raw.sessionId !== sessionId ||
+      typeof previewId !== "string" ||
+      typeof revision !== "string" ||
+      !isRecord(cursor)
+    )
+      throw new Error("invalid preview cache identity");
+    const cursorEpoch = cursor.epoch;
+    const cursorSeq = cursor.seq;
+    if (
+      typeof cursorEpoch !== "string" ||
+      typeof cursorSeq !== "number" ||
+      !Number.isSafeInteger(cursorSeq) ||
+      cursorSeq < 0
+    )
+      throw new Error("invalid preview cache identity");
+    const state = raw.state;
+    if (
+      state !== undefined &&
+      !["launching", "ready", "running", "stopped", "failed"].includes(String(state))
+    )
+      throw new Error("invalid preview cache state");
+    const url = raw.url;
+    if (url !== undefined && typeof url !== "string") throw new Error("invalid preview cache url");
+    const title = raw.title;
+    if (title !== undefined && typeof title !== "string") throw new Error("invalid preview cache title");
+    const canGoBack = raw.canGoBack;
+    const canGoForward = raw.canGoForward;
+    if (canGoBack !== undefined && typeof canGoBack !== "boolean")
+      throw new Error("invalid preview cache navigation");
+    if (canGoForward !== undefined && typeof canGoForward !== "boolean")
+      throw new Error("invalid preview cache navigation");
+    const viewport = raw.viewport;
+    if (
+      viewport !== undefined &&
+      (!isRecord(viewport) ||
+        typeof viewport.width !== "number" ||
+        !Number.isSafeInteger(viewport.width) ||
+        typeof viewport.height !== "number" ||
+        !Number.isSafeInteger(viewport.height) ||
+        viewport.width <= 0 ||
+        viewport.height <= 0 ||
+        viewport.width * viewport.height > 16 * 1024 * 1024 ||
+        (viewport.deviceScaleFactor !== undefined &&
+          (typeof viewport.deviceScaleFactor !== "number" ||
+            !Number.isFinite(viewport.deviceScaleFactor) ||
+            viewport.deviceScaleFactor <= 0 ||
+            viewport.deviceScaleFactor > 8)))
+    )
+      throw new Error("invalid preview cache viewport");
+    const capture = raw.capture;
+    if (
+      capture !== undefined &&
+      (!isRecord(capture) ||
+        typeof capture.captureId !== "string" ||
+        !["image/png", "image/jpeg", "image/webp"].includes(String(capture.mimeType)) ||
+        typeof capture.size !== "number" ||
+        !Number.isSafeInteger(capture.size) ||
+        capture.size <= 0 ||
+        capture.size > 8 * 1024 * 1024 ||
+        typeof capture.width !== "number" ||
+        !Number.isSafeInteger(capture.width) ||
+        typeof capture.height !== "number" ||
+        !Number.isSafeInteger(capture.height) ||
+        capture.width <= 0 ||
+        capture.height <= 0 ||
+        capture.width * capture.height > 16 * 1024 * 1024 ||
+        typeof capture.capturedAt !== "number" ||
+        !Number.isSafeInteger(capture.capturedAt) ||
+        capture.capturedAt < 0 ||
+        !/^[a-f0-9]{64}$/u.test(String(capture.sha256)))
+    )
+      throw new Error("invalid preview capture cache");
+    const error = raw.error;
+    if (
+      error !== undefined &&
+      (!isRecord(error) || typeof error.code !== "string" || typeof error.message !== "string")
+    )
+      throw new Error("invalid preview cache error");
+    const authority = restoredPreviewAuthority(raw.authority);
+    const availableActions = restoredPreviewActions(raw.availableActions);
+    const identity = { hostId, sessionId, previewId };
+    if (pair[0] !== previewKey(identity)) throw new Error("invalid preview cache key");
+    const cachedUrl = cachedPreviewUrl(url);
+    const restored = Object.freeze({
+      ...identity,
+      ...(state === undefined ? {} : { state }),
+      ...(cachedUrl === undefined ? {} : { url: cachedUrl }),
+      revision,
+      cursor: Object.freeze({ epoch: cursorEpoch, seq: cursorSeq }),
+      ...(title === undefined ? {} : { title }),
+      ...(canGoBack === undefined ? {} : { canGoBack }),
+      ...(canGoForward === undefined ? {} : { canGoForward }),
+      ...(viewport === undefined ? {} : { viewport: Object.freeze({ ...viewport }) }),
+      ...(capture === undefined ? {} : { capture: Object.freeze({ ...capture }) }),
+      ...(authority === undefined ? {} : { authority }),
+      ...(availableActions === undefined ? {} : { availableActions }),
+      ...(error === undefined ? {} : { error: Object.freeze({ ...error }) }),
+      freshness: "cached" as const,
+    }) as unknown as PreviewProjection;
+    previews.set(pair[0], restored);
+  }
+  return new ImmutableMap(previews);
 }
 function terminalValue(value: Record<string, unknown>): TerminalProjection {
   if (
@@ -285,23 +591,23 @@ function resultValue(value: Record<string, unknown>): ResultProjection {
     throw new Error("invalid result cache");
   return identity(value) as unknown as ResultProjection;
 }
-function fileValue(value: Record<string, unknown>): FileFrame {
+function fileValue(value: Record<string, unknown>): ProjectionFileFrame {
   if (typeof value.path !== "string") throw new Error("invalid file cache");
-  return identity(value) as unknown as FileFrame;
+  return identity(value) as unknown as ProjectionFileFrame;
 }
-function reviewValue(value: Record<string, unknown>): ReviewFrame {
+function reviewValue(value: Record<string, unknown>): ProjectionReviewFrame {
   if (
     typeof value.reviewId !== "string" ||
     typeof value.status !== "string" ||
     !Array.isArray(value.findings)
   )
     throw new Error("invalid review cache");
-  return identity(value) as unknown as ReviewFrame;
+  return identity(value) as unknown as ProjectionReviewFrame;
 }
-function agentValue(value: Record<string, unknown>): AgentFrame {
+function agentValue(value: Record<string, unknown>): ProjectionAgentFrame {
   if (typeof value.agentId !== "string" || typeof value.state !== "string")
     throw new Error("invalid agent cache");
-  return identity(value) as unknown as AgentFrame;
+  return identity(value) as unknown as ProjectionAgentFrame;
 }
 function transcriptValue(value: Record<string, unknown>): AgentTranscriptProjection {
   if (
@@ -375,7 +681,7 @@ function restoreSession(value: unknown): SessionProjection | undefined {
         .map((event) => safeJson(event) as SessionProjection["events"][number])
     : [];
   const audit = Array.isArray(value.audit)
-    ? value.audit.slice(-256).map((item) => safeJson(item) as AuditFrame)
+    ? value.audit.slice(-256).map((item) => safeJson(item) as ProjectionAuditFrame)
     : [];
   const ref = isRecord(value.ref) ? restoredSessionRef(value.ref) : undefined;
   return Object.freeze({
@@ -384,19 +690,21 @@ function restoreSession(value: unknown): SessionProjection | undefined {
     ...(ref === undefined ? {} : { ref }),
     entries: Object.freeze(entries),
     events: Object.freeze(events),
-    agents: asMap<AgentFrame>(value.agents, agentValue),
+    agents: asMap<ProjectionAgentFrame>(value.agents, agentValue),
     agentTranscripts:
       value.agentTranscripts === undefined
         ? new ImmutableMap<string, AgentTranscriptProjection>()
         : asMap<AgentTranscriptProjection>(value.agentTranscripts, transcriptValue),
     terminals: asMap<TerminalProjection>(value.terminals, terminalValue),
-    files: asMap<FileFrame>(value.files, fileValue),
-    reviews: asMap<ReviewFrame>(value.reviews, reviewValue),
+    files: asMap<ProjectionFileFrame>(value.files, fileValue),
+    reviews: asMap<ProjectionReviewFrame>(value.reviews, reviewValue),
     audit: Object.freeze(audit),
     // Never revive a connection-bound challenge, including from an older cache
     // written before challenges were excluded from persistence.
-    confirmations: new ImmutableMap<string, ConfirmationChallenge>(),
+    confirmations: new ImmutableMap<string, ProjectionConfirmationFrame>(),
     results: asMap<ResultProjection>(value.results, resultValue),
+    previews: restoredPreviews(value.previews, value.hostId, value.sessionId),
+    previewEvents: restoredPreviewEvents(value.previewEvents),
     entryIds: new ImmutableSet(entries.map((entry) => String(entry.id))),
     ...(typeof value.revision === "string" &&
     value.revision.length > 0 &&
@@ -437,7 +745,7 @@ export function decodeProjectionCache(
   if (
     !isRecord(parsed) ||
     parsed.kind !== "t4-code-projection" ||
-    parsed.version !== PROJECTION_CACHE_VERSION ||
+    (parsed.version !== 1 && parsed.version !== PROJECTION_CACHE_VERSION) ||
     !isRecord(parsed.data)
   )
     throw new Error("unsupported projection cache");

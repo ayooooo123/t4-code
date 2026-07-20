@@ -17,8 +17,8 @@ function minutesAgo(minutes: number): string {
 
 export const SHELL_FIXTURE: ShellFixture = {
   hosts: [
-    { id: "host-local", name: "This machine", kind: "local" },
-    { id: "host-remote", name: "dev-server", kind: "remote" },
+    { id: "host-local", runtimeKind: "omp", name: "This machine", kind: "local" },
+    { id: "host-remote", runtimeKind: "omp", name: "dev-server", kind: "remote" },
   ],
   projects: [
     { id: "proj-omp", name: "oh-my-pi", path: "~/dev/oh-my-pi", hostId: "host-local" },
@@ -42,6 +42,7 @@ export const SHELL_FIXTURE: ShellFixture = {
       title: "Trace duplicate stream frames after reconnect",
       model: "fable-5",
       status: "working",
+      lifecycle: "active",
       freshness: "live",
       pendingApprovals: 0,
       latestTurnCompletedAt: minutesAgo(14),
@@ -55,6 +56,7 @@ export const SHELL_FIXTURE: ShellFixture = {
       title: "Migrate settings store to schema v3",
       model: "fable-5",
       status: "pendingApproval",
+      lifecycle: "active",
       freshness: "live",
       pendingApprovals: 2,
       latestTurnCompletedAt: minutesAgo(6),
@@ -68,6 +70,7 @@ export const SHELL_FIXTURE: ShellFixture = {
       title: "Split renderer bundle for faster cold start",
       model: "kimi-k2.7",
       status: "planReady",
+      lifecycle: "active",
       freshness: "live",
       pendingApprovals: 0,
       latestTurnCompletedAt: minutesAgo(25),
@@ -81,6 +84,7 @@ export const SHELL_FIXTURE: ShellFixture = {
       title: "Pin protocol fixtures for desktop CI",
       model: "fable-5",
       status: "awaitingInput",
+      lifecycle: "active",
       freshness: "live",
       pendingApprovals: 0,
       latestTurnCompletedAt: minutesAgo(9),

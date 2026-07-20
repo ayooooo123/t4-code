@@ -16,14 +16,18 @@ import {
 import { UpdateSettingsPanel } from "../updates/UpdateSettingsPanel.tsx";
 import { useAppUpdateState } from "../updates/update-store.ts";
 import { AccentRow } from "./AccentRow.tsx";
+import { CatalogExplorerBlock } from "./CatalogExplorerBlock.tsx";
+import type { CatalogExplorerInput } from "./settings-presentation.ts";
 import { FIELD_CLASS } from "./controls.tsx";
 import { BrokerStatusLine, HostSelector, type BrokerStatusAction, type HostSelection } from "./HostSelector.tsx";
 import { buildDiagnosticsExport } from "./diagnostics.ts";
 import { railFocusTarget, type RailKey } from "./keyboard.ts";
 import type { AgentCatalog, ModelChoice } from "./live-catalog.ts";
 import { CYCLE_SETTING_ID, ModelRolesBlock, ROLES_SETTING_ID } from "./ModelRolesBlock.tsx";
+import { listValue, recordValue } from "./roles-model.ts";
 import type { EditableScope } from "./schema.ts";
 import { EDITABLE_SCOPES } from "./schema.ts";
+import { modelRoutingSearchText, NO_ROLE_TAGS, type RoleTags } from "./settings-presentation.ts";
 import type { SettingsStoreApi } from "./settings-store.ts";
 import { useSettings } from "./settings-store.ts";
 import { SettingRowView } from "./SettingRow.tsx";
@@ -45,6 +49,35 @@ interface SettingsRailEntry {
   readonly label: string;
 }
 
+export interface SettingsRailGroup {
+  readonly id: string;
+  readonly label: string;
+  readonly sections: readonly SettingsRailEntry[];
+}
+
+const SETTINGS_RAIL_GROUPS = [
+  {
+    id: "personal",
+    label: "Personal",
+    sectionIds: ["general", "appearance", "interaction", "keybindings", "notifications", "speech"],
+  },
+  {
+    id: "intelligence",
+    label: "AI & agents",
+    sectionIds: ["model", "models", "providers", "roles", "context", "tasks", "agents", "memory"],
+  },
+  {
+    id: "tools",
+    label: "Tools",
+    sectionIds: ["files", "shell", "tools", "browser", "terminal"],
+  },
+  {
+    id: "integrations",
+    label: "Integrations",
+    sectionIds: ["mcp", "extensions", "remote-hosts"],
+  },
+] as const;
+
 export function buildSettingsRailSections(sections: readonly SettingsSection[]): readonly SettingsRailEntry[] {
   const entries = sections.map(({ id, label }) => ({ id, label }));
   const diagnostics = entries.findIndex((section) => section.id === "diagnostics");
@@ -54,6 +87,43 @@ export function buildSettingsRailSections(sections: readonly SettingsSection[]):
     { id: UPDATE_SECTION_ID, label: "Updates" },
     ...entries.slice(index),
   ];
+}
+
+export function buildSettingsRailGroups(
+  sections: readonly SettingsSection[],
+): readonly SettingsRailGroup[] {
+  return groupSettingsRailEntries(buildSettingsRailSections(sections));
+}
+
+function groupSettingsRailEntries(
+  entries: readonly SettingsRailEntry[],
+): readonly SettingsRailGroup[] {
+  const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+  const used = new Set<string>();
+  const groups: SettingsRailGroup[] = [];
+
+  for (const definition of SETTINGS_RAIL_GROUPS) {
+    const grouped = definition.sectionIds.flatMap((id) => {
+      const entry = entryById.get(id);
+      if (entry === undefined) return [];
+      used.add(id);
+      return [entry];
+    });
+    if (grouped.length > 0) {
+      groups.push({ id: definition.id, label: definition.label, sections: grouped });
+    }
+  }
+
+  const systemIds = new Set([UPDATE_SECTION_ID, "diagnostics"]);
+  const hostSections = entries.filter((entry) => !used.has(entry.id) && !systemIds.has(entry.id));
+  if (hostSections.length > 0) {
+    groups.push({ id: "host", label: "Host settings", sections: hostSections });
+  }
+  const systemSections = entries.filter((entry) => systemIds.has(entry.id));
+  if (systemSections.length > 0) {
+    groups.push({ id: "system", label: "System", sections: systemSections });
+  }
+  return groups;
 }
 
 function ScopeTabs({
@@ -108,6 +178,8 @@ function SectionRail({
 }) {
   const drafts = useSettings(api, (state) => state.drafts);
   const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+  const groups = useMemo(() => groupSettingsRailEntries(sections), [sections]);
+  const orderedSections = groups.flatMap((group) => group.sections);
 
   const dirtyBySection = useMemo(() => {
     const counts = new Map<string, number>();
@@ -120,9 +192,14 @@ function SectionRail({
   }, [api, drafts]);
 
   return (
-    <nav aria-label="Settings sections" className="flex w-52 shrink-0 flex-col overflow-y-auto border-border border-e py-2">
-      <ul className="flex flex-col gap-px px-2">
-        {sections.map((section) => {
+    <nav aria-label="Settings sections" className="flex w-56 shrink-0 flex-col overflow-y-auto border-border border-e bg-(--sidebar-background)/40 px-2 py-3">
+      {groups.map((group, groupIndex) => (
+        <div className={cn(groupIndex > 0 && "mt-3")} key={group.id}>
+          <p className="px-2.5 pb-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+            {group.label}
+          </p>
+          <ul className="flex flex-col gap-px">
+            {group.sections.map((section) => {
           const active = section.id === activeSectionId;
           const dimmed = matchedIds !== null && !matchedIds.has(section.id);
           const dirtyCount = dirtyBySection.get(section.id) ?? 0;
@@ -148,7 +225,7 @@ function SectionRail({
                     return;
                   }
                   const target = railFocusTarget(
-                    sections.map((entry) => entry.id),
+                    orderedSections.map((entry) => entry.id),
                     section.id,
                     event.key as RailKey,
                   );
@@ -179,8 +256,10 @@ function SectionRail({
               </button>
             </li>
           );
-        })}
-      </ul>
+            })}
+          </ul>
+        </div>
+      ))}
     </nav>
   );
 }
@@ -201,7 +280,7 @@ function SectionRows({
   const rows = section.rows.filter((row) => !hiddenIds.has(row.id));
   if (rows.length === 0) return null;
   return (
-    <div className="divide-y divide-border rounded-lg border border-border bg-card">
+    <div className="divide-y divide-border rounded-xl border border-border bg-card">
       {rows.map((row) =>
         row.control.kind === "nested" ? (
           <div key={row.id}>
@@ -283,6 +362,8 @@ export interface RestartAction {
 export interface SettingsCatalogChoices {
   readonly models: readonly ModelChoice[];
   readonly agents: AgentCatalog;
+  /** Role names/colors from the host's `modelTags` setting. */
+  readonly roleTags?: RoleTags;
 }
 
 const NO_CHOICES: SettingsCatalogChoices = { models: [], agents: { agents: [], unavailableReason: null } };
@@ -296,6 +377,7 @@ export function SettingsWorkspace({
   scopes = EDITABLE_SCOPES,
   restartAction,
   catalogChoices = NO_CHOICES,
+  catalogExplorer,
   hostSelection,
   brokerStatus,
 }: {
@@ -310,6 +392,8 @@ export function SettingsWorkspace({
   readonly restartAction?: RestartAction;
   /** Models and agents the host advertises, for the roles/agents editors. */
   readonly catalogChoices?: SettingsCatalogChoices;
+  /** The active host's read-only capability catalog. */
+  readonly catalogExplorer?: CatalogExplorerInput;
   /** Connected hosts to switch between; the shell owns the selection. */
   readonly hostSelection?: HostSelection;
   /** The active host's account-broker status, when the shell tracks it. */
@@ -338,13 +422,34 @@ export function SettingsWorkspace({
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   const searching = query.trim().length > 0;
-  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const normalizedQuery = query.trim().toLowerCase();
   const updateMatches =
     searching &&
     "updates version release download install restart".includes(normalizedQuery);
+  const roleTags = catalogChoices.roleTags ?? NO_ROLE_TAGS;
+  // The specialized editors show friendly names beside the raw values, so
+  // search must hit both spellings on the rows those editors own.
+  const routingSearch = useMemo(() => {
+    const rowValue = (id: string) => viewModel.rowsById.get(id)?.effective?.value;
+    const text = modelRoutingSearchText({
+      roles: recordValue(rowValue(ROLES_SETTING_ID)) ?? {},
+      cycle: listValue(rowValue(CYCLE_SETTING_ID)) ?? [],
+      overrides: recordValue(rowValue(OVERRIDES_SETTING_ID)) ?? {},
+      disabledAgents: listValue(rowValue(DISABLED_SETTING_ID)) ?? [],
+      models: catalogChoices.models,
+      agentNames: catalogChoices.agents.agents.map((agent) => agent.name),
+      tags: roleTags,
+    });
+    return new Map([
+      [ROLES_SETTING_ID, text.roles],
+      [CYCLE_SETTING_ID, text.cycle],
+      [OVERRIDES_SETTING_ID, text.overrides],
+      [DISABLED_SETTING_ID, text.disabled],
+    ]);
+  }, [viewModel, catalogChoices, roleTags]);
   const matchedSections = useMemo(
-    () => (searching ? filterSections(viewModel.sections, query) : null),
-    [searching, viewModel, query],
+    () => (searching ? filterSections(viewModel.sections, query, routingSearch) : null),
+    [searching, viewModel, query, routingSearch],
   );
   const matchedIds = useMemo(
     () =>
@@ -362,6 +467,7 @@ export function SettingsWorkspace({
   const shownUpdate = searching ? updateMatches : appSectionActive;
   const selectedSectionId = appSectionActive ? UPDATE_SECTION_ID : activeSectionId;
   const sectionsForRail = useMemo(() => buildSettingsRailSections(viewModel.sections), [viewModel.sections]);
+  const railGroups = useMemo(() => buildSettingsRailGroups(viewModel.sections), [viewModel.sections]);
 
   const dirtyCount = Object.keys(drafts).length;
   const errorCount = Object.keys(draftErrors).length;
@@ -522,24 +628,30 @@ export function SettingsWorkspace({
           )}
 
           <div className="min-h-0 flex-1 overflow-y-auto" ref={contentRef}>
-            <div className="mx-auto flex max-w-3xl flex-col gap-6 px-4 py-4">
+            <div className="mx-auto flex max-w-4xl flex-col gap-8 pt-6 pr-[max(1rem,var(--app-safe-area-right))] pb-[calc(1rem+var(--app-safe-area-bottom))] pl-[max(1rem,var(--app-safe-area-left))] max-sm:gap-6 max-sm:pt-4">
               {railOverlaid && (
                 <label className="flex flex-col gap-1">
-                  <span className="font-medium text-muted-foreground text-xs">Section</span>
+                  <span className="font-medium text-muted-foreground text-xs">Settings category</span>
                   <select
                     className={cn(FIELD_CLASS, "w-full")}
                     onChange={(event) => selectSection(event.target.value)}
                     value={selectedSectionId}
                   >
-                    {sectionsForRail.map((section) => (
-                      <option key={section.id} value={section.id}>
-                        {section.label}
-                        {section.id === UPDATE_SECTION_ID && updateIsAvailable(update.phase) ? " · Update available" : ""}
-                      </option>
+                    {railGroups.map((group) => (
+                      <optgroup key={group.id} label={group.label}>
+                        {group.sections.map((section) => (
+                          <option key={section.id} value={section.id}>
+                            {section.label}
+                            {section.id === UPDATE_SECTION_ID && updateIsAvailable(update.phase) ? " · Update available" : ""}
+                          </option>
+                        ))}
+                      </optgroup>
                     ))}
                   </select>
                 </label>
               )}
+
+              {catalogExplorer !== undefined && <CatalogExplorerBlock input={catalogExplorer} />}
 
               {searching && shownSections.length === 0 && !shownUpdate && (
                 <p className="py-8 text-center text-muted-foreground text-sm">
@@ -552,19 +664,19 @@ export function SettingsWorkspace({
 
               {shownSections.map((section) => (
                 <section aria-labelledby={`section-${section.id}`} key={section.id}>
-                  <div className="mb-2 flex flex-col gap-0.5">
+                  <div className="mb-4 flex flex-col gap-1">
                     <h2
-                      className="font-heading font-semibold text-foreground text-sm"
+                      className="font-heading font-semibold text-foreground text-xl tracking-tight"
                       id={`section-${section.id}`}
                       tabIndex={-1}
                     >
                       {section.label}
                     </h2>
-                    <p className="max-w-[70ch] text-muted-foreground text-xs">{section.summary}</p>
+                    <p className="max-w-[70ch] text-muted-foreground text-sm leading-relaxed">{section.summary}</p>
                   </div>
                   <SectionRows api={api} hiddenIds={hiddenIds} section={section} />
                   {section.id === rolesHome && (
-                    <ModelRolesBlock api={api} hostLabel={viewModel.hostLabel} models={catalogChoices.models} />
+                    <ModelRolesBlock api={api} hostLabel={viewModel.hostLabel} models={catalogChoices.models} roleTags={roleTags} />
                   )}
                   {section.id === tasksHome && (
                     <TaskAgentsBlock
@@ -590,7 +702,7 @@ export function SettingsWorkspace({
           </div>
 
           {(dirtyCount > 0 || saving) && (
-            <footer className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-border border-t bg-background px-4 py-2">
+            <footer className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-border border-t bg-background pt-2 pr-[max(1rem,var(--app-safe-area-right))] pb-[calc(0.5rem+var(--app-safe-area-bottom))] pl-[max(1rem,var(--app-safe-area-left))]">
               <p className="text-sm">
                 {dirtyCount === 1 ? "1 unsaved change" : `${dirtyCount} unsaved changes`}
                 {errorCount > 0 && (

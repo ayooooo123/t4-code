@@ -12,6 +12,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 
 import { workspaceStore } from "../../state/store-instance.ts";
 import { selectSessionView } from "../../state/workspace-store.ts";
+import type { TranscriptHistoryPageState } from "../session-runtime/controller.ts";
 import type { TranscriptImageSource } from "../session-runtime/transcript-images.ts";
 import type { ToolRenderHost } from "./tool-render/types.ts";
 import { createAnchoredToggle, DisclosureAnchorContext } from "./disclosure-anchor.tsx";
@@ -51,6 +52,8 @@ export interface TranscriptTimelineProps {
   readonly nowMs: number;
   readonly imageSource: TranscriptImageSource;
   readonly toolHost?: ToolRenderHost | undefined;
+  readonly history?: TranscriptHistoryPageState | undefined;
+  readonly onLoadEarlier?: (() => Promise<void>) | undefined;
 }
 
 export const TranscriptTimeline = memo(function TranscriptTimeline({
@@ -61,6 +64,8 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
   nowMs,
   imageSource,
   toolHost,
+  history,
+  onLoadEarlier,
 }: TranscriptTimelineProps) {
   const listRef = useRef<LegendListRef | null>(null);
   // null anchor = the user was following the tail when they left. Read the
@@ -77,6 +82,7 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
   // never read as streamed output, and it never re-pins the view.
   const [disclosureActive, setDisclosureActive] = useState(false);
   const following = atEnd && !disclosureActive;
+  const [listMounted, setListMounted] = useState(false);
 
   // Synchronous mirrors for the pre-paint pin: scroll events and disclosure
   // begin/settle update these in the same task, so a ResizeObserver callback
@@ -167,13 +173,15 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
   );
 
   // New output while scrolled away raises the pill.
-  const lastRowCountRef = useRef(rows.length);
+  const lastTailIdRef = useRef(rows.at(-1)?.id);
   useEffect(() => {
-    if (rows.length !== lastRowCountRef.current) {
-      lastRowCountRef.current = rows.length;
-      if (!following) setNewOutputPending(true);
+    const nextTailId = rows.at(-1)?.id;
+    if (nextTailId !== lastTailIdRef.current) {
+      const hadTail = lastTailIdRef.current !== undefined;
+      lastTailIdRef.current = nextTailId;
+      if (hadTail && nextTailId !== undefined && !following) setNewOutputPending(true);
     }
-  }, [rows.length, following]);
+  }, [rows, following]);
 
   // Follow pins at the TRUE max on every painted frame, not eventually:
   // 1. React-commit growth (streamed rows, composer/footer resize) pins in
@@ -186,14 +194,14 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
   // `rows` identity matters: streamed text grows within a row without
   // changing the count.
   useLayoutEffect(() => {
-    if (!following) return;
+    if (!listMounted || !following) return;
     pinToEnd();
     const frame = requestAnimationFrame(pinToEnd);
     return () => cancelAnimationFrame(frame);
-  }, [following, rows, bottomInset, pinToEnd]);
+  }, [following, listMounted, rows, bottomInset, pinToEnd]);
 
   useEffect(() => {
-    if (!following) return;
+    if (!listMounted || !following) return;
     const scroller = locateScroller();
     if (scroller === null) return;
     const observer = new ResizeObserver(pinToEnd);
@@ -201,7 +209,7 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
     const content = scroller.firstElementChild;
     if (content !== null) observer.observe(content);
     return () => observer.disconnect();
-  }, [following, locateScroller, pinToEnd]);
+  }, [following, listMounted, locateScroller, pinToEnd]);
 
   const renderItem = useCallback(
     ({ item }: { item: TranscriptRow }) => (
@@ -230,19 +238,53 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
     void listRef.current?.scrollToEnd({ animated: !window.matchMedia("(prefers-reduced-motion: reduce)").matches });
   }, []);
 
-  // Cold-mount mask: LegendList lays rows out a few frames after mount, so
-  // a hard refresh briefly shows the shell over an empty transcript. Until
-  // the list reports real content, an exact warm overlay renders the tail
-  // rows bottom-aligned with the same measure, padding, and composer inset.
+  const listHeader = useMemo(() => {
+    if (history === undefined || history.phase === "unsupported") return LIST_HEADER;
+    if (!history.hasMore && history.phase !== "loading" && history.phase !== "error") return LIST_HEADER;
+    return (
+      <div className="flex min-h-12 items-center justify-center px-4 py-2">
+        <Button
+          disabled={history.phase === "loading"}
+          onClick={() => void onLoadEarlier?.()}
+          size="xs"
+          variant="outline"
+        >
+          {history.phase === "loading"
+            ? "Loading earlier messages…"
+            : history.phase === "error"
+              ? "Retry earlier messages"
+              : "Load earlier messages"}
+        </Button>
+        {history.error !== null && (
+          <span className="ml-2 max-w-sm text-muted-foreground text-xs">{history.error}</span>
+        )}
+      </div>
+    );
+  }, [history, onLoadEarlier]);
+
+  // Cold-mount mask: commit the exact warm tail before mounting LegendList.
+  // Rendering the hidden virtual list and its duplicate warm rows in the
+  // same first commit made a 10k session click wait on work the user could
+  // not see. The next animation frame mounts the measured list behind the
+  // already-visible copy, preserving the no-flicker contract while letting
+  // the transcript shell and warm tail paint first.
   // The measured list stays visibility:hidden during that handoff: both trees
   // may exist for layout, but only one transcript copy can ever paint. The
   // reveal atomically removes the overlay and restores the real list. Sessions
   // restored to a mid-scroll anchor mask with the plain transcript background
   // instead (never wrong content). Removal is layout-driven (rAF poll of the
   // list's content), not a timer.
-  const REVEAL_STABILITY_FRAMES = 8;
+  // Readiness already requires stable content geometry, correct tail alignment,
+  // and a row inside the viewport. Four consecutive ready frames absorb one
+  // delayed list remeasure without holding the warm copy for eight display cycles.
+  const REVEAL_STABILITY_FRAMES = 4;
   const [coldMount, setColdMount] = useState(true);
   useEffect(() => {
+    const frame = requestAnimationFrame(() => setListMounted(true));
+    return () => cancelAnimationFrame(frame);
+  }, []);
+  useEffect(() => {
+    if (!listMounted) return;
     let frame = 0;
     let stableFrames = 0;
     let previousHeight = -1;
@@ -284,7 +326,7 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
     };
     frame = requestAnimationFrame(check);
     return () => cancelAnimationFrame(frame);
-  }, [locateScroller, rows.length]);
+  }, [listMounted, locateScroller, rows.length]);
   useLayoutEffect(() => {
     if (!coldMount) skipPendingNavigationTransition();
   }, [coldMount, rows.length, locateScroller]);
@@ -293,31 +335,33 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
   return (
     <div className="relative h-full min-h-0" ref={containerRef}>
       <DisclosureAnchorContext.Provider value={anchorController}>
-      <LegendList<TranscriptRow>
-        className={cn(
-          "h-full min-h-0 overflow-x-hidden overscroll-y-contain [overflow-anchor:none]",
-          coldMount && "invisible",
+        {listMounted && (
+          <LegendList<TranscriptRow>
+            className={cn(
+              "h-full min-h-0 overflow-x-hidden overscroll-y-contain [overflow-anchor:none]",
+              coldMount && "invisible",
+            )}
+            data={rows as TranscriptRow[]}
+            estimatedItemSize={72}
+            getItemType={getItemType}
+            keyExtractor={keyExtractor}
+            // The composer dock floats over the list, so its measured height is
+            // real scrollable content (a footer spacer), not an inset hint: the
+            // scroll max then includes it, follow/scrollToEnd settle at the true
+            // max, and the last row rests a full gap above the composer at every
+            // viewport size.
+            ListFooterComponent={<div style={{ height: bottomInset }} />}
+            ListHeaderComponent={listHeader}
+            maintainScrollAtEnd={maintainScrollAtEnd}
+            maintainVisibleContentPosition={{ data: true, size: false }}
+            onScroll={handleScroll}
+            ref={listRef}
+            renderItem={renderItem}
+            {...(initialAnchorRef.current === null
+              ? { initialScrollAtEnd: true }
+              : { initialScrollOffset: initialAnchorRef.current })}
+          />
         )}
-        data={rows as TranscriptRow[]}
-        estimatedItemSize={72}
-        getItemType={getItemType}
-        keyExtractor={keyExtractor}
-        // The composer dock floats over the list, so its measured height is
-        // real scrollable content (a footer spacer), not an inset hint: the
-        // scroll max then includes it, follow/scrollToEnd settle at the true
-        // max, and the last row rests a full gap above the composer at every
-        // viewport size.
-        ListFooterComponent={<div style={{ height: bottomInset }} />}
-        ListHeaderComponent={LIST_HEADER}
-        maintainScrollAtEnd={maintainScrollAtEnd}
-        maintainVisibleContentPosition={{ data: true, size: false }}
-        onScroll={handleScroll}
-        ref={listRef}
-        renderItem={renderItem}
-        {...(initialAnchorRef.current === null
-          ? { initialScrollAtEnd: true }
-          : { initialScrollOffset: initialAnchorRef.current })}
-      />
       </DisclosureAnchorContext.Provider>
       {(newOutputPending || (!following && streaming)) && (
         <div
@@ -357,6 +401,7 @@ export const TranscriptTimeline = memo(function TranscriptTimeline({
                   key={row.id}
                 >
                   <TranscriptRowContent
+                    ghost
                     imageSource={imageSource}
                     nowMs={nowMs}
                     row={row}

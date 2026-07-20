@@ -9,6 +9,7 @@ target/
 dist/
 dist-electron/
 /release/
+/.artifacts/
 .vite-plus/
 *.tsbuildinfo
 /.worktrees/
@@ -17,6 +18,9 @@ dist-electron/
 !.env.example
 
 # Test and runtime output
+/artifacts/legacy-bridge-continuity/
+/.continuity/
+/evidence/wire/
 coverage/
 playwright-report/
 test-results/

@@ -15,6 +15,7 @@ import {
   upsertAgent,
 } from "./agent-tree.ts";
 import { appendActivity } from "./activity-log.ts";
+import { isSafeRelativePath } from "./live-projection.ts";
 import {
   ALL_ACTIONS_AVAILABLE,
   type ActivityEntry,
@@ -25,11 +26,29 @@ import {
   type FileTreeNode,
   type InspectorActionAvailability,
   type ReviewComment,
+  type ReviewApplyState,
   type ReviewFile,
   type ShellInventoryRow,
 } from "./model.ts";
 
 export type FileChildren = readonly FileTreeNode[] | "loading" | "error";
+
+export type FileDraftStatus = "clean" | "dirty" | "saving" | "conflict" | "error";
+
+export interface FileDraft {
+  readonly path: string;
+  readonly originalText: string;
+  readonly baseRevision: string | null;
+  readonly text: string;
+  readonly status: FileDraftStatus;
+  readonly message: string | null;
+}
+
+export interface PendingTurnReviewAction {
+  readonly turnId: string;
+  readonly path: string;
+  readonly action: "apply" | "discard";
+}
 
 export interface ReviewViewState {
   readonly files: readonly ReviewFile[];
@@ -38,6 +57,15 @@ export interface ReviewViewState {
   readonly view: "unified" | "split";
   readonly wrap: boolean;
   readonly viewedByPath: Readonly<Record<string, boolean>>;
+  /** Pushed ReviewFrame remains the legacy source; turn reads are explicit. */
+  readonly source?: "legacy" | "turn" | null;
+  readonly turnId?: string | null;
+  readonly loading?: boolean;
+  readonly error?: string | null;
+  /** Worktree tree revision used to serialize turn-scoped decisions. */
+  readonly revision?: string | null;
+  /** At most one turn decision may be in flight for this inspector. */
+  readonly pendingAction?: PendingTurnReviewAction | null;
   /** Line the comment composer is open on, if any. */
   readonly draftAnchor: { readonly line: number; readonly side: "old" | "new" } | null;
 }
@@ -47,7 +75,9 @@ export interface FilesViewState {
   readonly expanded: Readonly<Record<string, boolean>>;
   readonly selectedPath: string | null;
   readonly preview: FilePreview | "loading" | null;
+  readonly previewRevision: string | null;
   readonly query: string;
+  readonly draftsByPath: Readonly<Record<string, FileDraft>>;
   /** Host unreachable: the tree stays, previews degrade to offline. */
   readonly offline: boolean;
 }
@@ -95,11 +125,18 @@ export interface InspectorActions {
   closeCommentDraft(): void;
   addComment(path: string, line: number, side: "old" | "new", text: string): void;
   removeComment(commentId: string): void;
+  loadTurnReview(turnId: string): void;
   applyReviewFile(path: string): void;
   discardReviewFile(path: string): void;
   setFilesQuery(query: string): void;
   setFileExpanded(path: string, expanded: boolean): void;
+  /** Lazy-load a directory listing without touching tree expansion. */
+  requestDir(path: string): void;
   selectFile(path: string | null): void;
+  startFileEdit(path: string): void;
+  updateFileDraft(path: string, text: string): void;
+  saveFile(path: string): void;
+  discardFileDraft(path: string): void;
 }
 
 export type InspectorStore = InspectorState & InspectorActions;
@@ -114,12 +151,16 @@ export interface InspectorController {
   readonly kind: "fixture" | "desktop";
   /** Scoped agent control (steer/cancel/wake) after explicit confirmation. */
   performControl(scope: AgentControlScope): void;
+  /** Explicitly fetches one durable turn review snapshot. */
+  loadTurnReview?(turnId: string): void;
   /** Review apply/discard for one file after explicit confirmation. */
   performReview(action: "apply" | "discard", path: string): void;
   /** Lazy directory listing; resolves through `resolveDir`. */
   loadDir(path: string): void;
   /** File preview fetch; resolves through `resolvePreview`. */
   loadPreview(path: string): void;
+  /** Full-file write, gated by the authority revision that produced the draft. */
+  writeFile?(path: string, content: string, baseRevision: string | null): void;
 }
 
 const INITIAL_REVIEW: ReviewViewState = {
@@ -129,6 +170,12 @@ const INITIAL_REVIEW: ReviewViewState = {
   view: "unified",
   wrap: false,
   viewedByPath: {},
+  source: null,
+  turnId: null,
+  loading: false,
+  error: null,
+  revision: null,
+  pendingAction: null,
   draftAnchor: null,
 };
 
@@ -137,9 +184,15 @@ const INITIAL_FILES: FilesViewState = {
   expanded: {},
   selectedPath: null,
   preview: null,
+  previewRevision: null,
+  draftsByPath: {},
   query: "",
   offline: false,
 };
+
+function isLoadableDirectoryPath(path: string): boolean {
+  return path === "" || isSafeRelativePath(path);
+}
 
 export interface CreateInspectorStoreOptions {
   readonly sampleMode: boolean;
@@ -218,8 +271,7 @@ export function createInspectorStore(options: CreateInspectorStoreOptions): Insp
       })),
     openCommentDraft: (line, side) =>
       set((state) => ({ review: { ...state.review, draftAnchor: { line, side } } })),
-    closeCommentDraft: () =>
-      set((state) => ({ review: { ...state.review, draftAnchor: null } })),
+    closeCommentDraft: () => set((state) => ({ review: { ...state.review, draftAnchor: null } })),
     addComment: (path, line, side, text) => {
       const trimmed = text.trim();
       if (trimmed.length === 0) return;
@@ -247,10 +299,27 @@ export function createInspectorStore(options: CreateInspectorStoreOptions): Insp
           comments: state.review.comments.filter((comment) => comment.id !== commentId),
         },
       })),
+    loadTurnReview: (turnId) => {
+      if (turnId.length === 0) return;
+      set((state) => ({
+        review: {
+          ...state.review,
+          source: "turn",
+          turnId,
+          loading: true,
+          error: null,
+          revision: null,
+          pendingAction: null,
+          selectedPath: null,
+        },
+      }));
+      controller?.loadTurnReview?.(turnId);
+    },
     applyReviewFile: (path) => controller?.performReview("apply", path),
     discardReviewFile: (path) => controller?.performReview("discard", path),
     setFilesQuery: (query) => set((state) => ({ files: { ...state.files, query } })),
     setFileExpanded: (path, expanded) => {
+      if (!isLoadableDirectoryPath(path)) return;
       set((state) => ({
         files: {
           ...state.files,
@@ -268,15 +337,100 @@ export function createInspectorStore(options: CreateInspectorStoreOptions): Insp
         controller?.loadDir(path);
       }
     },
+    requestDir: (path) => {
+      if (!isLoadableDirectoryPath(path)) return;
+      if (get().files.childrenByPath[path] !== undefined) return;
+      set((state) => ({
+        files: {
+          ...state.files,
+          childrenByPath: { ...state.files.childrenByPath, [path]: "loading" },
+        },
+      }));
+      controller?.loadDir(path);
+    },
     selectFile: (path) => {
-      set((state) => ({ files: { ...state.files, selectedPath: path } }));
-      if (path === null) {
-        set((state) => ({ files: { ...state.files, preview: null } }));
+      set((state) => ({
+        files: {
+          ...state.files,
+          selectedPath: path,
+          preview: path === null ? null : "loading",
+          previewRevision: null,
+        },
+      }));
+      if (path !== null) controller?.loadPreview(path);
+    },
+    startFileEdit: (path) =>
+      set((state) => {
+        if (state.files.draftsByPath[path] !== undefined) return state;
+        const preview = state.files.preview;
+        if (
+          state.files.selectedPath !== path ||
+          preview === null ||
+          preview === "loading" ||
+          preview.kind !== "code" ||
+          preview.path !== path ||
+          preview.truncated
+        )
+          return state;
+        const draft: FileDraft = {
+          path,
+          originalText: preview.text,
+          baseRevision: state.files.previewRevision,
+          text: preview.text,
+          status: "clean",
+          message: null,
+        };
+        return {
+          files: {
+            ...state.files,
+            draftsByPath: { ...state.files.draftsByPath, [path]: draft },
+          },
+        };
+      }),
+    updateFileDraft: (path, text) =>
+      set((state) => {
+        const draft = state.files.draftsByPath[path];
+        if (draft === undefined || draft.status === "saving") return state;
+        return {
+          files: {
+            ...state.files,
+            draftsByPath: {
+              ...state.files.draftsByPath,
+              [path]: {
+                ...draft,
+                text,
+                status: text === draft.originalText ? "clean" : "dirty",
+                message: null,
+              },
+            },
+          },
+        };
+      }),
+    saveFile: (path) => {
+      const draft = get().files.draftsByPath[path];
+      if (draft === undefined || draft.status !== "dirty") return;
+      set((state) => ({
+        files: {
+          ...state.files,
+          draftsByPath: {
+            ...state.files.draftsByPath,
+            [path]: { ...draft, status: "saving", message: null },
+          },
+        },
+      }));
+      if (controller?.writeFile === undefined) {
+        resolveFileWriteOutcome(store, path, "error");
         return;
       }
-      set((state) => ({ files: { ...state.files, preview: "loading" } }));
-      controller?.loadPreview(path);
+      controller.writeFile(path, draft.text, draft.baseRevision);
     },
+    discardFileDraft: (path) =>
+      set((state) => {
+        if (state.files.draftsByPath[path] === undefined) return state;
+        const draftsByPath = { ...state.files.draftsByPath };
+        delete draftsByPath[path];
+        return { files: { ...state.files, draftsByPath } };
+      }),
   }));
 
   controller = options.controller(store);
@@ -297,12 +451,121 @@ export function resolveDir(
   }));
 }
 
-export function resolvePreview(api: InspectorStoreApi, preview: FilePreview): void {
-  api.setState((state) =>
-    state.files.selectedPath === preview.path
-      ? { files: { ...state.files, preview } }
-      : state,
-  );
+export function resolvePreview(
+  api: InspectorStoreApi,
+  preview: FilePreview,
+  baseRevision: string | null = null,
+): void {
+  api.setState((state) => {
+    if (state.files.selectedPath !== preview.path) return state;
+    const draft = state.files.draftsByPath[preview.path];
+    const files = { ...state.files, preview, previewRevision: baseRevision };
+    if (draft === undefined) return { files };
+    if (preview.kind !== "code") {
+      const shouldConflict = draft.status === "dirty" || draft.status === "saving";
+      return {
+        files: {
+          ...files,
+          ...(shouldConflict
+            ? {
+                draftsByPath: {
+                  ...state.files.draftsByPath,
+                  [preview.path]: {
+                    ...draft,
+                    status: "conflict",
+                    message:
+                      "The host could not confirm this file's current text. Your draft is safe; discard it only when you are ready to reload.",
+                  },
+                },
+              }
+            : {}),
+        },
+      };
+    }
+    if (
+      preview.text === draft.originalText ||
+      (draft.status === "saving" && preview.text === draft.text)
+    ) {
+      if (draft.status !== "clean") return { files };
+      return {
+        files: {
+          ...files,
+          draftsByPath: {
+            ...state.files.draftsByPath,
+            [preview.path]: { ...draft, baseRevision },
+          },
+        },
+      };
+    }
+    if (draft.status === "clean") {
+      return {
+        files: {
+          ...files,
+          draftsByPath: {
+            ...state.files.draftsByPath,
+            [preview.path]: {
+              ...draft,
+              baseRevision,
+              originalText: preview.text,
+              text: preview.text,
+            },
+          },
+        },
+      };
+    }
+    return {
+      files: {
+        ...files,
+        draftsByPath: {
+          ...state.files.draftsByPath,
+          [preview.path]: {
+            ...draft,
+            status: "conflict",
+            message:
+              "The file changed on the host while you were editing. Your draft is safe and will not overwrite it.",
+          },
+        },
+      },
+    };
+  });
+}
+
+export function resolveFileWriteOutcome(
+  api: InspectorStoreApi,
+  path: string,
+  outcome: "saved" | "conflict" | "error",
+): void {
+  api.setState((state) => {
+    const draft = state.files.draftsByPath[path];
+    if (draft === undefined) return state;
+    if (outcome === "saved") {
+      const draftsByPath = { ...state.files.draftsByPath };
+      delete draftsByPath[path];
+      return {
+        files: {
+          ...state.files,
+          draftsByPath,
+          ...(state.files.selectedPath === path ? { preview: "loading" as const } : {}),
+        },
+      };
+    }
+    return {
+      files: {
+        ...state.files,
+        draftsByPath: {
+          ...state.files.draftsByPath,
+          [path]: {
+            ...draft,
+            status: outcome,
+            message:
+              outcome === "conflict"
+                ? "The host could not confirm this draft's base revision. Your draft is safe; discard it only when you are ready to reload."
+                : "The host did not confirm this save. Your draft is safe and was not resent.",
+          },
+        },
+      },
+    };
+  });
 }
 
 /** Review outcome applied by a controller once the runtime confirms it. */
@@ -319,6 +582,140 @@ export function resolveReviewOutcome(
       ),
     },
   }));
+}
+
+/** Reserves one turn decision and returns the revision that must authorize it. */
+export function beginTurnReviewAction(
+  api: InspectorStoreApi,
+  request: PendingTurnReviewAction,
+): string | null {
+  const review = api.getState().review;
+  if (
+    review.source !== "turn" ||
+    review.turnId !== request.turnId ||
+    typeof review.revision !== "string" ||
+    review.pendingAction != null ||
+    !review.files.some((file) => file.path === request.path && file.applyState === "pending")
+  ) {
+    return null;
+  }
+  api.setState((state) => {
+    if (
+      state.review.source !== "turn" ||
+      state.review.turnId !== request.turnId ||
+      state.review.revision !== review.revision ||
+      state.review.pendingAction != null
+    ) {
+      return state;
+    }
+    return {
+      review: {
+        ...state.review,
+        pendingAction: request,
+        error: null,
+      },
+    };
+  });
+  return review.revision;
+}
+
+/** Clears only the matching in-flight turn decision and keeps its row retryable. */
+export function rejectTurnReviewAction(
+  api: InspectorStoreApi,
+  request: PendingTurnReviewAction,
+  error: string,
+): void {
+  api.setState((state) => {
+    const pending = state.review.pendingAction;
+    if (
+      state.review.source !== "turn" ||
+      state.review.turnId !== request.turnId ||
+      pending?.turnId !== request.turnId ||
+      pending.path !== request.path ||
+      pending.action !== request.action
+    ) {
+      return state;
+    }
+    return { review: { ...state.review, pendingAction: null, error } };
+  });
+}
+
+/** Applies a turn result only to the request that reserved the current row. */
+export function resolveTurnReviewOutcome(
+  api: InspectorStoreApi,
+  request: PendingTurnReviewAction,
+  result: {
+    readonly applyState: "applied" | "discarded";
+    readonly resultingRevision: string;
+  },
+): void {
+  api.setState((state) => {
+    const pending = state.review.pendingAction;
+    if (
+      state.review.source !== "turn" ||
+      state.review.turnId !== request.turnId ||
+      pending?.turnId !== request.turnId ||
+      pending.path !== request.path ||
+      pending.action !== request.action
+    ) {
+      return state;
+    }
+    return {
+      review: {
+        ...state.review,
+        files: state.review.files.map((file) =>
+          file.path === request.path && file.applyState === "pending"
+            ? { ...file, applyState: result.applyState }
+            : file,
+        ),
+        revision: result.resultingRevision,
+        pendingAction: null,
+        error: null,
+      },
+    };
+  });
+}
+
+/** Completes only the currently requested turn, suppressing stale responses. */
+export function resolveTurnReview(
+  api: InspectorStoreApi,
+  turnId: string,
+  result:
+    | { readonly files: readonly ReviewFile[]; readonly revision: string }
+    | { readonly error: string },
+): void {
+  api.setState((state) => {
+    if (state.review.source !== "turn" || state.review.turnId !== turnId) return state;
+    if ("error" in result) {
+      return { review: { ...state.review, loading: false, error: result.error } };
+    }
+    const priorStates =
+      state.review.source === "turn" && state.review.turnId === turnId
+        ? new Map(state.review.files.map((file) => [file.path, file.applyState]))
+        : new Map<string, ReviewApplyState>();
+    const files = result.files.map((file) => {
+      const prior = priorStates.get(file.path);
+      return prior === undefined || prior === "pending" ? file : { ...file, applyState: prior };
+    });
+    const hasDecision =
+      state.review.pendingAction != null ||
+      state.review.files.some((file) => file.applyState !== "pending");
+    const selectedPath =
+      state.review.selectedPath !== null &&
+      files.some((file) => file.path === state.review.selectedPath)
+        ? state.review.selectedPath
+        : null;
+    return {
+      review: {
+        ...state.review,
+        files,
+        selectedPath,
+        loading: false,
+        error: null,
+        revision: hasDecision ? (state.review.revision ?? result.revision) : result.revision,
+      },
+    };
+  });
 }
 
 // One inspector store per session, created on first use and kept for the
@@ -347,4 +744,3 @@ export function getInspectorStore(sessionId: string): InspectorStoreApi | null {
 export function useInspector<T>(api: InspectorStoreApi, selector: (state: InspectorStore) => T): T {
   return useStore(api, selector);
 }
-

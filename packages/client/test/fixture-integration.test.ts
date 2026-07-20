@@ -46,7 +46,7 @@ function waitForCursor(client: OmpClient, epoch: string, minimumSeq: number): Pr
   if (cursor?.epoch === epoch && cursor.seq >= minimumSeq) return Promise.resolve();
   const { promise, resolve } = Promise.withResolvers<void>();
   let dispose: Unsubscribe | undefined;
-  dispose = client.onFrame(() => {
+  dispose = client.onEvent(() => {
     const next = client.snapshot().cursor;
     if (next?.epoch === epoch && next.seq >= minimumSeq) {
       dispose?.();
@@ -69,21 +69,20 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
       expect(projection.snapshot.sessions.has(key)).toBe(true);
       expect(projection.snapshot.sessions.get(key)!.entries).toHaveLength(1);
       const { promise: streamed, resolve: resolveStreamed } = Promise.withResolvers<void>();
+      const { promise: settled, resolve: resolveSettled } = Promise.withResolvers<void>();
       const disposeStream = projection.subscribe((snapshot) => {
         const session = snapshot.sessions.get(key);
-        const eventTypes = session?.events.map((event) => event.event.type);
+        const updates = session?.events.filter((event) => event.event.type === "message.update").length;
+        if ((updates ?? 0) >= 2) resolveStreamed();
         if (
           session?.entries.length === 2 &&
-          eventTypes?.join(",") ===
-            "agent.start,turn.start,message.settled,turn.end,agent.end"
-        ) resolveStreamed();
+          session.events.some((event) => event.event.type === "agent.end")
+        ) resolveSettled();
       });
       const prompt = client.command({ hostId: "host-stream", sessionId: "session-stream", command: "session.prompt", args: { message: "hello" } });
-      await yieldLoop();
       await prompt;
       server.advanceBy(40);
-      await yieldLoop();
-      await streamed;
+      await Promise.all([streamed, settled]);
       disposeStream();
       // The subscription above proves both live events crossed the real
       // WebSocket boundary. Once the matching durable entry arrives, the
@@ -209,11 +208,11 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
     });
     let replaySnapshotsA = 0;
     let replaySnapshotsB = 0;
-    const disposeFramesA = clientA.onFrame((frame) => {
-      if (frame.type === "snapshot" && frame.cursor.epoch === "epoch-two-client-restarted") replaySnapshotsA += 1;
+    const disposeEventsA = clientA.onEvent((event) => {
+      if (event.kind === "snapshot" && event.payload.cursor.epoch === "epoch-two-client-restarted") replaySnapshotsA += 1;
     });
-    const disposeFramesB = clientB.onFrame((frame) => {
-      if (frame.type === "snapshot" && frame.cursor.epoch === "epoch-two-client-restarted") replaySnapshotsB += 1;
+    const disposeEventsB = clientB.onEvent((event) => {
+      if (event.kind === "snapshot" && event.payload.cursor.epoch === "epoch-two-client-restarted") replaySnapshotsB += 1;
     });
     try {
       await Promise.all([clientA.connect(), clientB.connect()]);
@@ -317,8 +316,8 @@ describe("OmpClient and FixtureWebSocketServer projection boundary", () => {
       expect(clientB.snapshot().cursor?.seq).toBeGreaterThan(0);
     } finally {
       releaseAFactory();
-      disposeFramesA();
-      disposeFramesB();
+      disposeEventsA();
+      disposeEventsB();
       await Promise.all([clientA.close(), clientB.close()]);
       await firstServer.stop();
       await replacementServer.stop();

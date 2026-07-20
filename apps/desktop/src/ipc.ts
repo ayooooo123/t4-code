@@ -5,6 +5,9 @@ import {
   decodeLocalProfileId,
   decodeDesktopUpdateRendererReadyResult,
   decodeDesktopUpdateState,
+  decodeProjectionCacheLoadResult,
+  decodeProjectionCacheSaveResult,
+  decodePhoneSetupState,
   type BootstrapResult,
   type CommandRequest,
   type CommandResult,
@@ -28,9 +31,14 @@ import {
   type PairLinkEvent,
   type PairRequest,
   type PairResult,
+  type PhoneSetupState,
   type PairLinksDrainResult,
   type PeerShareStartResult,
   type PeerShareStatusResult,
+  type ProjectionCacheLoadResult,
+  type ProjectionCacheSaveRequest,
+  type ProjectionCacheSaveResult,
+  type RendererServerEvent,
   type RuntimeErrorEvent,
   type ServiceActionResult,
   type ServiceAvailabilityIssue,
@@ -42,6 +50,8 @@ import {
   type TerminalCloseRequest,
   type TerminalInputRequest,
   type TerminalResizeRequest,
+  type SpeechRequest,
+  type SpeechResult,
   type TerminalResult,
   type WorkspaceProjectCreateRequest,
   type WorkspaceProjectCreateResult,
@@ -49,11 +59,19 @@ import {
   type WorkspaceRootSelectRequest,
   type WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
-import type { RendererServerFrame } from "@t4-code/protocol/desktop-ipc";
+import {
+  decodeBrowserCall,
+  decodeBrowserEvent,
+  decodeBrowserResult,
+  type BrowserCall,
+  type BrowserCallResult,
+  type BrowserEvent,
+} from "@t4-code/protocol/browser-ipc";
 import type { ServiceManager } from "@t4-code/service-manager";
 import { redactedMessage } from "@t4-code/client";
-import { trustedSender, type TrustedRenderer } from "./security.ts";
+import { isTrustedNavigation, trustedSender, type TrustedRenderer } from "./security.ts";
 import type { PeerShareHost } from "./peer-share.ts";
+import type { DesktopSpeechService } from "./speech.ts";
 import type { LocalTargetManager } from "./target-manager.ts";
 import type { WorkspaceRootsService } from "./workspace-roots.ts";
 import type { LocalProfileRuntime } from "./profile-runtime.ts";
@@ -61,10 +79,14 @@ export interface IpcRuntime {
   readonly manager: LocalTargetManager;
   readonly window: BrowserWindow;
   readonly trustedRenderer: TrustedRenderer;
+  readonly browser?: {
+    readonly call: (request: BrowserCall) => Promise<BrowserCallResult>;
+  };
   /** Static manager support is retained for narrow unit runtimes. */
   readonly serviceManager?: ServiceManager;
   /** Dynamic lifecycle access keeps IPC valid after rediscovery or window reopen. */
   readonly getServiceManager?: () => ServiceManager | undefined;
+  readonly speech?: DesktopSpeechService;
   readonly acquireServiceManager?: () => Promise<ServiceManager | undefined>;
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly profileRuntime?: LocalProfileRuntime;
@@ -79,6 +101,14 @@ export interface IpcRuntime {
     readonly downloadUpdate: () => Promise<DesktopUpdateState>;
     readonly restartToUpdate: () => DesktopUpdateState;
     readonly subscribe: (listener: (state: DesktopUpdateState) => void) => () => void;
+  };
+  readonly projectionCache?: {
+    readonly load: () => ProjectionCacheLoadResult | Promise<ProjectionCacheLoadResult>;
+    readonly save: (value: string) => ProjectionCacheSaveResult | Promise<ProjectionCacheSaveResult>;
+  };
+  readonly phoneSetup?: {
+    readonly inspect: () => Promise<PhoneSetupState>;
+    readonly configure: () => Promise<PhoneSetupState>;
   };
 }
 export class RemotePairingUnavailableError extends Error {
@@ -102,12 +132,40 @@ function decodeRequest(channel: DesktopInvokeChannel, value: unknown): DesktopIn
   if (request.channel !== channel) throw new Error("channel mismatch");
   return request;
 }
+function decodeBrowserCallEnvelope(value: unknown): BrowserCall {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) throw new Error("invalid browser call envelope");
+  const input = value as Record<string, unknown>;
+  const keys = Object.keys(input);
+  if (keys.length !== 2 || !keys.includes("channel") || !keys.includes("payload")) {
+    throw new Error("invalid browser call envelope");
+  }
+  if (input.channel !== "browser:call") throw new Error("channel mismatch");
+  return decodeBrowserCall(input.payload);
+}
 export interface IpcMainLike {
   handle(channel: string, listener: (event: IpcMainInvokeEvent, payload: unknown) => unknown): void;
   removeHandler(channel: string): void;
 }
+type BrowserCallTarget = NonNullable<IpcRuntime["browser"]>;
+
+export class BrowserTargetUnavailableError extends Error {
+  readonly code = "invalid_state" as const;
+
+  constructor() {
+    super("Browser runtime is unavailable");
+    this.name = "BrowserTargetUnavailableError";
+    Object.defineProperty(this, "stack", { value: undefined, enumerable: false, configurable: true });
+  }
+}
+
 export class DesktopIpcRegistry {
   private installed = false;
+  private browserTarget: BrowserCallTarget | undefined;
   private readonly runtime: IpcRuntime;
   private readonly serviceQueue = { tail: Promise.resolve() };
   private readonly peerShareQueue = { tail: Promise.resolve() };
@@ -117,12 +175,29 @@ export class DesktopIpcRegistry {
   private readonly ipc: IpcMainLike;
   constructor(runtime: IpcRuntime, ipc: IpcMainLike = ipcMain) {
     this.runtime = runtime;
+    this.browserTarget = runtime.browser;
     this.ipc = ipc;
   }
 
+  updateBrowserTarget(target: BrowserCallTarget): void {
+    this.browserTarget = target;
+  }
+
+  deactivateBrowserTarget(target?: BrowserCallTarget): void {
+    if (target === undefined || this.browserTarget === target) this.browserTarget = undefined;
+  }
+
   install(): void {
-    this.uninstall();
+    if (this.installed) return;
     this.installed = true;
+    this.ipc.handle("browser:call", async (event, payload: unknown): Promise<BrowserCallResult> => {
+      this.assertSender(event);
+      const call = decodeBrowserCallEnvelope(payload);
+      const target = this.browserTarget;
+      if (target === undefined) throw new BrowserTargetUnavailableError();
+      const result = await target.call(call);
+      return decodeBrowserResult(call.method, result) as BrowserCallResult;
+    });
     this.ipc.handle("omp:bootstrap", async (event, payload: unknown): Promise<BootstrapResult> => {
       this.assertSender(event);
       decodeRequest("omp:bootstrap", payload);
@@ -163,6 +238,16 @@ export class DesktopIpcRegistry {
       this.assertSender(event);
       const input = decodeRequest("omp:terminal:close", payload).payload as TerminalCloseRequest;
       return this.runtime.manager.terminalClose(input);
+    });
+    this.ipc.handle("omp:speech:speak", async (event, payload: unknown): Promise<SpeechResult> => {
+      this.assertSender(event);
+      const input = decodeRequest("omp:speech:speak", payload).payload as SpeechRequest;
+      return this.runtime.speech?.speakText(input) ?? { accepted: false, error: "Speech is unavailable" };
+    });
+    this.ipc.handle("omp:speech:stop", async (event, payload: unknown): Promise<SpeechResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:speech:stop", payload);
+      return this.runtime.speech?.stopSpeaking() ?? { accepted: false, error: "Speech is unavailable" };
     });
     this.ipc.handle("omp:command", async (event, payload: unknown): Promise<CommandResult> => {
       this.assertSender(event);
@@ -296,6 +381,16 @@ export class DesktopIpcRegistry {
       decodeRequest("app:update:get-state", payload);
       return decodeDesktopUpdateState(this.updateController().getState());
     });
+    this.ipc.handle("app:phone-setup:inspect", async (event, payload: unknown): Promise<PhoneSetupState> => {
+      this.assertSender(event);
+      decodeRequest("app:phone-setup:inspect", payload);
+      return decodePhoneSetupState(await this.phoneSetup().inspect());
+    });
+    this.ipc.handle("app:phone-setup:configure", async (event, payload: unknown): Promise<PhoneSetupState> => {
+      this.assertSender(event);
+      decodeRequest("app:phone-setup:configure", payload);
+      return decodePhoneSetupState(await this.phoneSetup().configure());
+    });
     this.ipc.handle("app:update:check", async (event, payload: unknown): Promise<DesktopUpdateState> => {
       this.assertSender(event);
       decodeRequest("app:update:check", payload);
@@ -318,16 +413,36 @@ export class DesktopIpcRegistry {
         openSettings: this.runtime.drainPendingUpdateOpen?.() ?? false,
       });
     });
+    this.ipc.handle("app:projection-cache:load", async (event, payload: unknown): Promise<ProjectionCacheLoadResult> => {
+      this.assertSender(event);
+      decodeRequest("app:projection-cache:load", payload);
+      const result = await (this.runtime.projectionCache?.load() ?? { available: false, value: null });
+      return decodeProjectionCacheLoadResult(result);
+    });
+    this.ipc.handle("app:projection-cache:save", async (event, payload: unknown): Promise<ProjectionCacheSaveResult> => {
+      this.assertSender(event);
+      const input = decodeRequest("app:projection-cache:save", payload).payload as ProjectionCacheSaveRequest;
+      const result = await (this.runtime.projectionCache?.save(input.value) ?? { saved: false });
+      return decodeProjectionCacheSaveResult(result);
+    });
     this.updateUnsubscribe = this.runtime.updateController?.subscribe((state) => {
       this.emit("app:update:state", state);
     });
   }
+
+  private phoneSetup(): NonNullable<IpcRuntime["phoneSetup"]> {
+    if (!this.runtime.phoneSetup) throw new Error("Phone setup is unavailable in this build.");
+    return this.runtime.phoneSetup;
+  }
   uninstall(): void {
+    if (!this.installed) return;
     this.updateUnsubscribe?.();
     this.updateUnsubscribe = undefined;
     for (const channel of [
+      "browser:call",
       "omp:bootstrap", "omp:connect", "omp:disconnect", "omp:command", "omp:confirm",
       "omp:terminal:input", "omp:terminal:resize", "omp:terminal:close", "omp:pair",
+      "omp:speech:speak", "omp:speech:stop",
       "omp:pair-links:drain", "omp:targets:list", "omp:targets:add", "omp:targets:remove",
       "omp:profiles:list", "omp:profiles:add", "omp:profiles:update", "omp:profiles:remove",
       "omp:profiles:status", "omp:profiles:start", "omp:profiles:stop", "omp:profiles:restart",
@@ -338,11 +453,13 @@ export class DesktopIpcRegistry {
       "omp:workspace:project:create",
       "app:update:get-state", "app:update:check", "app:update:download", "app:update:restart",
       "app:update:renderer-ready",
+      "app:projection-cache:load", "app:projection-cache:save",
+      "app:phone-setup:inspect", "app:phone-setup:configure",
     ] as const) this.ipc.removeHandler(channel);
     this.installed = false;
   }
-  emitServerFrame(targetId: string, frame: RendererServerFrame): void {
-    this.emit("omp:server-frame", { targetId, frame });
+  emitServerEvent(targetId: string, event: RendererServerEvent): void {
+    this.emit("omp:server-event", { targetId, event });
   }
   emitConnectionState(event: ConnectionStateEvent): void {
     this.emit("omp:connection-state", event);
@@ -355,6 +472,14 @@ export class DesktopIpcRegistry {
   }
   emitOpenUpdateSettings(): void {
     this.emit("app:update:open", { source: "menu" });
+  }
+  emitBrowserEvent(event: BrowserEvent): void {
+    const decoded = decodeBrowserEvent(event);
+    const window = this.runtime.window;
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
+    const mainFrame = window.webContents.mainFrame;
+    if (mainFrame === null || mainFrame === undefined || !isTrustedNavigation(mainFrame.url, this.runtime.trustedRenderer)) return;
+    window.webContents.send("browser:event", decoded);
   }
 
   private assertSender(event: IpcMainInvokeEvent): void {
@@ -386,7 +511,7 @@ export class DesktopIpcRegistry {
   private unavailableInspection(): ServiceInspection {
     const raw = this.runtime.getServiceAvailabilityIssue?.() ?? {
       code: "service_unavailable" as const,
-      message: "The local OMP service is unavailable. Choose Check again to retry.",
+      message: "The local T4 host is unavailable. Choose Check again to retry.",
     };
     const code = ["omp_incompatible", "omp_not_found", "service_unavailable"].includes(raw.code)
       ? raw.code
@@ -404,7 +529,7 @@ export class DesktopIpcRegistry {
     this.serviceInspectionPromise = undefined;
     const operation = async (): Promise<void> => {
       const manager = await this.acquireServiceManager();
-      if (manager === undefined) throw new Error(this.unavailableInspection().issue?.message ?? "appserver service is unavailable");
+      if (manager === undefined) throw new Error(this.unavailableInspection().issue?.message ?? "T4 host service is unavailable");
       await manager[action]();
     };
     return this.enqueueService(operation);

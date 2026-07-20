@@ -6,7 +6,7 @@ describe("workspace rail project overlay", () => {
   it("keeps a newly-created folder visible before it has an OMP session", () => {
     const result = mergeWorkspaceProjects(
       {
-        hosts: [{ id: "host-1", name: "Desktop", kind: "local" as const }],
+        hosts: [{ id: "host-1", runtimeKind: "omp", name: "Desktop", kind: "local" as const }],
         projects: [],
         sessions: [],
       },
@@ -21,7 +21,7 @@ describe("workspace rail project overlay", () => {
   it("does not duplicate a folder once OMP advertises a session in it", () => {
     const result = mergeWorkspaceProjects(
       {
-        hosts: [{ id: "host-1", name: "Desktop", kind: "local" as const }],
+        hosts: [{ id: "host-1", runtimeKind: "omp", name: "Desktop", kind: "local" as const }],
         projects: [{ id: "host-1/%2FUsers%2Fme%2FProjects%2FPearTube", hostId: "host-1", name: "PearTube", path: "PearTube" }],
         sessions: [],
       },

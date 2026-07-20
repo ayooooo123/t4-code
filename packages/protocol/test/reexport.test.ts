@@ -11,7 +11,7 @@ import {
   type AppFrame,
 } from "../src/index.ts";
 
-const appWireEntry = fileURLToPath(import.meta.resolve("@oh-my-pi/app-wire"));
+const appWireEntry = fileURLToPath(import.meta.resolve("@t4-code/host-wire"));
 const appWireRoot = dirname(dirname(appWireEntry));
 
 function fixture(name: string): unknown {
@@ -34,6 +34,24 @@ function rawSession(liveState?: unknown): Record<string, unknown> {
     ...(liveState === undefined ? {} : { liveState }),
   };
 }
+
+const providerTransport = Object.freeze({
+  provider: "openai-codex",
+  configuredPolicy: "auto",
+  websocketPreferred: true,
+  lastTransport: "websocket",
+  websocketDisabled: false,
+  websocketConnected: true,
+  fallbackCount: 0,
+  canAppend: true,
+  prewarmed: true,
+  hasSessionState: true,
+  hasTurnState: true,
+  fullContextRequests: 1,
+  deltaRequests: 12,
+  inputJsonBytes: 64_512,
+  lastInputJsonBytes: 2_048,
+});
 
 describe("@omp/protocol app-wire facade", () => {
   it("re-exports the frozen protocol version and decoders", () => {
@@ -151,6 +169,90 @@ describe("@omp/protocol app-wire facade", () => {
       }),
     ).toMatchObject({
       sessions: [{ liveState: { sessionControl: { mode: "unknown" } } }],
+    });
+  });
+
+  it("preserves additive provider transport evidence through list decoders", () => {
+    const sessions = [
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "sessions",
+        hostId: "host-a",
+        cursor: { epoch: "epoch-1", seq: 2 },
+        sessions: [rawSession({ providerTransport })],
+      }),
+      decodeSessions({
+        v: "omp-app/1",
+        type: "sessions",
+        cursor: { epoch: "epoch-1", seq: 3 },
+        sessions: [rawSession({ providerTransport })],
+      }),
+      decodeSessionListResult({
+        cursor: { epoch: "epoch-1", seq: 4 },
+        sessions: [rawSession({ providerTransport })],
+      }),
+    ];
+
+    for (const decoded of sessions) {
+      expect(decoded).toMatchObject({
+        sessions: [{ liveState: { providerTransport } }],
+      });
+    }
+  });
+
+  it("preserves additive provider transport evidence through deltas and responses", () => {
+    const session = rawSession({ providerTransport });
+
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "session.delta",
+        hostId: "host-a",
+        sessionId: "session-a",
+        cursor: { epoch: "epoch-1", seq: 5 },
+        revision: "rev-2",
+        upsert: session,
+      }),
+    ).toMatchObject({
+      type: "session.delta",
+      upsert: { liveState: { providerTransport } },
+    });
+
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "response",
+        requestId: "request-list-provider-transport",
+        hostId: "host-a",
+        ok: true,
+        command: "session.list",
+        result: {
+          cursor: { epoch: "epoch-1", seq: 6 },
+          sessions: [session],
+        },
+      }),
+    ).toMatchObject({
+      type: "response",
+      result: {
+        sessions: [{ liveState: { providerTransport } }],
+      },
+    });
+
+    expect(
+      decodeServerFrame({
+        v: "omp-app/1",
+        type: "response",
+        requestId: "request-create-provider-transport",
+        hostId: "host-a",
+        ok: true,
+        command: "session.create",
+        result: { session },
+      }),
+    ).toMatchObject({
+      type: "response",
+      result: {
+        session: { liveState: { providerTransport } },
+      },
     });
   });
 

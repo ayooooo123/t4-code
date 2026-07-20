@@ -118,12 +118,18 @@ export interface T4QrScannerPlugin {
   ): Promise<{ readonly remove: () => Promise<void> | void }>;
 }
 
+export interface T4SpeechPlugin {
+  speakText(options: { readonly text: string }): Promise<{ readonly accepted: boolean; readonly error?: string }>;
+  stopSpeaking(): Promise<{ readonly accepted: boolean; readonly error?: string }>;
+}
+
 interface CapacitorBridge {
   readonly Plugins?: {
     readonly T4SecureStorage?: T4SecureStoragePlugin;
     readonly T4PeerConnection?: T4PeerConnectionPlugin;
     readonly T4QrScanner?: T4QrScannerPlugin;
     readonly T4Update?: T4UpdatePlugin;
+    readonly T4Speech?: T4SpeechPlugin;
   };
   readonly getPlatform?: () => string;
   readonly isNativePlatform?: () => boolean;

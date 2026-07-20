@@ -23,8 +23,9 @@ import type {
   PairLinksDrainResult,
   PeerShareStartResult,
   PeerShareStatusResult,
-  RendererServerFrame,
-  RendererServerFrameEvent,
+  PhoneSetupState,
+  RendererServerEventEnvelope,
+  RendererServerEvent,
   RuntimeErrorEvent,
   ServiceActionResult,
   ServiceInspection,
@@ -41,10 +42,16 @@ import type {
   WorkspaceRootChooseResult,
   WorkspaceRootSelectRequest,
   WorkspaceRootsResult,
+  SpeechRequest,
+  SpeechResult,
+  ProjectionCacheLoadResult,
+  ProjectionCacheSaveRequest,
+  ProjectionCacheSaveResult,
 } from "@t4-code/protocol/desktop-ipc";
-import type { CatalogFrame, SettingsFrame, WelcomeFrame } from "@t4-code/protocol";
+import type { CatalogFrame, SettingsFrame } from "@t4-code/protocol";
 import { ImmutableMap } from "./immutable-map.ts";
 import type { ProjectionOptions, ProjectionSnapshot, ProjectionStore } from "./projection.ts";
+import type { RuntimeIntegrationDescriptor } from "./runtime-integration.ts";
 
 export interface DesktopShellPort {
   readonly kind: "desktop";
@@ -56,6 +63,8 @@ export interface DesktopShellPort {
   readonly confirm: (request: ConfirmRequest) => Promise<ConfirmResult>;
   readonly terminalInput: (request: TerminalInputRequest) => Promise<TerminalResult>;
   readonly terminalResize: (request: TerminalResizeRequest) => Promise<TerminalResult>;
+  readonly speakText?: (request: SpeechRequest) => Promise<SpeechResult>;
+  readonly stopSpeaking?: () => Promise<SpeechResult>;
   readonly terminalClose: (request: TerminalCloseRequest) => Promise<TerminalResult>;
   readonly pair: (request: PairRequest) => Promise<PairResult>;
   readonly drainPairLinks?: () => Promise<PairLinksDrainResult>;
@@ -86,20 +95,31 @@ export interface DesktopShellPort {
   readonly downloadUpdate?: () => Promise<DesktopUpdateState>;
   readonly restartToUpdate?: () => Promise<DesktopUpdateState>;
   readonly updateRendererReady?: () => Promise<DesktopUpdateRendererReadyResult>;
+  readonly loadProjectionCache?: () => Promise<ProjectionCacheLoadResult>;
+  readonly saveProjectionCache?: (request: ProjectionCacheSaveRequest) => Promise<ProjectionCacheSaveResult>;
+  readonly inspectPhoneSetup?: () => Promise<PhoneSetupState>;
+  readonly configurePhoneSetup?: () => Promise<PhoneSetupState>;
   readonly listTargets: () => Promise<TargetListResult>;
   readonly addTarget: (request: TargetAddRequest) => Promise<TargetAddResult>;
   readonly removeTarget: (request: TargetRequest) => Promise<TargetRemoveResult>;
   readonly connectTarget: (request: TargetRequest) => Promise<ConnectResult>;
   readonly disconnectTarget: (request: TargetRequest) => Promise<DisconnectResult>;
-  readonly onServerFrame: (listener: (event: RendererServerFrameEvent) => void) => () => void;
+  readonly onServerEvent: (listener: (event: RendererServerEventEnvelope) => void) => () => void;
   readonly onConnectionState: (listener: (event: ConnectionStateEvent) => void) => () => void;
   readonly onRuntimeError: (listener: (event: RuntimeErrorEvent) => void) => () => void;
+  /** Existing browser/native lifecycle funnel; does not install a second listener set. */
+  readonly onWake?: (listener: () => void) => () => void;
   readonly onPairLink?: (listener: (event: PairLinkEvent) => void) => () => void;
   readonly onUpdateState?: (listener: (state: DesktopUpdateState) => void) => () => void;
   readonly onOpenUpdateSettings?: (listener: (event: DesktopUpdateOpenEvent) => void) => () => void;
 }
 
 export type DesktopRuntimeStartState = "idle" | "starting" | "started" | "stopped" | "error";
+
+export type DesktopWelcomePayload = Extract<
+  RendererServerEvent,
+  { kind: "welcome" }
+>["payload"];
 
 export interface DesktopHostMetadata {
   readonly targetId: string;
@@ -112,7 +132,7 @@ export interface DesktopHostMetadata {
   readonly grantedCapabilities: readonly string[];
   readonly grantedFeatures: readonly string[];
   readonly negotiatedLimits: Readonly<Record<string, unknown>>;
-  readonly authentication: WelcomeFrame["authentication"];
+  readonly authentication: DesktopWelcomePayload["authentication"];
   readonly resumed: boolean;
 }
 
@@ -123,17 +143,18 @@ export interface DesktopRuntimeErrorEntry {
   readonly at: number;
 }
 
-export interface DesktopFrameFilter {
+export interface DesktopServerEventFilter {
   readonly targetId: string;
   readonly hostId?: string;
   readonly sessionId?: string;
-  readonly types?: readonly string[];
+  readonly kinds?: readonly string[];
 }
 
-export type DesktopFrameSubscription = (event: RendererServerFrameEvent) => void;
+export type DesktopServerEventSubscription = (event: RendererServerEventEnvelope) => void;
 
 export interface DesktopRuntimeSnapshot {
   readonly version: 1;
+  readonly integration: RuntimeIntegrationDescriptor;
   readonly platform: "linux" | "darwin";
   readonly desktopVersion: string;
   readonly startState: DesktopRuntimeStartState;
@@ -149,12 +170,18 @@ export interface DesktopRuntimeSnapshot {
 
 export type DesktopRuntimeSnapshotListener = (snapshot: DesktopRuntimeSnapshot) => void;
 
+export interface DesktopRuntimeTimerScheduler {
+  readonly setTimeout: (callback: () => void, delayMs: number) => unknown;
+  readonly clearTimeout: (handle: unknown) => void;
+}
+
 export interface DesktopRuntimeOptions {
   readonly shell: DesktopShellPort;
   readonly projection?: ProjectionStore;
   readonly projectionOptions?: ProjectionOptions;
   readonly clock?: { now(): number };
   readonly maxRuntimeErrors?: number;
+  readonly timers?: DesktopRuntimeTimerScheduler;
 }
 
 export interface DesktopControllerLease {
@@ -208,12 +235,6 @@ export function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-export function frameId(frame: RendererServerFrame, name: "hostId" | "sessionId"): string | undefined {
-  const record = asRecord(frame);
-  const value = record?.[name];
-  return typeof value === "string" ? value : undefined;
-}
-
 export function redactedMessage(message: string, maxLength = 512): string {
   const limit = Number.isSafeInteger(maxLength) && maxLength > 0
     ? Math.min(maxLength, 2_048)
@@ -258,7 +279,7 @@ export function targetCopy(target: DesktopTarget): DesktopTarget {
   });
 }
 
-export function hostMetadata(targetId: string, frame: WelcomeFrame): DesktopHostMetadata {
+export function hostMetadata(targetId: string, frame: DesktopWelcomePayload): DesktopHostMetadata {
   return freezeClone({
     targetId,
     hostId: String(frame.hostId),

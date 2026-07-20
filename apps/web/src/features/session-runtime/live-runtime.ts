@@ -9,29 +9,30 @@ import type {
   DesktopRuntimeSnapshot,
   SessionProjection,
 } from "@t4-code/client";
+import { readTranscriptPage, TranscriptPageClientError } from "@t4-code/client";
 import {
   hostId as brandHostId,
   PROTOCOL_VERSION,
   revision as brandRevision,
   sessionId as brandSessionId,
   type CatalogItem,
-  type ConfirmationChallenge,
+  type DurableEntry,
   type Revision,
   type SessionEvent,
   type SessionRef,
   type SessionSnapshotFrame,
 } from "@t4-code/protocol";
-import type { RendererServerFrame } from "@t4-code/protocol/desktop-ipc";
 
 import {
   initialProjection,
   reduceTranscript,
+  reduceTranscriptEvent,
   replayRetainedTranscriptEvents,
   retainedTranscriptEventsAreValid,
   settleTranscriptTurn,
   transcriptIsActive,
   type ApprovalRequest,
-  type TranscriptFrame,
+  type TranscriptServerEvent,
   type TranscriptProjection,
 } from "../transcript/projection.ts";
 import { slashCommandsFromCatalog } from "../composer/slash.ts";
@@ -40,14 +41,16 @@ import type {
   SessionLink,
   SessionRuntime,
   SessionRuntimeSnapshot,
+  TranscriptHistoryPageState,
 } from "./controller.ts";
 import { IMAGE_PROMPTS_UNSUPPORTED_REASON, type SessionIntent } from "./intents.ts";
 import { runImagePromptUpload } from "./image-upload.ts";
 import { promptRejectionReason } from "./command-errors.ts";
 import { pendingPromptsFromRef } from "./pending-prompts.ts";
 import {
-  createTranscriptImageSource,
+  createTranscriptArtifactSource,
   type TranscriptImageAvailability,
+  type TranscriptMediaReference,
 } from "./transcript-images.ts";
 import {
   commandSupport,
@@ -67,10 +70,7 @@ import {
   sessionControlForLink,
   WriteGateError,
 } from "./session-observer.ts";
-import {
-  hostSessionInventoryIsComplete,
-  sessionWriteLink,
-} from "./session-inventory.ts";
+import { hostSessionInventoryIsComplete, sessionWriteLink } from "./session-inventory.ts";
 
 export interface LiveRuntimeOptions {
   readonly controller: DesktopRuntimeController;
@@ -91,16 +91,49 @@ const CONTROL_REJECTED: Record<PendingControl, string> = {
 const CONTROL_UNKNOWN =
   "The connection dropped before the host answered. The control shows the host's last confirmed value.";
 const MAX_RETIRED_PENDING_PROMPTS = 128;
+const INITIAL_TRANSCRIPT_PAGE_ENTRIES = 64;
+const INITIAL_TRANSCRIPT_PAGE_BYTES = 256 * 1024;
+const OLDER_TRANSCRIPT_PAGE_ENTRIES = 128;
+const OLDER_TRANSCRIPT_PAGE_BYTES = 512 * 1024;
+const MAX_PAGED_TRANSCRIPT_ENTRIES = 4_096;
+
+function prependTranscriptPage(
+  current: readonly DurableEntry[],
+  older: readonly DurableEntry[],
+): readonly DurableEntry[] {
+  const existing = new Set(current.map((entry) => entry.id));
+  const added: DurableEntry[] = [];
+  for (const entry of older) {
+    if (existing.has(entry.id)) continue;
+    existing.add(entry.id);
+    added.push(entry);
+  }
+  return [...added, ...current];
+}
+
+function presentPagedTranscript(
+  projection: TranscriptProjection,
+  pagedEntries: readonly DurableEntry[],
+): TranscriptProjection {
+  if (pagedEntries.length === 0) return projection;
+  if (projection.entries.length === 0) return { ...projection, entries: pagedEntries };
+  const liveIds = new Set(projection.entries.map((entry) => entry.id));
+  const firstOverlap = pagedEntries.findIndex((entry) => liveIds.has(entry.id));
+  const prefix = firstOverlap < 0 ? pagedEntries : pagedEntries.slice(0, firstOverlap);
+  return prefix.length === 0
+    ? projection
+    : { ...projection, entries: [...prefix, ...projection.entries] };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Frame types the transcript reducer accepts; mirrors the subscription. */
-const TRANSCRIPT_FRAME_TYPES: ReadonlySet<string> = new Set(["snapshot", "entry", "event", "gap"]);
+/** Event kinds the transcript reducer accepts; mirrors the subscription. */
+const TRANSCRIPT_EVENT_KINDS: ReadonlySet<string> = new Set(["snapshot", "entry", "event", "gap"]);
 
-function isTranscriptFrame(frame: RendererServerFrame): frame is TranscriptFrame {
-  return TRANSCRIPT_FRAME_TYPES.has(frame.type);
+function isTranscriptEvent(event: { readonly kind: string }): event is TranscriptServerEvent {
+  return TRANSCRIPT_EVENT_KINDS.has(event.kind);
 }
 
 /** Follow-ups the host reports as queued, read strictly from the ref. */
@@ -192,9 +225,10 @@ function findCancelCommand(items: readonly CatalogItem[]): CatalogItem | undefin
   );
 }
 
-
 interface PendingChallenge {
-  readonly challenge: ConfirmationChallenge;
+  readonly challenge: SessionProjection["confirmations"] extends ReadonlyMap<string, infer Value>
+    ? Value
+    : never;
   readonly approval: ApprovalRequest;
 }
 
@@ -236,8 +270,13 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   const decidedChallenges = new Set<string>();
   const listeners = new Set<() => void>();
   let transcriptImagesAttached = false;
+  let pagedEntries: readonly DurableEntry[] = [];
+  let transcriptHistory: TranscriptHistoryPageState | undefined;
+  let transcriptPageGeneration: string | undefined;
+  let transcriptPageCursor: string | undefined;
+  let transcriptPageRequest: Promise<void> | null = null;
 
-  const transcriptImages = createTranscriptImageSource({
+  const transcriptImages = createTranscriptArtifactSource({
     hostId: options.hostId,
     sessionId: options.sessionId,
     availability: {
@@ -252,28 +291,40 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       controller.command(targetId, {
         hostId: wireHostId,
         sessionId: wireSessionId,
-        command: "session.image.read",
-        args: { entryId: reference.entryId, sha256: reference.sha256, offset },
+        command: "source" in reference ? "artifact.read" : "session.image.read",
+        args:
+          "source" in reference
+            ? { artifactId: reference.artifactId, offset }
+            : { entryId: reference.entryId, sha256: reference.sha256, offset },
       }),
   });
 
   const transcriptImageAvailability = (
     runtime: DesktopRuntimeSnapshot,
+    reference: TranscriptMediaReference,
   ): TranscriptImageAvailability => {
     if (runtime.connections.get(targetId) !== "connected") {
-      return { available: false, reason: "Reconnect to this host to load transcript images." };
+      return { available: false, reason: "Reconnect to this host to load transcript media." };
     }
     const host = runtime.hosts.get(options.hostId);
+    const noun = "source" in reference ? "artifact" : "transcript image";
     if (host === undefined || !host.grantedCapabilities.includes("sessions.read")) {
       return {
         available: false,
-        reason: "This target does not grant transcript image access.",
+        reason: `This target does not grant ${noun} access.`,
       };
     }
-    if (!host.grantedFeatures.includes("transcript.images")) {
+    if (
+      "source" in reference
+        ? !host.grantedFeatures.includes("artifacts.read")
+        : !host.grantedFeatures.includes("transcript.images")
+    ) {
       return {
         available: false,
-        reason: "This OMP host does not offer transcript image reads.",
+        reason:
+          "source" in reference
+            ? "This host does not offer artifact reads."
+            : "This OMP host does not offer transcript image reads.",
       };
     }
     if (!transcriptImagesAttached) {
@@ -283,8 +334,9 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   };
 
   const syncTranscriptImageAvailability = (runtime: DesktopRuntimeSnapshot) => {
-    transcriptImages.setAvailability(transcriptImageAvailability(runtime));
+    transcriptImages.setAvailability((reference) => transcriptImageAvailability(runtime, reference));
   };
+
 
   const warmSession = (runtime: DesktopRuntimeSnapshot): SessionProjection | undefined =>
     runtime.projection.sessions.get(projectionKey);
@@ -334,6 +386,97 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   const notify = () => {
     snapshot = null;
     for (const listener of listeners) listener();
+  };
+
+  const transcriptPageSupported = (runtime: DesktopRuntimeSnapshot): boolean => {
+    const host = runtime.hosts.get(options.hostId);
+    return (
+      runtime.connections.get(targetId) === "connected" &&
+      runtime.targetHosts.get(targetId) === options.hostId &&
+      host?.grantedCapabilities.includes("sessions.read") === true &&
+      host.grantedFeatures.includes("transcript.page")
+    );
+  };
+
+  const loadTranscriptPage = (before?: string): Promise<void> => {
+    if (transcriptPageRequest !== null) return transcriptPageRequest;
+    const loadingOlder = before !== undefined;
+    const remainingEntries = MAX_PAGED_TRANSCRIPT_ENTRIES - pagedEntries.length;
+    if (loadingOlder && remainingEntries <= 0) return Promise.resolve();
+    transcriptHistory = {
+      phase: "loading",
+      hasMore: transcriptPageCursor !== undefined,
+      error: null,
+    };
+    notify();
+    const request = readTranscriptPage(
+      controller,
+      { targetId, hostId: options.hostId, sessionId: options.sessionId },
+      {
+        ...(before === undefined ? {} : { before }),
+        limit: loadingOlder
+          ? Math.min(OLDER_TRANSCRIPT_PAGE_ENTRIES, remainingEntries)
+          : INITIAL_TRANSCRIPT_PAGE_ENTRIES,
+        maxBytes: loadingOlder ? OLDER_TRANSCRIPT_PAGE_BYTES : INITIAL_TRANSCRIPT_PAGE_BYTES,
+      },
+    )
+      .then((page) => {
+        if (disposed) return;
+        if (
+          loadingOlder &&
+          transcriptPageGeneration !== undefined &&
+          page.generation !== transcriptPageGeneration
+        ) {
+          throw new TranscriptPageClientError(
+            "stale",
+            "The transcript changed while older history was loading.",
+            "transcript_generation_changed",
+          );
+        }
+        pagedEntries = loadingOlder
+          ? prependTranscriptPage(pagedEntries, page.entries)
+          : [...page.entries];
+        transcriptPageGeneration = page.generation;
+        transcriptPageCursor = page.nextCursor;
+        transcriptHistory = {
+          phase: "ready",
+          hasMore: page.hasMore && pagedEntries.length < MAX_PAGED_TRANSCRIPT_ENTRIES,
+          error:
+            page.hasMore && pagedEntries.length >= MAX_PAGED_TRANSCRIPT_ENTRIES
+              ? "This view reached its in-memory history limit."
+              : null,
+        };
+        notify();
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        const unsupported =
+          error instanceof TranscriptPageClientError && error.code === "unsupported";
+        transcriptHistory = {
+          phase: unsupported ? "unsupported" : "error",
+          hasMore: transcriptPageCursor !== undefined,
+          error: unsupported
+            ? null
+            : error instanceof TranscriptPageClientError
+              ? error.message
+              : "Older transcript history could not be loaded.",
+        };
+        notify();
+      })
+      .finally(() => {
+        if (transcriptPageRequest === request) transcriptPageRequest = null;
+      });
+    transcriptPageRequest = request;
+    return request;
+  };
+
+  const primeTranscriptTail = (): Promise<void> => {
+    if (transcriptHistory !== undefined) return transcriptPageRequest ?? Promise.resolve();
+    if (!transcriptPageSupported(controller.getSnapshot())) {
+      transcriptHistory = { phase: "unsupported", hasMore: false, error: null };
+      return Promise.resolve();
+    }
+    return loadTranscriptPage();
   };
 
   // Seed from the controller's warm projection. Durable entries install at the
@@ -597,21 +740,21 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     return sendCommand(command, args, false, true, undefined, leaseRevision);
   };
 
-  const applyFrame = (frame: TranscriptFrame) => {
-    // Renderer frames are sanitized to their global retention budget before
+  const applyServerEvent = (event: TranscriptServerEvent) => {
+    // Renderer events are sanitized to their global retention budget before
     // delivery. Preserve the shared client's smaller/custom retention truth,
-    // which is otherwise not representable on the app-wire snapshot itself.
-    const reduced = reduceTranscript(transcript, frame);
-    // Raw frame subscribers still receive stale/duplicate/gapped events that
+    // which is otherwise not representable on the server snapshot itself.
+    const reduced = reduceTranscriptEvent(transcript, event);
+    // Subscribers still receive stale/duplicate/gapped events that
     // the reducer correctly refuses. Only advance prompt retirement state when
     // the transcript actually accepted this event at its advertised cursor.
     if (
-      frame.type === "event" &&
+      event.kind === "event" &&
       reduced !== transcript &&
-      reduced.cursor?.epoch === frame.cursor.epoch &&
-      reduced.cursor.seq === frame.cursor.seq
+      reduced.cursor?.epoch === event.payload.cursor.epoch &&
+      reduced.cursor.seq === event.payload.cursor.seq
     ) {
-      applyPendingPromptLifecycle(frame.event);
+      applyPendingPromptLifecycle(event.payload.event);
     }
     const next = withWarmHistoryTruncation(reduced, controller.getSnapshot());
     if (next !== transcript) {
@@ -624,7 +767,9 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   let attaching = false;
   let retryAfterAttach = false;
   let connectionGeneration = 0;
-  let previousConnected = controller.getSnapshot().connections.get(targetId) === "connected";
+  let previousAttachAuthority =
+    controller.getSnapshot().connections.get(targetId) === "connected" &&
+    controller.getSnapshot().targetHosts.get(targetId) === options.hostId;
   const initialAuthoritativeWorking = authoritativeWorkingState(
     controller.getSnapshot(),
     targetId,
@@ -646,19 +791,21 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     // turn/compaction whose active ref delta has not arrived yet.
     transcript = settleTranscriptTurn(transcript);
   }
-  const attachIfConnected = (runtime: DesktopRuntimeSnapshot) => {
+  const attachIfAuthoritative = (runtime: DesktopRuntimeSnapshot) => {
     if (disposed) return;
-    const connected = runtime.connections.get(targetId) === "connected";
-    if (connected !== previousConnected) {
-      previousConnected = connected;
+    const hasAttachAuthority =
+      runtime.connections.get(targetId) === "connected" &&
+      runtime.targetHosts.get(targetId) === options.hostId;
+    if (hasAttachAuthority !== previousAttachAuthority) {
+      previousAttachAuthority = hasAttachAuthority;
       connectionGeneration += 1;
-      if (!connected) {
+      if (!hasAttachAuthority) {
         attached = false;
         transcriptImagesAttached = false;
         syncTranscriptImageAvailability(runtime);
       }
     }
-    if (!connected) return;
+    if (!hasAttachAuthority) return;
     if (attached) return;
     if (attaching) {
       retryAfterAttach = true;
@@ -668,8 +815,16 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     retryAfterAttach = false;
     const generation = connectionGeneration;
     attached = true;
-    void controller
-      .attachSession(targetId, options.hostId, options.sessionId, transcript.cursor ?? undefined)
+    const tailPrime = primeTranscriptTail();
+    const startAttach = () =>
+      controller.attachSession(
+        targetId,
+        options.hostId,
+        options.sessionId,
+        transcript.cursor ?? undefined,
+      );
+    const attachRequest = transcript.cursor === null ? tailPrime.then(startAttach) : startAttach();
+    void attachRequest
       .then((result) => {
         const current = controller.getSnapshot();
         transcriptImagesAttached = result.accepted === true && generation === connectionGeneration;
@@ -688,13 +843,13 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
         if (disposed) return;
         if (retryAfterAttach && generation !== connectionGeneration) {
           retryAfterAttach = false;
-          attachIfConnected(controller.getSnapshot());
+          attachIfAuthoritative(controller.getSnapshot());
         } else {
           retryAfterAttach = false;
         }
       });
   };
-  const unsubscribeFrames = controller.subscribeFrames(
+  const unsubscribeEvents = controller.subscribeEvents(
     {
       targetId,
       hostId: options.hostId,
@@ -702,11 +857,11 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       // session.delta belongs to the host-wide session-index cursor domain,
       // not this session's transcript cursor domain. The shared desktop
       // projection already consumes it for ref/revision/control truth.
-      types: ["snapshot", "entry", "event", "gap"],
+      kinds: ["snapshot", "entry", "event", "gap"],
     },
     (event) => {
-      if (isTranscriptFrame(event.frame)) {
-        applyFrame(event.frame);
+      if (isTranscriptEvent(event.event)) {
+        applyServerEvent(event.event);
       }
     },
   );
@@ -715,7 +870,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   const unsubscribeRuntime = controller.subscribe((runtime) => {
     const retainedTranscript = withWarmHistoryTruncation(transcript, runtime);
     if (retainedTranscript !== transcript) transcript = retainedTranscript;
-    attachIfConnected(runtime);
+    attachIfAuthoritative(runtime);
     const authoritativeWorking = authoritativeWorkingState(
       runtime,
       targetId,
@@ -726,10 +881,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     const warmNow = runtime.projection.sessions.get(projectionKey);
     const newestTranscriptEventOrdinal = warmNow?.transcriptEventArrivalOrdinal ?? 0;
     const newestRefOrdinal = runtime.projection.sessionRefArrivalOrdinals.get(projectionKey) ?? 0;
-    if (
-      authoritativeWorking === false &&
-      newestRefOrdinal > newestTranscriptEventOrdinal
-    ) {
+    if (authoritativeWorking === false && newestRefOrdinal > newestTranscriptEventOrdinal) {
       // Settle on receive order, not a working true -> false edge. A mounted
       // runtime may miss the active ref entirely (null -> idle) or receive two
       // idle refs around newer transcript activity (idle -> idle). The newer
@@ -750,7 +902,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
   // part of the attach round-trip; no replay frame may land in the gap between
   // runtime construction and listener registration.
   syncTranscriptImageAvailability(controller.getSnapshot());
-  attachIfConnected(controller.getSnapshot());
+  attachIfAuthoritative(controller.getSnapshot());
 
   const pendingChallenge = (runtime: DesktopRuntimeSnapshot): PendingChallenge | null => {
     const confirmations = warmSession(runtime)?.confirmations;
@@ -951,7 +1103,10 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     const runtime = controller.getSnapshot();
     const hasChallenge = warmSession(runtime)?.confirmations.has(intent.approvalId) ?? false;
     if (hasChallenge) {
-      return confirmChallenge(intent.approvalId, intent.decision === "approve" ? "approve" : "deny");
+      return confirmChallenge(
+        intent.approvalId,
+        intent.decision === "approve" ? "approve" : "deny",
+      );
     } else {
       return sendCommand(
         "session.ui.respond",
@@ -990,8 +1145,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
             pendingPrompts.length > 0 ||
             sessionIsWorkingWithPendingPrompts(ref, pendingPrompts));
         const sessionControl = sessionControlForLink(link, readSessionControl(ref));
-        const controlGate =
-          sessionControl === null ? null : presentSessionControl(sessionControl);
+        const controlGate = sessionControl === null ? null : presentSessionControl(sessionControl);
         const cancelItem = catalog === undefined ? undefined : findCancelCommand(catalog.items);
         const cancelSupported = cancelItem !== undefined && cancelItem.supported !== false;
         const canCancel =
@@ -1040,6 +1194,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
           pendingControl,
           controlError,
         });
+        projection = presentPagedTranscript(projection, pagedEntries);
 
         snapshot = {
           projection,
@@ -1069,6 +1224,8 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
               ? derivedControls
               : gateComposerControls(derivedControls, controlGate.controlReason),
           sessionControl,
+          providerTransport: ref?.liveState?.providerTransport ?? null,
+          ...(transcriptHistory === undefined ? {} : { transcriptHistory }),
           nowMs: Date.now(),
         };
       }
@@ -1082,6 +1239,11 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       void submitPrompt(intent);
     },
     submitPrompt,
+    async loadEarlierTranscript() {
+      if (transcriptHistory?.phase === "loading") return;
+      if (transcriptPageCursor === undefined && transcriptHistory?.phase !== "error") return;
+      await loadTranscriptPage(transcriptPageCursor);
+    },
     pause() {
       // Live frames keep applying in the background so switch-back is warm.
       // Image bytes do not: every inactive runtime releases its object URLs
@@ -1098,7 +1260,7 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
     dispose() {
       if (disposed) return;
       disposed = true;
-      unsubscribeFrames();
+      unsubscribeEvents();
       unsubscribeRuntime();
       transcriptImages.dispose();
       listeners.clear();

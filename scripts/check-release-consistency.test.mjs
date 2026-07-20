@@ -19,6 +19,25 @@ function changed(path, replace) {
   return copy;
 }
 
+function changedRuntime(name, mutate) {
+  return changed("compat/omp-app-matrix.json", (text) => {
+    const matrix = JSON.parse(text);
+    mutate(matrix[name]);
+    return JSON.stringify(matrix);
+  });
+}
+
+function replaceRequired(text, search, replacement) {
+  assert.ok(text.includes(search), `fixture is missing expected value ${search}`);
+  return text.replace(search, replacement);
+}
+
+function nextPatchVersion(version) {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/u);
+  assert.ok(match, `expected a stable semantic version, received ${version}`);
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
+}
+
 function requiredWorkflowJob(workflow, name) {
   const parsed = parseYaml(workflow);
   assert.ok(parsed && typeof parsed === "object" && !Array.isArray(parsed));
@@ -43,28 +62,137 @@ function resolveWorkflowExpression(expression, context) {
 }
 
 test("current source tree has one consistent release version", () => {
-  assert.deepEqual(collectReleaseConsistencyErrors(files, "v0.1.22"), []);
+  assert.deepEqual(collectReleaseConsistencyErrors(files), []);
+});
+
+test("rejects duplicate keys in JSON release contracts", () => {
+  const duplicated = changed("compat/omp-app-matrix.json", (text) =>
+    text.replace(
+      '"appProtocol": "omp-app/1",',
+      '"appProtocol": "omp-app/1",\n  "appProtocol": "omp-app/1",',
+    ),
+  );
+
+  assert.ok(
+    collectReleaseConsistencyErrors(duplicated).some((error) =>
+      error.includes("duplicated mapping key"),
+    ),
+  );
+});
+
+test("promotes the verified runtime into the product release", () => {
+  const matrix = JSON.parse(files.get("compat/omp-app-matrix.json"));
+  assert.equal(matrix.verifiedRuntime.sourceTag, "t4code-17.0.5-appserver-10");
+  assert.equal(matrix.publishedRuntime.sourceTag, "t4code-17.0.5-appserver-10");
+  assert.deepEqual(matrix.publishedRuntime, matrix.verifiedRuntime);
 });
 
 test("rejects a tag that differs from the package version", () => {
   assert.ok(
     collectReleaseConsistencyErrors(files, "v9.9.9").some((error) =>
-      error.includes("release tag v9.9.9 does not match v0.1.22"),
+      error.includes("release tag v9.9.9 does not match v0.1.30"),
+    ),
+  );
+});
+
+test("tagged releases reject published provenance drift", () => {
+  const appWireCases = [
+    [
+      "version",
+      (record) => {
+        record.version = "0.5.8";
+      },
+    ],
+    [
+      "commit",
+      (record) => {
+        record.sourceCommit = "0".repeat(40);
+      },
+    ],
+    [
+      "source tree",
+      (record) => {
+        record.sourceTreeHash = "0".repeat(40);
+      },
+    ],
+  ];
+  for (const [field, mutate] of appWireCases) {
+    const drifted = changedRuntime("publishedAppWire", mutate);
+    assert.ok(
+      collectReleaseConsistencyErrors(drifted, "v0.1.30").some((error) =>
+        error.includes(
+          `published app-wire ${field} must match current app-wire for tagged releases`,
+        ),
+      ),
+    );
+  }
+
+  const runtimeCases = [
+    [
+      "version",
+      (runtime) => {
+        runtime.version = "17.0.0";
+      },
+    ],
+    [
+      "commit",
+      (runtime) => {
+        runtime.sourceCommit = "0".repeat(40);
+      },
+    ],
+    [
+      "tag",
+      (runtime) => {
+        runtime.sourceTag = "t4code-17.0.5-appserver-2";
+      },
+    ],
+    [
+      "upstream commit",
+      (runtime) => {
+        runtime.upstreamCommit = "0".repeat(40);
+      },
+    ],
+    [
+      "integration patches",
+      (runtime) => {
+        runtime.integrationPatches = runtime.integrationPatches.slice(0, -1);
+      },
+    ],
+  ];
+  for (const [field, mutate] of runtimeCases) {
+    const drifted = changedRuntime("publishedRuntime", mutate);
+    assert.ok(
+      collectReleaseConsistencyErrors(drifted, "v0.1.30").some((error) =>
+        error.includes(
+          `published runtime ${field} must match current verified runtime for tagged releases`,
+        ),
+      ),
+    );
+  }
+
+  const extended = changedRuntime("publishedRuntime", (runtime) => {
+    runtime.artifactSha256 = "0".repeat(64);
+  });
+  assert.ok(
+    collectReleaseConsistencyErrors(extended, "v0.1.30").some((error) =>
+      error.includes(
+        "published runtime must exactly match current verified runtime for tagged releases",
+      ),
     ),
   );
 });
 
 test("rejects workspace, site, README, and runtime version drift", () => {
   const cases = [
-    ["apps/web/package.json", (text) => text.replace('"version": "0.1.22"', '"version": "0.1.3"')],
+    ["apps/web/package.json", (text) => text.replace('"version": "0.1.30"', '"version": "0.1.3"')],
     [
       "apps/site/src/release.ts",
-      (text) => text.replace('RELEASE_TAG = "v0.1.22"', 'RELEASE_TAG = "v0.1.3"'),
+      (text) => text.replace('RELEASE_TAG = "v0.1.30"', 'RELEASE_TAG = "v0.1.3"'),
     ],
-    ["README.md", (text) => text.replace("Download v0.1.22", "Download v0.1.3")],
+    ["README.md", (text) => text.replace("Download v0.1.30", "Download v0.1.3")],
     [
       "apps/desktop/src/target-manager.ts",
-      (text) => text.replace('version: "0.1.22"', 'version: "0.1.3"'),
+      (text) => text.replace('version: "0.1.30"', 'version: "0.1.3"'),
     ],
     [
       "apps/site/src/docs/content.ts",
@@ -115,7 +243,36 @@ test("rejects updater channel, stable manifest, and publication-contract drift",
     ],
     [
       ".github/workflows/ci.yml",
-      (text) => text.replace("needs: [core, tooling, android-debug]", "needs: [core, tooling]"),
+      (text) =>
+        text.replace(
+          "needs: [core, legacy-bridge-continuity, tooling, android-debug]",
+          "needs: [core, tooling, android-debug]",
+        ),
+    ],
+    [
+      ".github/workflows/ci.yml",
+      (text) =>
+        text.replace(
+          "ref: ${{ github.event.pull_request.head.sha || github.sha }}",
+          "ref: ${{ github.ref }}",
+        ),
+    ],
+    [
+      ".github/workflows/ci.yml",
+      (text) =>
+        replaceRequired(
+          text,
+          'test "$source_repository" = "https://github.com/lyc-aon/oh-my-pi"',
+          'test "$source_repository" = "https://github.com/example/other"',
+        ),
+    ],
+    [
+      ".github/workflows/ci.yml",
+      (text) => replaceRequired(text, '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]', '[[ -n "$sha" ]]'),
+    ],
+    [
+      ".github/workflows/ci.yml",
+      (text) => text.replace("run: pnpm test:legacy-bridge-continuity", "run: pnpm test"),
     ],
     [
       "scripts/reconcile-release-assets.mjs",
@@ -196,20 +353,21 @@ test("historical repair runs CI authority from trusted control while querying ol
   assert.notEqual(checkoutSha, queriedSha);
 });
 
-test("rejects app-wire matrix changes until the release surfaces agree", () => {
-  const drifted = changed("compat/omp-app-matrix.json", (text) =>
-    text.replace('"version": "0.5.8"', '"version": "0.5.1"'),
-  );
-  assert.ok(collectReleaseConsistencyErrors(drifted).length > 0);
-});
-
-test("rejects app-wire provenance changes until the release surfaces agree", () => {
-  const drifted = changed("compat/omp-app-matrix.json", (text) =>
-    text.replace(
-      '"sourceCommit": "33615123ff986fc9cadf645463b4fed17e8b9f35"',
-      '"sourceCommit": "0000000000000000000000000000000000000000"',
+test("rejects published app-wire version drift until release surfaces agree", () => {
+  const drifted = changedRuntime("publishedAppWire", (record) => {
+    record.version = "0.5.1";
+  });
+  assert.ok(
+    collectReleaseConsistencyErrors(drifted).some(
+      (error) => error.startsWith("README.md") || error.startsWith("apps/site/src/release.ts"),
     ),
   );
+});
+
+test("rejects published app-wire provenance drift until release surfaces agree", () => {
+  const drifted = changedRuntime("publishedAppWire", (record) => {
+    record.sourceCommit = "0".repeat(40);
+  });
   assert.ok(
     collectReleaseConsistencyErrors(drifted).some(
       (error) => error.startsWith("README.md") || error.startsWith("docs/CURRENT_RELEASE_NOTES.md"),
@@ -218,12 +376,11 @@ test("rejects app-wire provenance changes until the release surfaces agree", () 
 });
 
 test("rejects drift between the compatibility matrix and vendored app-wire manifest", () => {
-  const drifted = changed("vendor/app-wire/manifest.json", (text) =>
-    text.replace(
-      '"sourceTreeHash": "e36475dc81dd4c3703eb207ae466f85947b33525"',
-      '"sourceTreeHash": "0000000000000000000000000000000000000000"',
-    ),
-  );
+  const drifted = changed("vendor/app-wire/manifest.json", (text) => {
+    const manifest = JSON.parse(text);
+    manifest.sourceTreeHash = "0".repeat(40);
+    return JSON.stringify(manifest);
+  });
   assert.ok(
     collectReleaseConsistencyErrors(drifted).some((error) =>
       error.includes("vendor/app-wire/manifest.json sourceTreeHash must match"),
@@ -231,63 +388,94 @@ test("rejects drift between the compatibility matrix and vendored app-wire manif
   );
 });
 
+test("rejects a stale app-wire third-party notice", () => {
+  const { package: packageName, version } = JSON.parse(
+    files.get("vendor/app-wire/manifest.json"),
+  );
+  const drifted = changed("THIRD_PARTY_NOTICES.md", (text) =>
+    replaceRequired(text, `${packageName}@${version}`, `${packageName}@0.0.0`),
+  );
+  assert.ok(
+    collectReleaseConsistencyErrors(drifted).some((error) =>
+      error.startsWith("THIRD_PARTY_NOTICES.md is missing"),
+    ),
+  );
+});
+
 test("rejects drift in verified OMP runtime provenance", () => {
   const cases = [
-    (text) =>
-      text.replace(
-        "f909a2895bc1a352d1d3c27c45d59622bc1c0a36",
-        "0000000000000000000000000000000000000000",
-      ),
-    (text) => text.replace('"sourceTag": "t4code-17.0.0-appserver-6"', '"sourceTag": "wrong-tag"'),
-    (text) =>
-      text.replace(
-        '"upstreamCommit": "d5cd24f39a951bfbd50dc8f50bcf095d59694d6c"',
-        '"upstreamCommit": "0000000000000000000000000000000000000000"',
-      ),
-    (text) => text.replace('"complete-session-event-projection"', '"Wrong integration patch"'),
-    (text) =>
-      text.replace(
-        '"upstreamTagContainsIntegrationPatches": false',
-        '"upstreamTagContainsIntegrationPatches": true',
-      ),
+    (runtime) => {
+      runtime.sourceCommit = "0000000000000000000000000000000000000000";
+    },
+    (runtime) => {
+      runtime.sourceTag = "wrong-tag";
+    },
+    (runtime) => {
+      runtime.upstreamCommit = "invalid";
+    },
+    (runtime) => {
+      runtime.integrationPatches = runtime.integrationPatches.map((patch) =>
+        patch === "versioned-agent-view-lifecycle-corpus" ? "Wrong integration patch" : patch,
+      );
+    },
   ];
-  for (const replace of cases) {
-    const drifted = changed("compat/omp-app-matrix.json", replace);
+  for (const [index, mutate] of cases.entries()) {
+    const drifted = changedRuntime("verifiedRuntime", mutate);
+    assert.ok(collectReleaseConsistencyErrors(drifted).length > 0, `runtime drift case ${index}`);
+  }
+});
+
+test("rejects drift in published OMP runtime provenance", () => {
+  const cases = [
+    (runtime) => {
+      runtime.sourceCommit = "0000000000000000000000000000000000000000";
+    },
+    (runtime) => {
+      runtime.sourceTag = "wrong-tag";
+    },
+    (runtime) => {
+      runtime.upstreamCommit = "0000000000000000000000000000000000000000";
+    },
+  ];
+  for (const mutate of cases) {
+    const drifted = changedRuntime("publishedRuntime", mutate);
     assert.ok(collectReleaseConsistencyErrors(drifted).length > 0);
   }
 });
 
-test("accepts a coordinated app-wire provenance update without editing the workflow", () => {
+test("accepts a current app-wire update without rewriting published release surfaces", () => {
   const coordinated = new Map(files);
+  const matrix = JSON.parse(coordinated.get("compat/omp-app-matrix.json"));
+  const manifest = JSON.parse(coordinated.get("vendor/app-wire/manifest.json"));
+  const current = { ...matrix.appWire };
+  const proposed = {
+    version: nextPatchVersion(current.version),
+    sourceCommit: "1".repeat(40),
+    sourceTreeHash: "2".repeat(40),
+    tarballSha256: "3".repeat(64),
+    goldenCorpusSha256: "4".repeat(64),
+  };
+
+  Object.assign(matrix.appWire, proposed, {
+    tarball: `vendor/app-wire/oh-my-pi-app-wire-${proposed.version}.tgz`,
+  });
+  Object.assign(manifest, proposed, {
+    tarball: `oh-my-pi-app-wire-${proposed.version}.tgz`,
+  });
+  coordinated.set("compat/omp-app-matrix.json", JSON.stringify(matrix));
+  coordinated.set("vendor/app-wire/manifest.json", JSON.stringify(manifest));
   coordinated.set(
-    "compat/omp-app-matrix.json",
-    coordinated
-      .get("compat/omp-app-matrix.json")
-      .replace('"version": "0.5.8"', '"version": "0.5.9"')
-      .replace("oh-my-pi-app-wire-0.5.8.tgz", "oh-my-pi-app-wire-0.5.9.tgz"),
-  );
-  coordinated.set(
-    "apps/site/src/release.ts",
-    coordinated
-      .get("apps/site/src/release.ts")
-      .replace('APP_WIRE_VERSION = "0.5.8"', 'APP_WIRE_VERSION = "0.5.9"'),
-  );
-  coordinated.set(
-    "README.md",
-    coordinated
-      .get("README.md")
-      .replace("`@oh-my-pi/app-wire` 0.5.8", "`@oh-my-pi/app-wire` 0.5.9"),
-  );
-  coordinated.set(
-    "docs/CURRENT_RELEASE_NOTES.md",
-    coordinated.get("docs/CURRENT_RELEASE_NOTES.md").replace("app-wire 0.5.8", "app-wire 0.5.9"),
-  );
-  coordinated.set(
-    "vendor/app-wire/manifest.json",
-    coordinated
-      .get("vendor/app-wire/manifest.json")
-      .replace('"version": "0.5.8"', '"version": "0.5.9"')
-      .replace("oh-my-pi-app-wire-0.5.8.tgz", "oh-my-pi-app-wire-0.5.9.tgz"),
+    "THIRD_PARTY_NOTICES.md",
+    [
+      [`${current.package}@${current.version}`, `${current.package}@${proposed.version}`],
+      [current.sourceCommit, proposed.sourceCommit],
+      [current.sourceTreeHash, proposed.sourceTreeHash],
+      [current.tarballSha256, proposed.tarballSha256],
+      [current.goldenCorpusSha256, proposed.goldenCorpusSha256],
+    ].reduce(
+      (notice, [from, to]) => replaceRequired(notice, from, to),
+      coordinated.get("THIRD_PARTY_NOTICES.md"),
+    ),
   );
 
   assert.deepEqual(collectReleaseConsistencyErrors(coordinated), []);
@@ -303,7 +491,7 @@ test("rejects stale README release URLs while allowing historical prose", () => 
   const staleLink = changed("README.md", (text) => `${text}\n[Old release](${oldReleaseUrl})\n`);
   assert.ok(
     collectReleaseConsistencyErrors(staleLink).some((error) =>
-      error.includes("release URL for v0.1.3; expected v0.1.22"),
+      error.includes("release URL for v0.1.3; expected v0.1.30"),
     ),
   );
   assert.deepEqual(collectReleaseConsistencyErrors(files), []);
@@ -316,11 +504,33 @@ test("deploys release site source only after artifact publication", () => {
 
   assert.ok(ciWorkflow.includes("android-debug:"));
   assert.ok(ciWorkflow.includes("core:"));
+  assert.ok(ciWorkflow.includes("legacy-bridge-continuity:"));
+  assert.ok(ciWorkflow.includes("ref: ${{ github.event.pull_request.head.sha || github.sha }}"));
+  assert.ok(
+    ciWorkflow.includes(
+      `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
+    ),
+  );
+  assert.ok(
+    ciWorkflow.includes('test "$source_repository" = "https://github.com/lyc-aon/oh-my-pi"'),
+  );
+  assert.ok(
+    ciWorkflow.includes("sha=\"$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)\""),
+  );
+  assert.ok(ciWorkflow.includes('[[ "$sha" =~ ^[0-9a-f]{40}$ ]]'));
+  assert.ok(ciWorkflow.includes('echo "repository=lyc-aon/oh-my-pi" >> "$GITHUB_OUTPUT"'));
+  assert.ok(ciWorkflow.includes("repository: ${{ steps.authority.outputs.repository }}"));
+  assert.ok(ciWorkflow.includes("ref: ${{ steps.authority.outputs.sha }}"));
+  assert.ok(ciWorkflow.includes("T4_OMP_SOURCE_DIR: ${{ github.workspace }}/.continuity/omp"));
+  assert.ok(ciWorkflow.includes("run: pnpm test:legacy-bridge-continuity"));
+  assert.ok(ciWorkflow.includes("path: artifacts/legacy-bridge-continuity/"));
+  assert.ok(ciWorkflow.includes("if-no-files-found: error"));
   assert.ok(ciWorkflow.includes("tooling:"));
   assert.ok(ciWorkflow.includes("name: verify"));
   assert.ok(ciWorkflow.includes("if: ${{ always() }}"));
-  assert.ok(ciWorkflow.includes("needs: [core, tooling, android-debug]"));
+  assert.ok(ciWorkflow.includes("needs: [core, legacy-bridge-continuity, tooling, android-debug]"));
   assert.ok(ciWorkflow.includes('test "$CORE_RESULT" = success'));
+  assert.ok(ciWorkflow.includes('test "$CONTINUITY_RESULT" = success'));
   assert.ok(ciWorkflow.includes('test "$TOOLING_RESULT" = success'));
   assert.ok(ciWorkflow.includes('test "$ANDROID_RESULT" = success'));
   assert.ok(ciWorkflow.includes("github.event_name == 'pull_request' && github.ref || github.sha"));

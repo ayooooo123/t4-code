@@ -200,10 +200,10 @@ export function MobileConnectionScreen({
 
   return (
     <div className="flex min-h-full flex-col bg-background text-foreground">
-      <header className="flex min-h-14 items-center border-border border-b px-4 pt-[env(safe-area-inset-top)]">
+      <header className="flex min-h-14 items-center border-border border-b px-4 pt-(--app-safe-area-top)">
         <BrandLockup />
       </header>
-      <main className="mx-auto flex w-full max-w-lg flex-1 flex-col justify-center px-5 py-10">
+      <main className="mx-auto flex w-full max-w-lg flex-1 flex-col justify-center pt-10 pr-[max(1.25rem,var(--app-safe-area-right))] pb-[calc(2.5rem+var(--app-safe-area-bottom))] pl-[max(1.25rem,var(--app-safe-area-left))]">
         <div className="mb-8 flex size-11 items-center justify-center rounded-lg bg-primary text-primary-foreground">
           <Cable aria-hidden="true" className="size-5" />
         </div>

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { OMP_RUNTIME_INTEGRATION } from "@t4-code/client";
 import type { DesktopRuntimeController, DesktopRuntimeSnapshot } from "@t4-code/client";
 import {
   commandId,
@@ -10,19 +11,23 @@ import {
   type CatalogFrame,
   type SessionRef,
 } from "@t4-code/protocol";
-import type {
-  CommandRequest,
-  CommandResult,
-  ConfirmRequest,
-  ConfirmResult,
-  RendererServerFrameEvent,
+import {
+  rendererServerEventFromFrame,
+  type CommandRequest,
+  type CommandResult,
+  type ConfirmRequest,
+  type ConfirmResult,
+  type RendererServerEventEnvelope,
+  type RendererServerFrame,
 } from "@t4-code/protocol/desktop-ipc";
 
 import {
   archiveLiveSession,
   deleteLiveSession,
   managementCommandSupport,
+  projectRevealSupport,
   renameLiveSession,
+  revealLiveProject,
   restoreLiveSession,
   sessionCreateSupport,
   sessionIsArchived,
@@ -31,7 +36,7 @@ import {
   terminateLiveSession,
 } from "../src/features/session-runtime/session-management.ts";
 import { presentSessionControl } from "../src/features/session-runtime/session-observer.ts";
-import type { LiveSessionAddress } from "../src/platform/live-workspace.ts";
+import type { LiveProjectAddress, LiveSessionAddress } from "../src/platform/live-workspace.ts";
 
 const ADDRESS: LiveSessionAddress = {
   targetId: "target-1",
@@ -39,6 +44,11 @@ const ADDRESS: LiveSessionAddress = {
   sessionId: "session-1",
 };
 const KEY = `${ADDRESS.hostId}\u0000${ADDRESS.sessionId}`;
+const PROJECT_ADDRESS: LiveProjectAddress = {
+  targetId: ADDRESS.targetId,
+  hostId: ADDRESS.hostId,
+  projectId: "project-1",
+};
 
 function ref(
   options: { archived?: boolean; revision?: string; status?: string; title?: string } = {},
@@ -64,6 +74,7 @@ function catalog(): CatalogFrame {
     revision: revision("catalog-1"),
     items: [
       "session.create",
+      "project.reveal",
       "session.rename",
       "session.archive",
       "session.restore",
@@ -86,7 +97,7 @@ class FakeManagementController {
   readonly confirms: ConfirmRequest[] = [];
   maxConcurrentChallengedCommands = 0;
   private readonly snapshotListeners = new Set<(snapshot: DesktopRuntimeSnapshot) => void>();
-  private readonly frameListeners = new Set<(event: RendererServerFrameEvent) => void>();
+  private readonly eventListeners = new Set<(event: RendererServerEventEnvelope) => void>();
   private readonly sessionIndex = new Map<string, SessionRef>();
   closeRejection: NonNullable<CommandResult["error"]> | null = null;
   emitStaleCloseChallengeDuringLease = false;
@@ -132,10 +143,22 @@ class FakeManagementController {
   getSnapshot(): DesktopRuntimeSnapshot {
     return {
       version: 1,
+      integration: OMP_RUNTIME_INTEGRATION,
       platform: "linux",
       desktopVersion: "test",
       startState: "started",
-      targets: new Map(),
+      targets: new Map([
+        [
+          ADDRESS.targetId,
+          {
+            targetId: ADDRESS.targetId,
+            kind: "local",
+            label: "This Mac",
+            state: "connected",
+            paired: true,
+          },
+        ],
+      ]),
       connections: new Map([[ADDRESS.targetId, "connected"]]),
       targetHosts: new Map([[ADDRESS.targetId, ADDRESS.hostId]]),
       hosts: new Map([
@@ -150,7 +173,7 @@ class FakeManagementController {
             appserverBuild: "test",
             epoch: "epoch-1",
             grantedCapabilities: ["sessions.manage"],
-            grantedFeatures: [],
+            grantedFeatures: ["project.reveal"],
             negotiatedLimits: {},
             authentication: "local",
             resumed: false,
@@ -184,12 +207,12 @@ class FakeManagementController {
     return () => this.snapshotListeners.delete(listener);
   }
 
-  subscribeFrames(
+  subscribeEvents(
     _filter: unknown,
-    listener: (event: RendererServerFrameEvent) => void,
+    listener: (event: RendererServerEventEnvelope) => void,
   ): () => void {
-    this.frameListeners.add(listener);
-    return () => this.frameListeners.delete(listener);
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
   }
 
   async command(_targetId: string, intent: CommandRequest["intent"]): Promise<CommandResult> {
@@ -213,6 +236,9 @@ class FakeManagementController {
     if (intent.command === "session.restore") {
       this.pendingMutation = "restore";
       return { ...base, result: { restored: true } };
+    }
+    if (intent.command === "project.reveal") {
+      return { ...base, result: { revealed: true } };
     }
     if (intent.command === "session.close" && this.closeRejection !== null) {
       return { ...base, accepted: false, error: this.closeRejection };
@@ -329,9 +355,12 @@ class FakeManagementController {
     };
   }
 
-  private emitFrame(frame: RendererServerFrameEvent["frame"]): void {
-    const event = { targetId: ADDRESS.targetId, frame };
-    for (const listener of this.frameListeners) listener(event);
+  private emitFrame(frame: RendererServerFrame): void {
+    const event = {
+      targetId: ADDRESS.targetId,
+      event: rendererServerEventFromFrame(frame),
+    };
+    for (const listener of this.eventListeners) listener(event);
   }
 
   private emitSnapshot(): void {
@@ -387,6 +416,41 @@ function controller(fake: FakeManagementController): DesktopRuntimeController {
 }
 
 describe("session management authority helpers", () => {
+  it("reveals only a negotiated local project and sends no folder path", async () => {
+    const fake = new FakeManagementController();
+    expect(projectRevealSupport(fake.getSnapshot(), PROJECT_ADDRESS)).toEqual({
+      supported: true,
+      reason: null,
+    });
+    await revealLiveProject(controller(fake), PROJECT_ADDRESS);
+    expect(fake.commands.at(-1)).toEqual({
+      hostId: hostId(ADDRESS.hostId),
+      command: "project.reveal",
+      args: { projectId: projectId(PROJECT_ADDRESS.projectId) },
+    });
+    expect(fake.commands.at(-1)).not.toHaveProperty("args.cwd");
+
+    const remote = {
+      ...fake.getSnapshot(),
+      targets: new Map([
+        [
+          ADDRESS.targetId,
+          {
+            targetId: ADDRESS.targetId,
+            kind: "remote",
+            label: "Remote Mac",
+            state: "connected",
+            paired: true,
+          },
+        ],
+      ]),
+    } as DesktopRuntimeSnapshot;
+    expect(projectRevealSupport(remote, PROJECT_ADDRESS)).toEqual({
+      supported: false,
+      reason: "Reveal in Finder is available only on this Mac",
+    });
+  });
+
   it("offers creation only when the live host catalog advertises session.create", () => {
     const snapshot = new FakeManagementController().getSnapshot();
     const address = { targetId: ADDRESS.targetId, hostId: ADDRESS.hostId, projectId: "project-1" };
@@ -869,9 +933,7 @@ describe("dispatch-time ownership rechecks", () => {
     fake.onChallenge = () => fake.replaceRef(OBSERVED_REF);
     await expect(terminateLiveSession(controller(fake), ADDRESS)).rejects.toThrow(OBSERVED_REASON);
     expect(fake.confirms).toHaveLength(0);
-    expect(
-      fake.commands.filter((intent) => intent.command === "session.list"),
-    ).toHaveLength(0);
+    expect(fake.commands.filter((intent) => intent.command === "session.list")).toHaveLength(0);
   });
 });
 

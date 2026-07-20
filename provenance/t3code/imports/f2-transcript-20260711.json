@@ -9,28 +9,28 @@
       "sourceBlobSha": "1a4dc6b689558a9f8d834c12d7ecb2bb64e0d7c8",
       "targetPath": "apps/web/src/features/transcript/TranscriptTimeline.tsx",
       "classification": "adapted",
-      "checksum": "sha256:7771cd7d001b856ddcfa859bc48de5603e780d31ea261200114b2346f280b2cd"
+      "checksum": "sha256:ce4fdbf078a4556bdb3b0e3b1fcd222711e7053661ca3942158169acc8fea18a"
     },
     {
       "sourcePath": "apps/web/src/components/chat/MessagesTimeline.tsx",
       "sourceBlobSha": "1a4dc6b689558a9f8d834c12d7ecb2bb64e0d7c8",
       "targetPath": "apps/web/src/features/transcript/rows.ts",
       "classification": "adapted",
-      "checksum": "sha256:ad49a8e51f40f370791736de6821e0fccdc0bb11ec0019ea66506341a72a824c"
+      "checksum": "sha256:fa0ed4864778a149a4670ad9efbad449e24ebeb46b6caeb96eb956f20cc03e5b"
     },
     {
       "sourcePath": "apps/web/src/components/chat/MessagesTimeline.tsx",
       "sourceBlobSha": "1a4dc6b689558a9f8d834c12d7ecb2bb64e0d7c8",
       "targetPath": "apps/web/src/features/transcript/TranscriptRows.tsx",
       "classification": "adapted",
-      "checksum": "sha256:407886a370374106052557f855186286b9a421baaa43beefe34d1443bee3f7af"
+      "checksum": "sha256:5a3952985145f4b13b2aebc54e819c4c9ae2c9c3da6bf8f250b62852a4e40034"
     },
     {
       "sourcePath": "packages/shared/src/searchRanking.ts;apps/web/src/components/chat/composerSlashCommandSearch.ts",
       "sourceBlobSha": "b2fb2e223d3b7b85f993b48558222f708c4c6b54;c4919b1924515d1611c33a01bc6029f50605c749",
-      "targetPath": "apps/web/src/features/composer/slash.ts",
+      "targetPath": "apps/web/src/features/composer/slash.ts + apps/web/src/features/composer/match.ts",
       "classification": "adapted",
-      "checksum": "sha256:7998ce82281cba3beab240b7ac7163de73b2c37128ecf82ddd9506f89ffa58c7"
+      "checksum": "sha256:833f8ebd576e4e37db527b8a5dac4c8dfbe31d85295b796c1ea26b3bbcd4acc5;sha256:de8963354251eba7321b17b62e9b6de1aa550b5e3ad6be5f2bc9c9635697aefc"
     },
     {
       "sourcePath": "apps/web/src/components/chat/ContextWindowMeter.tsx",

@@ -5,7 +5,7 @@
 // runtime's words, and removing a host says exactly what it does: it
 // deletes the credential stored on this computer, nothing more.
 import type { DesktopRuntimeSnapshot } from "@t4-code/client";
-import type { LocalProfile, ServiceInspection } from "@t4-code/protocol/desktop-ipc";
+import type { LocalProfile, PhoneSetupState, ServiceInspection } from "@t4-code/protocol/desktop-ipc";
 import {
   Badge,
   Button,
@@ -22,6 +22,7 @@ import {
 } from "@t4-code/ui";
 import { ArrowLeft, Cable, Check, Copy, Plus, UsersRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 
 import { ToneBadge } from "../onboarding/bits.tsx";
 import { FIELD_CLASS } from "../settings/controls.tsx";
@@ -174,6 +175,86 @@ function ServiceCard({ api }: { readonly api: TargetsStoreApi }) {
           Check again
         </Button>
       </div>
+    </section>
+  );
+}
+
+interface PhoneSetupApi {
+  readonly inspect: () => Promise<PhoneSetupState>;
+  readonly configure: () => Promise<PhoneSetupState>;
+}
+
+function PhoneSetupCard({ api }: { readonly api: PhoneSetupApi }) {
+  const { configure: configurePhone, inspect } = api;
+  const [state, setState] = useState<PhoneSetupState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void inspect().then((next) => { if (active) setState(next); }, () => {
+      if (active) setState({ phase: "error", message: "Phone setup could not be checked." });
+    });
+    return () => { active = false; };
+  }, [inspect]);
+  const configure = async () => {
+    setBusy(true);
+    try { setState(await configurePhone()); }
+    catch { setState({ phase: "error", message: "Phone setup could not be completed." }); }
+    finally { setBusy(false); }
+  };
+  const copy = async () => {
+    if (!state?.url) return;
+    try { await navigator.clipboard.writeText(state.url); }
+    catch { return; }
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1_500);
+  };
+  const ready = state?.phase === "ready" && state.url !== undefined;
+  return (
+    <section aria-labelledby="phone-setup-heading" className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="font-heading font-semibold text-sm" id="phone-setup-heading">Use T4 Code on your phone</h2>
+          <p className="mt-1 text-muted-foreground text-xs">
+            {state?.message ?? "Checking private phone access…"}
+          </p>
+        </div>
+        <ToneBadge
+          label={ready ? "Ready" : busy || state === null ? "Checking" : state.phase === "error" ? "Needs attention" : "Private"}
+          tone={ready ? "success" : busy || state === null ? "working" : state?.phase === "error" ? "error" : "muted"}
+        />
+      </div>
+      {ready ? (
+        <div className="mt-4 grid items-center gap-4 sm:grid-cols-[auto_1fr]">
+          <div className="w-fit rounded-xl p-3 shadow-sm">
+            <QRCodeSVG aria-label="QR code for private T4 Code phone access" level="M" size={164} value={state.url!} />
+          </div>
+          <div className="flex min-w-0 flex-col gap-3">
+            <ol className="list-decimal space-y-1 pl-4 text-sm">
+              <li>Open Tailscale on your phone, sign in to the same account, and connect.</li>
+              <li>
+                For automatic reconnect, tap your Tailscale profile picture, open
+                {" "}<span className="font-medium">VPN On Demand</span>, and set both Wi-Fi and
+                Cellular to <span className="font-medium">Always</span>.
+              </li>
+              <li>Scan this code with your phone camera.</li>
+              <li>Choose <span className="font-medium">Add to Home Screen</span> in Safari if you want an app icon.</li>
+            </ol>
+            <div className="flex min-w-0 items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded bg-secondary px-2 py-1.5 text-xs">{state.url}</code>
+              <Button onClick={() => void copy()} size="xs" variant="outline">
+                {copied ? <Check /> : <Copy />}{copied ? "Copied" : "Copy"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : state !== null && state.phase !== "unsupported" ? (
+        <div className="mt-3">
+          <Button disabled={busy || state.phase === "tailscale-required"} onClick={() => void configure()} size="sm">
+            {busy && <Spinner />}{busy ? "Setting up…" : "Set up phone access"}
+          </Button>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -876,6 +957,7 @@ export function TargetsScreen({
   snapshot,
   serviceAvailable,
   profilesAvailable,
+  phoneSetup,
   onBack,
 }: {
   readonly api: TargetsStoreApi;
@@ -884,6 +966,7 @@ export function TargetsScreen({
   readonly serviceAvailable: boolean;
   /** Whether this desktop build exposes isolated named-profile management. */
   readonly profilesAvailable: boolean;
+  readonly phoneSetup?: PhoneSetupApi;
   readonly onBack: () => void;
 }) {
   const announcement = useTargets(api, (state) => state.announcement);
@@ -912,12 +995,13 @@ export function TargetsScreen({
         </p>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex max-w-3xl flex-col gap-4 px-4 py-4">
+        <div className="mx-auto flex max-w-3xl flex-col gap-4 pt-4 pr-[max(1rem,var(--app-safe-area-right))] pb-[calc(1rem+var(--app-safe-area-bottom))] pl-[max(1rem,var(--app-safe-area-left))]">
           {profilesAvailable ? (
             <ProfilesSection api={api} />
           ) : serviceAvailable ? (
             <ServiceCard api={api} />
           ) : null}
+          {phoneSetup !== undefined && <PhoneSetupCard api={phoneSetup} />}
           <section aria-labelledby="hosts-heading" className="flex flex-col gap-2">
             <h2 className="font-heading font-semibold text-foreground text-sm" id="hosts-heading">
               Connections

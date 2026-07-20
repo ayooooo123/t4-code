@@ -16,7 +16,7 @@ import {
   type OmpClient,
   type OmpClientOptions,
   type OmpTransport,
-  type PublicServerFrame,
+  type PublicOmpServerEvent,
   type Unsubscribe,
 } from "@t4-code/client";
 import {
@@ -24,7 +24,6 @@ import {
   DEVICE_CAPABILITIES,
   PROTOCOL_VERSION,
   deviceToken as validateDeviceToken,
-  type WelcomeFrame,
 } from "@t4-code/protocol";
 import type {
   BootstrapResult,
@@ -40,8 +39,10 @@ import type {
   PairResult,
   PairLinkEvent,
   PairLinksDrainResult,
-  RendererServerFrameEvent,
+  RendererServerEventEnvelope,
   RuntimeErrorEvent,
+  SpeechRequest,
+  SpeechResult,
   TargetAddRequest,
   TargetAddResult,
   TargetListResult,
@@ -55,7 +56,7 @@ import type {
   WorkspaceRootSelectRequest,
   WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
-import { commandResultError } from "@t4-code/protocol/desktop-ipc";
+import { commandResultError, decodeSpeechText } from "@t4-code/protocol/desktop-ipc";
 import type { DesktopShellPort } from "@t4-code/client";
 
 import { BrowserWebSocketTransport } from "./browser-transport.ts";
@@ -132,7 +133,7 @@ function parseBackendPayload(value: unknown): BrowserBackendConfig {
   const data = value as Record<string, unknown>;
   const wsUrl = validatedWsUrl(data.wsUrl);
   const label =
-    data.label === undefined ? "OMP Appserver" : boundedText(data.label, "label", MAX_LABEL_LENGTH);
+    data.label === undefined ? "T4 host" : boundedText(data.label, "label", MAX_LABEL_LENGTH);
   const auth = data.auth;
   let deviceId = data.deviceId;
   let deviceToken = data.deviceToken ?? data.token;
@@ -200,8 +201,8 @@ export function detectBackend(): BrowserBackendConfig | null {
 interface StateListener {
   (event: ConnectionStateEvent): void;
 }
-interface FrameListener {
-  (event: RendererServerFrameEvent): void;
+interface ServerEventListener {
+  (event: RendererServerEventEnvelope): void;
 }
 interface ErrorListener {
   (event: RuntimeErrorEvent): void;
@@ -225,7 +226,6 @@ export function createBrowserShellPort(
     : { wsUrl: "wss://private.invalid", label: preparedConnection?.label ?? "T4 private host" };
   if (config === null) return null;
   const backendConfig = config;
-
   const mobilePlatform = nativeMobilePlatform();
   const platform: "linux" | "darwin" = (() => {
     if (typeof navigator !== "undefined" && /mac/i.test(navigator.platform)) return "darwin";
@@ -237,7 +237,7 @@ export function createBrowserShellPort(
   let activePeerTransport: CapacitorPeerTransport | undefined;
   let transport: OmpTransport | undefined;
   const pendingOpens = new Set<OmpTransport>();
-  let welcome: WelcomeFrame | undefined;
+  let welcomeAuthentication: "local" | "pairing-required" | "paired" | undefined;
   let stopLifecycle: Unsubscribe | undefined;
   let cancelNativeResumeWake: (() => void) | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
@@ -247,10 +247,12 @@ export function createBrowserShellPort(
       : { deviceId: backendConfig.deviceId, deviceToken: backendConfig.deviceToken };
   const browserDeviceId = backendConfig.deviceId ?? `browser-${Date.now().toString(36)}`;
 
-  const frameListeners = new Set<FrameListener>();
+  const serverEventListeners = new Set<ServerEventListener>();
   const stateListeners = new Set<StateListener>();
   const errorListeners = new Set<ErrorListener>();
   const pairLinkListeners = new Set<PairLinkListener>();
+  const wakeListeners = new Set<() => void>();
+  let browserSpeechResolve: ((result: SpeechResult) => void) | undefined;
 
   function emitState(targetId: string, state: DesktopTarget["state"]): void {
     connectionState = state;
@@ -271,18 +273,21 @@ export function createBrowserShellPort(
     for (const listener of errorListeners) listener(event);
   }
 
-  function emitFrame(targetId: string, frame: RendererServerFrameEvent["frame"]): void {
-    const event: RendererServerFrameEvent = { targetId, frame };
-    for (const listener of frameListeners) listener(event);
+  function emitServerEvent(targetId: string, event: PublicOmpServerEvent): void {
+    const envelope: RendererServerEventEnvelope = { targetId, event };
+    for (const listener of serverEventListeners) listener(envelope);
   }
 
-  function safePublicFrame(frame: PublicServerFrame): PublicServerFrame {
-    if (frame.type !== "response" || frame.error === undefined) return frame;
-    const error = commandResultError(frame.error) ?? {
+  function safePublicEvent(event: PublicOmpServerEvent): PublicOmpServerEvent {
+    if (event.kind !== "response" || event.payload.error === undefined) return event;
+    const error = commandResultError(event.payload.error) ?? {
       code: "internal",
       message: "command failed",
     };
-    return { ...frame, error };
+    return Object.freeze({
+      ...event,
+      payload: Object.freeze({ ...event.payload, error }),
+    }) as PublicOmpServerEvent;
   }
   function buildClient(): OmpClient {
     const transportFactory = async (): Promise<OmpTransport> => {
@@ -322,16 +327,16 @@ export function createBrowserShellPort(
       },
       client: {
         name: "T4 Code",
-        version: "0.1.22",
+        version: "0.1.30",
         build: mobilePlatform ?? "browser",
         platform: mobilePlatform ?? (platform === "darwin" ? "darwin" : "linux"),
       },
       reconnect: { baseMs: 250, maxMs: 10_000 },
     });
 
-    c.onFrame((frame) => {
-      if (frame.type === "welcome") welcome = frame;
-      emitFrame(TARGET_ID, safePublicFrame(frame));
+    c.onEvent((event) => {
+      if (event.kind === "welcome") welcomeAuthentication = event.payload.authentication;
+      emitServerEvent(TARGET_ID, safePublicEvent(event));
     });
 
     c.onState((snapshot) => {
@@ -375,18 +380,65 @@ export function createBrowserShellPort(
         const timer = setTimeout(() => {
           cancelNativeResumeWake = undefined;
           client?.wake();
+          // eslint-disable-next-line unicorn/no-useless-spread -- listeners may unsubscribe during wake dispatch.
+          for (const listener of [...wakeListeners]) listener();
         }, NATIVE_RESUME_GRACE_MS);
         cancelNativeResumeWake = () => clearTimeout(timer);
         return;
       }
       client?.wake();
+      // eslint-disable-next-line unicorn/no-useless-spread -- listeners may unsubscribe during wake dispatch.
+      for (const listener of [...wakeListeners]) listener();
     }, options.lifecycle);
   }
 
   // ------------------------------------------------------------------ shell port
 
+  async function speakText(request: SpeechRequest): Promise<SpeechResult> {
+    let text: string;
+    try { text = decodeSpeechText(request.text); } catch (error) {
+      return { accepted: false, error: error instanceof Error ? error.message : "invalid speech text" };
+    }
+    const plugin = mobilePlatform === "android" && typeof window !== "undefined" ? (window.Capacitor?.Plugins?.T4Speech ?? null) : null;
+    if (plugin !== null) {
+      try { return await plugin.speakText({ text }); }
+      catch { return { accepted: false, error: "Android speech is unavailable" }; }
+    }
+    const synthesis = (globalThis as typeof globalThis & { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
+    const Utterance = (globalThis as typeof globalThis & { SpeechSynthesisUtterance?: typeof SpeechSynthesisUtterance }).SpeechSynthesisUtterance;
+    if (synthesis === undefined || Utterance === undefined) return { accepted: false, error: "Speech synthesis is unavailable" };
+    browserSpeechResolve?.({ accepted: false, error: "Speech replaced" });
+    synthesis.cancel();
+    const { promise, resolve } = Promise.withResolvers<SpeechResult>();
+    browserSpeechResolve = resolve;
+    const utterance = new Utterance(text);
+    utterance.onend = () => { if (browserSpeechResolve === resolve) { browserSpeechResolve = undefined; resolve({ accepted: true }); } };
+    utterance.onerror = () => { if (browserSpeechResolve === resolve) { browserSpeechResolve = undefined; resolve({ accepted: false, error: "Speech synthesis failed" }); } };
+    synthesis.speak(utterance);
+    return promise;
+  }
+
+  async function stopSpeaking(): Promise<SpeechResult> {
+    if (mobilePlatform === "android") {
+      const plugin = typeof window !== "undefined" ? window.Capacitor?.Plugins?.T4Speech : undefined;
+      if (plugin !== undefined) {
+        try { return await plugin.stopSpeaking(); }
+        catch { return { accepted: false, error: "Android speech is unavailable" }; }
+      }
+    }
+    const synthesis = (globalThis as typeof globalThis & { speechSynthesis?: SpeechSynthesis }).speechSynthesis;
+    if (synthesis === undefined) return { accepted: false, error: "Speech synthesis is unavailable" };
+    synthesis.cancel();
+    const resolve = browserSpeechResolve;
+    browserSpeechResolve = undefined;
+    resolve?.({ accepted: false, error: "Speech cancelled" });
+    return { accepted: true };
+  }
   const shell: DesktopShellPort = {
     kind: "desktop" as const,
+
+    speakText,
+    stopSpeaking,
     platform,
 
     async bootstrap(): Promise<BootstrapResult> {
@@ -419,11 +471,20 @@ export function createBrowserShellPort(
 
     async disconnect(_request: TargetRequest): Promise<DisconnectResult> {
       clearNativeResumeWake();
+      // Settle any active speech first: a disconnected session must not keep
+      // talking, and a pending speech promise must resolve before the client
+      // and lifecycle bindings are torn down.
+      try {
+        await stopSpeaking();
+      } catch {
+        // Speech settle is best-effort; teardown proceeds regardless.
+      }
       for (const pending of pendingOpens) pending.close();
       if (client !== undefined) {
         await client.close();
         client = undefined;
-        welcome = undefined;
+        transport = undefined;
+        welcomeAuthentication = undefined;
       }
       stopLifecycle?.();
       stopLifecycle = undefined;
@@ -524,7 +585,7 @@ export function createBrowserShellPort(
 
     async pair(request: PairRequest): Promise<PairResult> {
       if (client === undefined || client.state !== "pairing") throw new Error("not ready to pair");
-      const result = await client.pairStart({
+      await client.pairStart({
         code: request.code,
         deviceId: browserDeviceId,
         deviceName:
@@ -534,7 +595,7 @@ export function createBrowserShellPort(
         platform: mobilePlatform ?? platform,
         requestedCapabilities: DEVICE_CAPABILITIES,
       });
-      return { targetId: request.targetId, paired: result.type === "pair.ok" };
+      return { targetId: request.targetId, paired: true };
     },
 
     async drainPairLinks(): Promise<PairLinksDrainResult> {
@@ -551,7 +612,7 @@ export function createBrowserShellPort(
           label: backendConfig.label,
           kind: "remote",
           state: connectionState,
-          paired: authentication !== undefined || welcome?.authentication === "paired",
+          paired: authentication !== undefined || welcomeAuthentication === "paired",
         },
       ];
       return { targets };
@@ -573,9 +634,9 @@ export function createBrowserShellPort(
       return this.disconnect(request);
     },
 
-    onServerFrame(listener: FrameListener): Unsubscribe {
-      frameListeners.add(listener);
-      return () => frameListeners.delete(listener);
+    onServerEvent(listener: ServerEventListener): Unsubscribe {
+      serverEventListeners.add(listener);
+      return () => serverEventListeners.delete(listener);
     },
 
     onConnectionState(listener: StateListener): Unsubscribe {
@@ -586,6 +647,10 @@ export function createBrowserShellPort(
     onRuntimeError(listener: ErrorListener): Unsubscribe {
       errorListeners.add(listener);
       return () => errorListeners.delete(listener);
+    },
+    onWake(listener: () => void): Unsubscribe {
+      wakeListeners.add(listener);
+      return () => wakeListeners.delete(listener);
     },
 
     onPairLink(listener: PairLinkListener): Unsubscribe {

@@ -4,10 +4,13 @@ import { createHash } from "node:crypto";
 import {
   appendFile,
   chmod,
+  copyFile,
   lstat,
   mkdir,
+  readdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -16,14 +19,21 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 
+import { makeCanonicalTemporaryDirectory } from "./test-temporary-directory.mjs";
+
 const repoRoot = resolve(import.meta.dirname, "..");
 const deployScript = resolve(repoRoot, "ops/t4-maintainer/deploy-local.sh");
 const runnerScript = resolve(repoRoot, "ops/t4-maintainer/run.sh");
-
+const bashPath = "/bin/bash";
+// Full-suite contention can push a successful convergence run past 30 seconds
+// on macOS. Keep this above the production process boundary so the fixture
+// reports the child result instead of a test-harness timeout.
+const integrationProcessTimeoutMs = 60_000;
 const upstreamCommit = "a".repeat(40);
 const integrationCommit = "b".repeat(40);
 const t4Commit = "c".repeat(40);
 const mainCommit = "d".repeat(40);
+const changedT4MainCommit = "1".repeat(40);
 const upstreamTagObject = "e".repeat(40);
 const integrationTagObject = "f".repeat(40);
 const mockDebSize = Buffer.byteLength("mock-deb\n");
@@ -31,6 +41,37 @@ const mockAssetSize = Buffer.byteLength("mock-asset\n");
 const mockDebSha512 = createHash("sha512").update("mock-deb\n").digest("base64");
 const mockAssetSha512 = createHash("sha512").update("mock-asset\n").digest("base64");
 const mockDriftSha512 = createHash("sha512").update("drift\n").digest("base64");
+const flockUnavailable =
+  spawnSync("flock", ["--version"], { stdio: "ignore" }).error?.code === "ENOENT";
+const statModeProbe = spawnSync("stat", ["-c", "%a", import.meta.filename], {
+  encoding: "utf8",
+});
+const statModeUnavailable =
+  statModeProbe.status !== 0 || !/^[0-7]+\n$/u.test(statModeProbe.stdout);
+const nullSortExpected = Buffer.from("a\0b\0");
+const nullSortProbe = spawnSync("sort", ["-z"], { input: Buffer.from("b\0a\0") });
+const nullSortUnavailable =
+  nullSortProbe.status !== 0 || nullSortProbe.stdout?.equals(nullSortExpected) !== true;
+const portableFlockMock = "#!/usr/bin/env bash\nexit 0\n";
+const portableStatMock = [
+  "#!/usr/bin/env bash",
+  "set -euo pipefail",
+  "if [[ ${1:-} == -c && ${2:-} == %a && $# -eq 3 ]]; then",
+  '  exec "$MOCK_NODE_EXECUTABLE" -e \'const fs=require("node:fs");const mode=fs.statSync(process.argv[1]).mode&0o7777;process.stdout.write(mode.toString(8)+"\\n")\' "$3"',
+  "fi",
+  'exec /usr/bin/stat "$@"',
+  "",
+].join("\n");
+const portableNullSortMock = [
+  "#!/usr/bin/env bash",
+  "set -euo pipefail",
+  "if [[ ${1:-} == -z && $# -eq 1 ]]; then",
+  '  exec "$MOCK_NODE_EXECUTABLE" -e \'const fs=require("node:fs");const data=fs.readFileSync(0);const parts=[];let start=0;for(let index=0;index<data.length;index+=1){if(data[index]===0){parts.push(data.subarray(start,index));start=index+1;}}if(start<data.length)parts.push(data.subarray(start));parts.sort(Buffer.compare);const output=[];for(const part of parts)output.push(part,Buffer.from([0]));process.stdout.write(Buffer.concat(output));\'',
+  "fi",
+  'exec /usr/bin/sort "$@"',
+  "",
+].join("\n");
+
 
 const mockDispatcher = String.raw`#!/usr/bin/env bash
 set -euo pipefail
@@ -96,6 +137,22 @@ case $tool in
       [[ $argument == repos/* ]] && endpoint=$argument
     done
     case $endpoint in
+      'repos/LycaonLLC/t4-code/pulls?state=open&base=main&per_page=100')
+        count=$(read_state t4-pr-queries 0)
+        count=$((count + 1))
+        write_state t4-pr-queries "$count"
+        if [[ -n \${MOCK_PR_FAIL_AFTER:-} && $count -gt \${MOCK_PR_FAIL_AFTER} ]]; then
+          exit 1
+        elif [[ \${MOCK_PR_SEQUENTIAL:-0} == 1 && $count -ge 2 ]] ||
+             [[ -n \${MOCK_PR_CHANGE_AFTER:-} && $count -gt \${MOCK_PR_CHANGE_AFTER} ]]; then
+          printf '%s\n' '[{"number":42,"draft":false,"title":"Release cutover","labels":[]}]'
+        else
+          printf '%s\n' '[]'
+        fi
+        ;;
+      repos/LycaonLLC/t4-code/pulls/42/files?per_page=100)
+        printf '%s\n' '[{"filename":"ops/t4-maintainer/run.sh"}]'
+        ;;
       repos/can1357/oh-my-pi/releases/latest)
         printf '{"draft":false,"prerelease":false,"tag_name":"v1.2.3"}\n'
         ;;
@@ -165,7 +222,17 @@ case $tool in
       repos/lyc-aon/oh-my-pi/commits/t4code-1.2.3-appserver-1)
         printf '%s\n' "$MOCK_INTEGRATION_COMMIT"
         ;;
-      repos/LycaonLLC/t4-code/commits/v1.2.3|repos/LycaonLLC/t4-code/commits/main)
+      repos/LycaonLLC/t4-code/commits/main)
+        count=$(read_state t4-main-queries 0)
+        count=$((count + 1))
+        write_state t4-main-queries "$count"
+        if [[ -n \${MOCK_T4_MAIN_COMMIT_AFTER:-} && $count -gt \${MOCK_T4_MAIN_COMMIT_AFTER} ]]; then
+          printf '%s\n' "\${MOCK_T4_MAIN_COMMIT_CHANGED:?}"
+        else
+          printf '%s\n' "$MOCK_T4_COMMIT"
+        fi
+        ;;
+      repos/LycaonLLC/t4-code/commits/v1.2.3)
         printf '%s\n' "$MOCK_T4_COMMIT"
         ;;
       repos/lyc-aon/oh-my-pi/compare/*)
@@ -186,7 +253,7 @@ case $tool in
         t4_ci_path='.github/workflows/ci.yml'
         t4_release_path='.github/workflows/release.yml'
         t4_site_path='.github/workflows/deploy-site.yml'
-        mock_workflow_updated_at=$( /usr/bin/date --utc +%Y-%m-%dT%H:%M:%SZ )
+        mock_workflow_updated_at=$( /bin/date -u +%Y-%m-%dT%H:%M:%SZ )
         [[ \${MOCK_T4_WORKFLOW_WRONG_PATH:-0} != 1 ]] || t4_ci_path='.github/workflows/not-ci.yml'
         if [[ (\${MOCK_WORKFLOWS_TERMINAL:-0} == 1 && ! -f $state/sol-ran) ||
               (\${MOCK_WORKFLOWS_FAIL_ONCE_AFTER_SOL:-0} == 1 && -f $state/sol-ran && ! -f $state/workflows-failed-once) ]]; then
@@ -196,7 +263,7 @@ case $tool in
 {"workflow_runs":[
  {"name":"CI","path":"$t4_ci_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"main","status":"completed","conclusion":"failure","updated_at":"2020-01-01T00:00:00Z"},
  {"name":"Release app builds","path":"$t4_release_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"v1.2.3","status":"completed","conclusion":"failure","updated_at":"2020-01-01T00:00:00Z"},
- {"name":"Deploy project site","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"completed","conclusion":"failure","updated_at":"2020-01-01T00:00:00Z"}
+ {"name":"Deploy project site v1.2.3 mock-dispatch","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"completed","conclusion":"failure","updated_at":"2020-01-01T00:00:00Z"}
 ]}
 JSON
         elif [[ \${MOCK_WORKFLOWS_ACTIVE:-0} == 1 ]]; then
@@ -204,7 +271,7 @@ JSON
 {"workflow_runs":[
  {"name":"CI","path":"$t4_ci_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"main","status":"in_progress","conclusion":null,"updated_at":"$mock_workflow_updated_at"},
  {"name":"Release app builds","path":"$t4_release_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"v1.2.3","status":"queued","conclusion":null,"updated_at":"$mock_workflow_updated_at"},
- {"name":"Deploy project site","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"queued","conclusion":null,"updated_at":"$mock_workflow_updated_at"}
+ {"name":"Deploy project site v1.2.3 mock-dispatch","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"queued","conclusion":null,"updated_at":"$mock_workflow_updated_at"}
 ]}
 JSON
         else
@@ -212,7 +279,7 @@ JSON
 {"workflow_runs":[
  {"name":"CI","path":"$t4_ci_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"main","status":"completed","conclusion":"success","updated_at":"$mock_workflow_updated_at"},
  {"name":"Release app builds","path":"$t4_release_path","head_sha":"$MOCK_T4_COMMIT","event":"push","head_branch":"v1.2.3","status":"completed","conclusion":"success","updated_at":"$mock_workflow_updated_at"},
- {"name":"Deploy project site","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"completed","conclusion":"success","updated_at":"$mock_workflow_updated_at"}
+ {"name":"Deploy project site v1.2.3 mock-dispatch","path":"$t4_site_path","head_sha":"$MOCK_T4_COMMIT","event":"workflow_dispatch","head_branch":"v1.2.3","status":"completed","conclusion":"success","updated_at":"$mock_workflow_updated_at"}
 ]}
 JSON
         fi
@@ -277,7 +344,7 @@ JSON
         fi
         ;;
       repos/lyc-aon/oh-my-pi/releases/tags/t4code-1.2.3-appserver-1)
-        omp_digest=$(printf 'mock-asset\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
+        omp_digest=$(printf 'mock-asset\n' | sha256sum | awk '{print $1}')
         omp_asset_prefix='mock://'
         [[ \${MOCK_OMP_ASSET_WRONG_ORIGIN:-0} != 1 ]] || omp_asset_prefix='https://example.invalid/'
         extra=''
@@ -303,16 +370,16 @@ JSON
         release_tag=\${endpoint##*/}
         release_version=\${release_tag#v}
         release_prefix="https://github.com/LycaonLLC/t4-code/releases/download/$release_tag"
-        deb_digest=$(printf 'mock-deb\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
-        asset_digest=$(printf 'mock-asset\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
+        deb_digest=$(printf 'mock-deb\n' | sha256sum | awk '{print $1}')
+        asset_digest=$(printf 'mock-asset\n' | sha256sum | awk '{print $1}')
         metadata=$(linux_update_metadata "$release_version")
-        metadata_digest=$(printf '%s\n' "$metadata" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
-        metadata_size=$(printf '%s\n' "$metadata" | /usr/bin/wc -c)
+        metadata_digest=$(printf '%s\n' "$metadata" | sha256sum | awk '{print $1}')
+        metadata_size=$(printf '%s\n' "$metadata" | wc -c)
         manifest=$(printf '%s  T4-Code-%s-android.apk\n%s  T4-Code-%s-linux-amd64.deb\n%s  T4-Code-%s-linux-x86_64.AppImage\n%s  T4-Code-%s-mac-arm64.dmg\n%s  T4-Code-%s-mac-arm64.zip\n%s  latest-linux.yml\n' \
           "$asset_digest" "$release_version" "$deb_digest" "$release_version" "$asset_digest" "$release_version" \
           "$asset_digest" "$release_version" "$asset_digest" "$release_version" "$metadata_digest")
-        manifest_digest=$(printf '%s\n' "$manifest" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
-        manifest_size=$(printf '%s\n' "$manifest" | /usr/bin/wc -c)
+        manifest_digest=$(printf '%s\n' "$manifest" | sha256sum | awk '{print $1}')
+        manifest_size=$(printf '%s\n' "$manifest" | wc -c)
         cat <<JSON
 {"tag_name":"$release_tag","html_url":"https://github.com/LycaonLLC/t4-code/releases/tag/$release_tag","published_at":"2026-07-15T00:00:00Z","draft":false,"prerelease":false,"assets":[
   {"name":"SHA256SUMS.txt","state":"uploaded","size":$manifest_size,"digest":"sha256:$manifest_digest","browser_download_url":"$release_prefix/SHA256SUMS.txt"},
@@ -350,8 +417,8 @@ JSON
         manifest_version=$version
         manifest_tag=$release_tag
         deb_size=${mockDebSize}
-        deb_digest=$(printf 'mock-deb\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
-        asset_digest=$(printf 'mock-asset\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
+        deb_digest=$(printf 'mock-deb\n' | sha256sum | awk '{print $1}')
+        asset_digest=$(printf 'mock-asset\n' | sha256sum | awk '{print $1}')
         apk_digest=$asset_digest
         apk_url="$release_prefix/T4-Code-$version-android.apk"
         extra=''
@@ -377,10 +444,10 @@ JSON
       elif [[ $url == *SHA256SUMS* ]]; then
         version=1.2.3
         [[ $url =~ /v([0-9]+\.[0-9]+\.[0-9]+)/SHA256SUMS\.txt ]] && version=\${BASH_REMATCH[1]}
-        deb_digest=$(printf 'mock-deb\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
-        asset_digest=$(printf 'mock-asset\n' | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
+        deb_digest=$(printf 'mock-deb\n' | sha256sum | awk '{print $1}')
+        asset_digest=$(printf 'mock-asset\n' | sha256sum | awk '{print $1}')
         metadata=$(linux_update_metadata "$version")
-        metadata_digest=$(printf '%s\n' "$metadata" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')
+        metadata_digest=$(printf '%s\n' "$metadata" | sha256sum | awk '{print $1}')
         printf '%s  T4-Code-%s-android.apk\n%s  T4-Code-%s-linux-amd64.deb\n%s  T4-Code-%s-linux-x86_64.AppImage\n%s  T4-Code-%s-mac-arm64.dmg\n%s  T4-Code-%s-mac-arm64.zip\n%s  latest-linux.yml\n' \
           "$asset_digest" "$version" "$deb_digest" "$version" "$asset_digest" "$version" \
           "$asset_digest" "$version" "$asset_digest" "$version" "$metadata_digest" >"$output"
@@ -401,9 +468,9 @@ JSON
       [[ $(read_state gateway-service inactive) == active ]] || exit 22
       [[ $(read_state gateway-health healthy) == healthy ]] || exit 22
       sessions=$(read_state active-sessions 0)
-      identity=$(read_state deployment-identity "sha256:$(printf old | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')")
+      identity=$(read_state deployment-identity "sha256:$(printf old | sha256sum | awk '{print $1}')")
       if [[ \${MOCK_STALE_LOOPBACK_IDENTITY:-0} == 1 ]]; then
-        identity="sha256:$(printf stale-loopback | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+        identity="sha256:$(printf stale-loopback | sha256sum | awk '{print $1}')"
       fi
       printf '{"ok":true,"web":true,"upstream":true,"transport":"local-unix","activeSessions":%s,"deploymentIdentity":"%s"}\n' "$sessions" "$identity"
       exit 0
@@ -421,9 +488,9 @@ JSON
         exit 0
       fi
       [[ $(read_state tailnet-health healthy) == healthy ]] || exit 22
-      identity=$(read_state deployment-identity "sha256:$(printf old | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')")
+      identity=$(read_state deployment-identity "sha256:$(printf old | sha256sum | awk '{print $1}')")
       if [[ \${MOCK_STALE_TAILNET_IDENTITY:-0} == 1 ]]; then
-        identity="sha256:$(printf stale | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+        identity="sha256:$(printf stale | sha256sum | awk '{print $1}')"
       fi
       printf '{"ok":true,"web":true,"upstream":true,"transport":"local-unix","activeSessions":0,"deploymentIdentity":"%s"}\n' "$identity"
       exit 0
@@ -585,13 +652,24 @@ SH
   omp)
     count=$(read_state sol-count 0)
     write_state sol-count $((count + 1))
+    printf 'sol-env\t%q\t%q\t%q\n' "$T4_MAINTENANCE_CONTEXT" "$T4_MAINTENANCE_RESULT" "$T4_MAINTENANCE_DEFERRAL_FILE" >>"$calls"
     write_state sol-ran 1
     if [[ \${MOCK_SOL_BACKGROUND_HOLDER:-0} == 1 ]]; then
       (sleep 30) >/dev/null 2>&1 &
       write_state sol-background-pid $!
     fi
-    if [[ -n \${MOCK_SOL_RESULT_SOURCE:-} ]]; then
+    if [[ -n \${MOCK_SOL_RESULT_SYMLINK_SOURCE:-} ]]; then
+      ln -s -- "$MOCK_SOL_RESULT_SYMLINK_SOURCE" "$T4_MAINTENANCE_RESULT"
+    elif [[ -n \${MOCK_SOL_RESULT_SOURCE:-} ]]; then
       cp -- "$MOCK_SOL_RESULT_SOURCE" "$T4_MAINTENANCE_RESULT"
+    fi
+    if [[ -n \${MOCK_SOL_DEFERRAL_SYMLINK_SOURCE:-} ]]; then
+      ln -s -- "$MOCK_SOL_DEFERRAL_SYMLINK_SOURCE" "$T4_MAINTENANCE_DEFERRAL_FILE"
+    elif [[ -n \${MOCK_SOL_DEFERRAL_SOURCE:-} ]]; then
+      cp -- "$MOCK_SOL_DEFERRAL_SOURCE" "$T4_MAINTENANCE_DEFERRAL_FILE"
+    fi
+    if [[ -n \${MOCK_SOL_DEFERRAL_MODE:-} && -e $T4_MAINTENANCE_DEFERRAL_FILE ]]; then
+      chmod "$MOCK_SOL_DEFERRAL_MODE" "$T4_MAINTENANCE_DEFERRAL_FILE"
     fi
     exit \${MOCK_SOL_STATUS:-86}
     ;;
@@ -606,6 +684,7 @@ SH
       runtime=$(dirname -- "$(dirname -- "$script")")
       shift 2
       origin='' port='' web_root='' app_socket='' label='' deployment_identity='' defer_start=false
+      profile_routes=null start_profiles=false
       while (($#)); do
         case $1 in
           --defer-start) defer_start=true; shift ;;
@@ -615,10 +694,12 @@ SH
           --app-socket) app_socket=$2; shift 2 ;;
           --label) label=$2; shift 2 ;;
           --deployment-identity) deployment_identity=$2; shift 2 ;;
+          --profile-routes) profile_routes=$2; shift 2 ;;
+          --start-profiles) start_profiles=true; shift ;;
           *) shift ;;
         esac
       done
-      /usr/bin/jq -n \
+      jq -n \
         --arg sourceRoot "$runtime" \
         --arg nodeExecutable "$MOCK_NODE_EXECUTABLE" \
         --arg gatewayScript "$runtime/scripts/tailnet-gateway.mjs" \
@@ -628,6 +709,8 @@ SH
         --arg label "$label" \
         --arg deploymentIdentity "$deployment_identity" \
         --arg webRoot "$web_root" \
+        --argjson profileRoutes "$profile_routes" \
+        --argjson startProfiles "$start_profiles" \
         '{
           sourceRoot:$sourceRoot,
           nodeExecutable:$nodeExecutable,
@@ -638,7 +721,10 @@ SH
           appSocket:$appSocket,
           label:$label,
           deploymentIdentity:$deploymentIdentity
-        }' \
+        } + (if $profileRoutes == null then {} else {
+          profileRoutes:$profileRoutes,
+          startProfiles:$startProfiles
+        } end)' \
         >"$MOCK_GATEWAY_CONFIG"
       printf 'new-unit\n' >"$MOCK_GATEWAY_UNIT"
       write_state deployment-identity "$deployment_identity"
@@ -716,6 +802,7 @@ SH
       start|restart)
         write_state "$key" active
         if [[ $key == app-service ]]; then
+          cp -- "$MOCK_OMP_TARGET" "$MOCK_PROC_EXE"
           rm -f -- "$state/mainpid-zero" "$state/app-drained"
           if [[ \${MOCK_APP_START_FAIL_ACTIVE:-0} == 1 && ! -f $state/app-start-failed-once ]]; then
             write_state app-start-failed-once 1
@@ -727,6 +814,16 @@ SH
       daemon-reload) exit 0 ;;
       *) exit 0 ;;
     esac
+    ;;
+
+  realpath)
+    [[ \${1:-} == -e ]] && shift
+    [[ \${1:-} == -- ]] && shift
+    exec "$MOCK_NODE_EXECUTABLE" -e 'const fs=require("node:fs");process.stdout.write(fs.realpathSync.native(process.argv[1])+"\n")' "$1"
+    ;;
+
+  uname)
+    [[ \${1:-} == -s ]] && printf 'Linux\n' || printf 'Linux\n'
     ;;
 
   pgrep)
@@ -764,6 +861,13 @@ SH
     version=1.2.3
     [[ $deb =~ T4-Code-([0-9]+\.[0-9]+\.[0-9]+)-linux-amd64\.deb$ ]] && version=\${BASH_REMATCH[1]}
     write_state package-version "$version"
+    if [[ \${MOCK_MUTATE_OVERLAY_AFTER_APT:-0} == 1 && $count -eq 1 ]]; then
+      printf 'mutated-overlay\n' >"$MOCK_OVERLAY_PACKAGE"
+    fi
+    if [[ \${MOCK_TAMPER_SEALED_AFTER_APT:-0} == 1 && $count -eq 1 ]]; then
+      chmod 600 "$MOCK_SEALED_PACKAGE"
+      printf 'tampered-sealed-overlay\n' >"$MOCK_SEALED_PACKAGE"
+    fi
     mkdir -p -- "$(dirname -- "$MOCK_T4_EXECUTABLE")" "$MOCK_T4_WEB_ROOT"
     printf '#!/bin/sh\nexit 0\n' >"$MOCK_T4_EXECUTABLE"
     chmod 0755 "$MOCK_T4_EXECUTABLE"
@@ -779,6 +883,14 @@ SH
     ;;
 
   dpkg-deb)
+    if [[ \${1:-} == --fsys-tarfile ]]; then
+      tar_root=$(mktemp -d)
+      mkdir -p "$tar_root/opt/T4 Code/resources"
+      printf 'mock-app-asar\n' >"$tar_root/opt/T4 Code/resources/app.asar"
+      tar -cf - -C "$tar_root" './opt/T4 Code/resources/app.asar'
+      rm -rf -- "$tar_root"
+      exit 0
+    fi
     field=\${!#}
     if [[ $field == Package ]]; then
       printf 't4-code\n'
@@ -792,9 +904,9 @@ SH
 
   sha256sum)
     if [[ \${1:-} == /proc/*/exe ]]; then
-      exec /usr/bin/sha256sum "$MOCK_OMP_TARGET"
+      set -- "$MOCK_PROC_EXE"
     fi
-    exec /usr/bin/sha256sum "$@"
+    exec "$MOCK_NODE_EXECUTABLE" -e 'const fs=require("node:fs");const crypto=require("node:crypto");const path=process.argv[1];const data=path ? fs.readFileSync(path) : fs.readFileSync(0);process.stdout.write(crypto.createHash("sha256").update(data).digest("hex")+"  "+(path || "-")+"\n")' "$@"
     ;;
 
   *)
@@ -837,8 +949,9 @@ case \${1:-} in
 esac
 SH
 chmod 0755 "$MOCK_OMP_TARGET"
-omp_sha=$(/usr/bin/sha256sum "$MOCK_OMP_TARGET" | /usr/bin/awk '{print $1}')
-deployment_identity="sha256:$(printf '%s\0%s\0%s\0' "$MOCK_T4_COMMIT" "$MOCK_INTEGRATION_COMMIT" "$omp_sha" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')"
+cp -- "$MOCK_OMP_TARGET" "$MOCK_PROC_EXE"
+omp_sha=$(sha256sum "$MOCK_OMP_TARGET" | awk '{print $1}')
+deployment_identity="sha256:$(printf '%s\0%s\0%s\0' "$MOCK_T4_COMMIT" "$MOCK_INTEGRATION_COMMIT" "$omp_sha" | sha256sum | awk '{print $1}')"
 printf '1.2.3' >"$MOCK_STATE/package-version"
 printf 'active' >"$MOCK_STATE/app-service"
 printf 'active' >"$MOCK_STATE/gateway-service"
@@ -854,7 +967,7 @@ gateway_origin=https://mock.tailnet.ts.net
 gateway_port=4319
 gateway_socket=$(<"$MOCK_STATE/socket-path")
 gateway_label=mock
-/usr/bin/jq -n \
+jq -n \
   --arg sourceRoot "$MOCK_RUNTIME_ROOT" \
   --arg allowedOrigin "$gateway_origin" \
   --argjson port "$gateway_port" \
@@ -881,18 +994,18 @@ tree_sha() {
   (
     cd -- "$root"
     while IFS= read -r -d '' relative; do
-      digest=$(/usr/bin/sha256sum "$relative" | /usr/bin/awk '{print $1}')
+      digest=$(sha256sum "$relative" | awk '{print $1}')
       printf '%s\0%s\0' "$relative" "$digest"
-    done < <(/usr/bin/find . -type f -print0 | LC_ALL=C /usr/bin/sort -z)
-  ) | /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+    done < <(find . -type f -print0 | LC_ALL=C sort -z)
+  ) | sha256sum | awk '{print $1}'
 }
 
-gateway_script_sha=$(/usr/bin/sha256sum "$gateway_script" | /usr/bin/awk '{print $1}')
+gateway_script_sha=$(sha256sum "$gateway_script" | awk '{print $1}')
 web_tree_sha=$(tree_sha "$web_root")
 ws_tree_sha=$(tree_sha "$ws_root")
-config_sha=$(/usr/bin/sha256sum "$MOCK_GATEWAY_CONFIG" | /usr/bin/awk '{print $1}')
-unit_sha=$(/usr/bin/sha256sum "$MOCK_GATEWAY_UNIT" | /usr/bin/awk '{print $1}')
-/usr/bin/jq -n \
+config_sha=$(sha256sum "$MOCK_GATEWAY_CONFIG" | awk '{print $1}')
+unit_sha=$(sha256sum "$MOCK_GATEWAY_UNIT" | awk '{print $1}')
+jq -n \
   --slurpfile publication "$result" \
   --arg omp_target "$MOCK_OMP_TARGET" \
   --arg omp_sha "$omp_sha" \
@@ -985,7 +1098,7 @@ function forgedOmpPublicProof() {
         browserDownloadUrl: `mock://${name}`,
       })),
   };
-  const canonicalJson = spawnSync("/usr/bin/jq", ["-cS", "."], {
+  const canonicalJson = spawnSync("jq", ["-cS", "."], {
     encoding: "utf8",
     input: JSON.stringify(canonical),
   });
@@ -1017,11 +1130,13 @@ async function waitForPath(path) {
 
 async function createDeployFixture(options = {}) {
   const previousVersion = options.sameVersion ? "1.2.3" : "1.2.2";
-  const root = await mkdtemp(join(tmpdir(), "t4-maintainer-contract-"));
+  const manifestKind = options.manifestKind ?? "t4-maintainer-local-deployment";
+  const root = await makeCanonicalTemporaryDirectory("t4-maintainer-contract-");
   const home = join(root, "home");
   const state = join(root, "mock-state");
   const bin = join(root, "bin");
   const maintainerRoot = join(root, "maintainer");
+  const privilegeBin = join(maintainerRoot, "test-bin");
   const runRoot = join(maintainerRoot, "runs", "fixture");
   const work = join(runRoot, "local-work");
   const result = join(runRoot, "result.json");
@@ -1034,18 +1149,34 @@ async function createDeployFixture(options = {}) {
   const ompService = "mock-omp.service";
   const gatewayUnit = join(home, ".config", "systemd", "user", gatewayService);
   const t4Executable = join(root, "opt", "T4 Code", "t4-code");
+  const t4AppAsar = join(root, "opt", "T4 Code", "resources", "app.asar");
   const t4WebRoot = join(root, "opt", "T4 Code", "resources", "web");
+  const previousRuntime = join(root, "previous-runtime");
+  const overlayPackage = join(root, "operator-overlay.deb");
+  const overlayReceipt = join(maintainerRoot, "state", "operator-overlay.json");
   const deployments = join(maintainerRoot, "deployments");
+  const procRoot = join(maintainerRoot, "mock-proc");
+  const procExecutableCopy = join(procRoot, "immutable-omp");
 
   await mkdir(dirname(ompTarget), { recursive: true });
   await mkdir(dirname(socket), { recursive: true });
   await mkdir(dirname(gatewayConfig), { recursive: true });
   await mkdir(dirname(gatewayUnit), { recursive: true });
+  await mkdir(dirname(t4AppAsar), { recursive: true });
   await mkdir(t4WebRoot, { recursive: true });
+  await mkdir(previousRuntime, { recursive: true });
   await mkdir(runRoot, { recursive: true });
   await mkdir(state, { recursive: true });
   await mkdir(bin, { recursive: true });
+  await mkdir(privilegeBin, { recursive: true });
+  await mkdir(procRoot, { recursive: true });
+
   await writeFile(calls, "");
+  if (options.wsEscape) {
+    const escapingWs = join(state, "escaping-ws");
+    await mkdir(escapingWs, { recursive: true });
+    await writeFile(join(escapingWs, "package.json"), '{"name":"ws"}\n');
+  }
 
   await writeFile(
     result,
@@ -1120,9 +1251,16 @@ case \${1:-} in
 esac
 `,
   );
+  await copyFile(ompTarget, procExecutableCopy);
+  await chmod(procExecutableCopy, 0o751);
   await chmod(ompTarget, 0o751);
   await writeFile(t4Executable, "#!/bin/sh\nexit 0\n");
   await chmod(t4Executable, 0o755);
+  await writeFile(t4AppAsar, "mock-app-asar\n");
+  const installedOmpSha = createHash("sha256").update(await readFile(ompTarget)).digest("hex");
+  const deploymentIdentity = `sha256:${createHash("sha256")
+    .update(`${t4Commit}\0${integrationCommit}\0${installedOmpSha}\0`)
+    .digest("hex")}`;
   await writeFile(join(t4WebRoot, "index.html"), "old-web\n");
   await writeFile(
     gatewayConfig,
@@ -1132,13 +1270,61 @@ esac
       port: 4319,
       appSocket: socket,
       label: "mock",
+      ...(options.sameVersion ? { deploymentIdentity } : {}),
+      ...(options.profileRoutes === undefined
+        ? {}
+        : { profileRoutes: options.profileRoutes, startProfiles: options.startProfiles === true }),
     })}\n`,
   );
+  if (options.sameVersion) {
+    const appAsarSha = createHash("sha256").update("mock-app-asar\n").digest("hex");
+    await writeFile(overlayPackage, "mock-overlay\n");
+    const overlayPackageBytes = await readFile(overlayPackage);
+    const overlayPackageSha = createHash("sha256").update(overlayPackageBytes).digest("hex");
+    await writeFile(
+      join(previousRuntime, "LOCAL_DEPLOYMENT.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        kind: manifestKind,
+        t4Commit,
+        installedOmpSha256: installedOmpSha,
+        reportedPackageVersion: previousVersion,
+        deploymentIdentity,
+      })}\n`,
+    );
+    if (options.overlayReceipt !== "missing") {
+      await mkdir(dirname(overlayReceipt), { recursive: true });
+      await writeFile(
+        overlayReceipt,
+        `${JSON.stringify({
+          schemaVersion: 1,
+          kind: "t4-maintainer-operator-overlay",
+          artifact: {
+            package: {
+              path: overlayPackage,
+              canonicalPath: overlayPackage,
+              size: overlayPackageBytes.length,
+              sha256: overlayPackageSha,
+              version: previousVersion,
+            },
+            t4: { commit: t4Commit, appAsarSha256: appAsarSha },
+            omp: { sha256: installedOmpSha },
+            gateway: { deploymentIdentity },
+          },
+        })}\n`,
+      );
+      await chmod(overlayReceipt, 0o600);
+    }
+  }
   await writeFile(gatewayUnit, "old-unit\n");
   await writeFile(join(state, "package-version"), previousVersion);
   await writeFile(join(state, "active-sessions"), String(options.activeSessions ?? 0));
   await writeFile(join(state, "gateway-health"), options.gatewayHealthy === false ? "unhealthy" : "healthy");
   await writeFile(join(state, "tailnet-health"), "healthy");
+  await writeFile(
+    join(state, "deployment-identity"),
+    options.sameVersion ? deploymentIdentity : `sha256:${createHash("sha256").update("old").digest("hex")}`,
+  );
   await writeFile(join(state, "socket-path"), socket);
   await writeFile(join(state, "app-service"), options.appActive === false ? "inactive" : "active");
   await writeFile(
@@ -1149,15 +1335,29 @@ esac
     join(state, "gateway-enablement"),
     options.gatewayEnabled === false ? "disabled" : "enabled",
   );
-  await mkdir(join(state, "escaping-ws"), { recursive: true });
-  await writeFile(join(state, "escaping-ws", "package.json"), "{}\n");
   if (options.desktopBusy) await writeFile(join(state, "desktop-busy"), "1");
   if (options.childBusy) await writeFile(join(state, "child-busy"), "1");
   if (options.mainPidZero) await writeFile(join(state, "mainpid-zero"), "1");
   if (options.busyAfterStage) await writeFile(join(state, "busy-after-stage"), "1");
-
   const dispatcher = join(bin, "mock-tool");
   await writeFile(dispatcher, mockDispatcher);
+  const uname = join(privilegeBin, "uname");
+  const setpriv = join(privilegeBin, "setpriv");
+  await writeFile(uname, `#!/usr/bin/env bash\nprintf '${options.platform ?? "Linux"}\\n'\n`);
+  await writeFile(
+    setpriv,
+    `#!/usr/bin/env bash
+set -euo pipefail
+printf 'setpriv' >>"$MOCK_CALLS"
+printf '\\t%q' "$@" >>"$MOCK_CALLS"
+printf '\\n' >>"$MOCK_CALLS"
+[[ \${1:-} == --no-new-privs && \${2:-} == -- ]] || exit 64
+shift 2
+exec "$@"
+`,
+  );
+  await chmod(uname, 0o755);
+  await chmod(setpriv, 0o755);
   await chmod(dispatcher, 0o755);
   for (const tool of [
     "gh",
@@ -1175,8 +1375,19 @@ esac
     "dpkg",
     "dpkg-deb",
     "sha256sum",
+    "realpath",
   ]) {
     await symlink(dispatcher, join(bin, tool));
+  }
+  const portableTools = [
+    ...(flockUnavailable ? [["flock", portableFlockMock]] : []),
+    ...(statModeUnavailable ? [["stat", portableStatMock]] : []),
+    ...(nullSortUnavailable ? [["sort", portableNullSortMock]] : []),
+  ];
+  for (const [tool, source] of portableTools) {
+    const toolPath = join(bin, tool);
+    await writeFile(toolPath, source);
+    await chmod(toolPath, 0o755);
   }
 
   const socketProcess = spawn(
@@ -1189,6 +1400,9 @@ esac
   );
   await waitForPath(socket);
   await writeFile(join(state, "app-pid"), `${socketProcess.pid}\n`);
+  const procExecutable = join(procRoot, String(socketProcess.pid), "exe");
+  await mkdir(dirname(procExecutable), { recursive: true });
+  await symlink(procExecutableCopy, procExecutable);
 
   const env = {
     ...process.env,
@@ -1203,7 +1417,9 @@ esac
     MOCK_MAIN_COMMIT: mainCommit,
     MOCK_UPSTREAM_TAG_OBJECT: upstreamTagObject,
     MOCK_INTEGRATION_TAG_OBJECT: integrationTagObject,
+    MOCK_BIN: bin,
     MOCK_OMP_TARGET: ompTarget,
+    MOCK_PROC_EXE: procExecutableCopy,
     MOCK_OMP_SERVICE: ompService,
     MOCK_GATEWAY_CONFIG: gatewayConfig,
     MOCK_GATEWAY_UNIT: gatewayUnit,
@@ -1212,9 +1428,10 @@ esac
     MOCK_T4_WEB_ROOT: t4WebRoot,
     T4_MAINTAINER_ROOT: maintainerRoot,
     T4_MAINTAINER_TEST_MODE: "1",
+    ...(process.platform === "linux" ? {} : { T4_MAINTAINER_TEST_PROC_ROOT: procRoot }),
     T4_MAINTAINER_GH: join(bin, "gh"),
     T4_MAINTAINER_CURL: join(bin, "curl"),
-    T4_MAINTAINER_JQ: "/usr/bin/jq",
+    T4_MAINTAINER_JQ: "jq",
     T4_MAINTAINER_GIT: join(bin, "git"),
     T4_MAINTAINER_BUN: join(bin, "bun"),
     T4_MAINTAINER_PNPM: join(bin, "pnpm"),
@@ -1225,6 +1442,13 @@ esac
     T4_MAINTAINER_DPKG: join(bin, "dpkg"),
     T4_MAINTAINER_DPKG_DEB: join(bin, "dpkg-deb"),
     T4_MAINTAINER_SHA256SUM: join(bin, "sha256sum"),
+    T4_MAINTAINER_REALPATH: join(bin, "realpath"),
+    ...(options.useHostPrivilegeTools
+      ? {}
+      : {
+          T4_MAINTAINER_UNAME: uname,
+          T4_MAINTAINER_SETPRIV: setpriv,
+        }),
     T4_MAINTAINER_SYSTEMCTL: join(bin, "systemctl"),
     T4_MAINTAINER_SLEEP: "/usr/bin/true",
     T4_MAINTAINER_FORK_SYNC_EVENT_QUIESCE_SECONDS: "1",
@@ -1232,13 +1456,17 @@ esac
     T4_MAINTAINER_FORK_SYNC_RUN_SETTLE_INTERVAL_SECONDS: "1",
     T4_MAINTAINER_FORK_SYNC_RUN_QUIET_POLLS: "3",
     T4_MAINTAINER_FORK_SYNC_RUN_MIN_OBSERVATION_POLLS: "7",
-    T4_MAINTAINER_INSTALL: "/usr/bin/install",
-    T4_MAINTAINER_SYNC: "/usr/bin/sync",
+    T4_MAINTAINER_INSTALL: "install",
+    MOCK_OVERLAY_PACKAGE: overlayPackage,
+    MOCK_SEALED_PACKAGE: join(maintainerRoot, "state", "operator-overlays", `${createHash("sha256").update("mock-overlay\n").digest("hex")}.deb`),
+    T4_MAINTAINER_SYNC: "/bin/sync",
     T4_LOCAL_OMP_TARGET: ompTarget,
     T4_LOCAL_OMP_SERVICE: ompService,
     T4_LOCAL_OMP_SOCKET: socket,
     T4_LOCAL_T4_EXECUTABLE: t4Executable,
     T4_LOCAL_T4_WEB_ROOT: t4WebRoot,
+    T4_LOCAL_T4_APP_ASAR: t4AppAsar,
+    T4_LOCAL_ROLLBACK_RECEIPT: overlayReceipt,
     T4_LOCAL_GATEWAY_SERVICE: gatewayService,
     T4_LOCAL_GATEWAY_CONFIG: gatewayConfig,
     T4_LOCAL_GATEWAY_UNIT: gatewayUnit,
@@ -1299,6 +1527,19 @@ esac
       ? { MOCK_GATEWAY_DISABLE_FAIL_AFTER_FIRST: "1" }
       : {}),
     ...(options.productBranchMissing ? { MOCK_PRODUCT_BRANCH_MISSING: "1" } : {}),
+    ...(options.prSequential ? { MOCK_PR_SEQUENTIAL: "1" } : {}),
+    ...(options.prChangeAfter !== undefined
+      ? { MOCK_PR_CHANGE_AFTER: String(options.prChangeAfter) }
+      : {}),
+    ...(options.prFailAfter !== undefined
+      ? { MOCK_PR_FAIL_AFTER: String(options.prFailAfter) }
+      : {}),
+    ...(options.t4MainCommitChangeAfter !== undefined
+      ? {
+          MOCK_T4_MAIN_COMMIT_AFTER: String(options.t4MainCommitChangeAfter),
+          MOCK_T4_MAIN_COMMIT_CHANGED: changedT4MainCommit,
+        }
+      : {}),
   };
 
   return {
@@ -1310,7 +1551,12 @@ esac
     receipt,
     calls,
     ompTarget,
+    t4AppAsar,
+    previousRuntime,
+    overlayPackage,
+    overlayReceipt,
     gatewayConfig,
+    procRoot,
     gatewayUnit,
     deployments,
     env,
@@ -1325,10 +1571,10 @@ esac
       gatewayEnablement: options.gatewayEnabled === false ? "disabled" : "enabled",
     },
     run(extraEnv = {}) {
-      return spawnSync("/usr/bin/bash", [deployScript, result, receipt, work], {
+      return spawnSync(bashPath, [deployScript, result, receipt, work], {
         encoding: "utf8",
         env: { ...env, ...extraEnv },
-        timeout: 20_000,
+        timeout: integrationProcessTimeoutMs,
       });
     },
     async callsText() {
@@ -1374,7 +1620,13 @@ async function createRunnerFixture(options = {}) {
     ompAssetZero: options.ompAssetZero,
     ompAssetDigestless: options.ompAssetDigestless,
     ompAssetDigestMismatch: options.ompAssetDigestMismatch,
+    platform: options.platform,
+    useHostPrivilegeTools: options.useHostPrivilegeTools,
     ompAssetUnreachable: options.ompAssetUnreachable,
+    prSequential: options.prSequential,
+    prChangeAfter: options.prChangeAfter,
+    prFailAfter: options.prFailAfter,
+    t4MainCommitChangeAfter: options.t4MainCommitChangeAfter,
     ompAssetWrongOrigin: options.ompAssetWrongOrigin,
   });
   const localDeploy = join(fixture.root, "bin", "local-deploy");
@@ -1415,7 +1667,7 @@ async function createRunnerFixture(options = {}) {
       ],
     })}\n`,
   );
-  const intentHash = spawnSync("/usr/bin/git", ["hash-object", atomicIntentPath], {
+  const intentHash = spawnSync("git", ["hash-object", atomicIntentPath], {
     encoding: "utf8",
   });
   assert.equal(intentHash.status, 0, intentHash.stderr);
@@ -1494,13 +1746,19 @@ async function createRunnerFixture(options = {}) {
       );
     },
     runRunner(extraEnv = {}, args = []) {
-      return spawnSync("/usr/bin/bash", [runnerScript, ...args], {
+      return spawnSync(bashPath, [runnerScript, ...args], {
         encoding: "utf8",
         env: { ...runnerEnv, ...extraEnv },
-        timeout: 20_000,
+        timeout: integrationProcessTimeoutMs,
       });
     },
   };
+}
+
+async function writeSolDeferral(fixture, marker) {
+  const path = join(fixture.root, `sol-deferral-${Date.now()}-${Math.random()}.json`);
+  await writeFile(path, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+  return path;
 }
 
 async function assertRestored(fixture, { blocked = false } = {}) {
@@ -1662,10 +1920,13 @@ test("installed candidate proves its drain contract against the exact live execu
     calls,
     /^omp-candidate\tappserver\tdrain-if-idle\t--json\t--expected-host-id\tt4-maintainer-host-[0-9a-f]{64}\t--expected-epoch\tt4-maintainer-epoch-[0-9a-f]{64}$/mu,
   );
-  assert.ok(
-    calls.split("\n").filter((line) => /^sha256sum\t\/proc\/[0-9]+\/exe$/u.test(line)).length >= 2,
-    calls,
-  );
+  const expectedProcRoot = process.platform === "linux" ? "/proc" : fixture.procRoot;
+  const executableHashPrefix = `sha256sum\t${expectedProcRoot}/`;
+  const executableHashes = calls.split("\n").filter((line) => {
+    if (!line.startsWith(executableHashPrefix) || !line.endsWith("/exe")) return false;
+    return /^[1-9][0-9]*$/u.test(line.slice(executableHashPrefix.length, -"/exe".length));
+  });
+  assert.ok(executableHashes.length >= 2, calls);
 });
 
 test("malformed, unsupported, and false live drain proofs never complete deployment", async (t) => {
@@ -1806,6 +2067,24 @@ test("stopped or unhealthy baseline services are repairable", async (t) => {
   }
 });
 
+test("local deployment preserves named Tailnet routes and their start policy", async (t) => {
+  const profileRoutes = [
+    {
+      id: "fast",
+      appSocket: "/run/user/1000/omp/fast.sock",
+      serviceUnit: "t4-fast.service",
+      startEnabled: true,
+    },
+  ];
+  const fixture = await createDeployFixture({ profileRoutes, startProfiles: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.run();
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const installedConfig = JSON.parse(await readFile(fixture.gatewayConfig, "utf8"));
+  assert.deepEqual(installedConfig.profileRoutes, profileRoutes);
+  assert.equal(installedConfig.startProfiles, true);
+});
+
 test("same-version package repair is an effective reinstall", async (t) => {
   const fixture = await createDeployFixture({ sameVersion: true });
   t.after(() => fixture.cleanup());
@@ -1817,6 +2096,73 @@ test("same-version package repair is an effective reinstall", async (t) => {
   assert.equal(aptCalls.length, 1);
   assert.match(aptCalls[0], /--reinstall/u);
   assert.match(aptCalls[0], /T4-Code-1\.2\.3-linux-amd64\.deb/u);
+});
+
+test("same-version repair accepts the explicit local-unreleased-candidate manifest kind", async (t) => {
+  const fixture = await createDeployFixture({
+    sameVersion: true,
+    manifestKind: "local-unreleased-candidate",
+  });
+  t.after(() => fixture.cleanup());
+  const result = fixture.run();
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const aptCalls = (await fixture.callsText())
+    .split("\n")
+    .filter((line) => line.startsWith("apt-get\t") && !line.includes("--simulate"));
+  assert.equal(aptCalls.length, 1);
+  assert.match(aptCalls[0], /--reinstall/u);
+});
+
+test("same-version deployment rejects a missing or mismatched current overlay receipt", async (t) => {
+  for (const [name, options, mutate] of [
+    ["missing", { sameVersion: true, overlayReceipt: "missing" }, undefined],
+    ["unexpected manifest kind", { sameVersion: true, manifestKind: "not-a-maintainer-deployment" }, undefined],
+    ["mismatched", { sameVersion: true }, async (fixture) => {
+      const receipt = JSON.parse(await readFile(fixture.overlayReceipt, "utf8"));
+      receipt.artifact.gateway.deploymentIdentity = `sha256:${"f".repeat(64)}`;
+      await writeFile(fixture.overlayReceipt, `${JSON.stringify(receipt)}\n`);
+    }],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createDeployFixture(options);
+      subtest.after(() => fixture.cleanup());
+      if (mutate) await mutate(fixture);
+      const result = fixture.run();
+      assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      const calls = await fixture.callsText();
+      assert.doesNotMatch(calls, /^apt-get\t.*--reinstall(?!.*--simulate)/mu);
+      assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
+    });
+  }
+});
+
+test("same-version rollback uses the sealed overlay when its original changes", async (t) => {
+  const fixture = await createDeployFixture({ sameVersion: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.run({
+    T4_MAINTAINER_TEST_FAULT: "after-desktop-install",
+    MOCK_MUTATE_OVERLAY_AFTER_APT: "1",
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(await fixture.callsText(), /^apt-get\t.*operator-overlays.*\.deb/mu);
+  assert.equal(await pathExists(join(fixture.maintainerRoot, "state", "deployment-blocked.json")), false);
+});
+
+test("same-version rollback rejects a tampered sealed overlay", async (t) => {
+  const fixture = await createDeployFixture({ sameVersion: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.run({
+    T4_MAINTAINER_TEST_FAULT: "after-desktop-install",
+    MOCK_TAMPER_SEALED_AFTER_APT: "1",
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const marker = join(fixture.maintainerRoot, "state", "deployment-blocked.json");
+  assert.equal(await pathExists(marker), true, `${result.stdout}\n${result.stderr}\n${await fixture.callsText()}`);
+  assert.ok(["rollback-incomplete", "rollback-drained-after-exposure"].includes(JSON.parse(await readFile(marker, "utf8")).status));
+  const aptCalls = (await fixture.callsText())
+    .split("\n")
+    .filter((line) => line.startsWith("apt-get\t") && line.includes("operator-overlays") && !line.includes("--simulate"));
+  assert.equal(aptCalls.length, 0, await fixture.callsText());
 });
 
 test("the second idle guard catches a session opened during preparation", async (t) => {
@@ -1930,7 +2276,14 @@ test("post-exposure busy or changed appserver preserves new state behind a durab
 
       const second = fixture.run();
       assert.notEqual(second.status, 0, `${second.stdout}\n${second.stderr}`);
-      assert.equal(await fixture.callsText(), callsBefore);
+      const callsAfter = await fixture.callsText();
+      const beforeLines = callsBefore.trimEnd().split("\n");
+      const afterLines = callsAfter.trimEnd().split("\n");
+      assert.deepEqual(
+        afterLines.slice(beforeLines.length),
+        [`realpath\t-e\t--\t${fixture.maintainerRoot}`],
+        callsAfter,
+      );
     });
   }
 });
@@ -1997,10 +2350,123 @@ test("runtime dependency symlinks must remain inside the exact tagged runtime", 
   t.after(() => fixture.cleanup());
   const result = fixture.run();
   assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /T4 gateway ws runtime resolves outside the exact tagged checkout/u);
   const calls = await fixture.callsText();
   assert.doesNotMatch(calls, /^apt-get\t/mu);
   assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
   await assertRestored(fixture);
+});
+
+test("test process roots cannot weaken the production executable proof", async (t) => {
+  const fixture = await createDeployFixture();
+  t.after(() => fixture.cleanup());
+  const result = fixture.run({
+    T4_MAINTAINER_TEST_MODE: "0",
+    T4_MAINTAINER_TEST_PROC_ROOT: join(fixture.maintainerRoot, "mock-proc"),
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(
+    result.stderr,
+    /process-root override is restricted to an explicit temporary test root/u,
+  );
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^apt-get\t/mu);
+  assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
+  await assertRestored(fixture);
+});
+
+test("test process roots reject canonical escapes before mutation", async (t) => {
+  const fixture = await createDeployFixture();
+  t.after(() => fixture.cleanup());
+  const externalProcRoot = join(fixture.root, "external-proc");
+  const escapedProcRoot = join(fixture.maintainerRoot, "escaped-proc");
+  await mkdir(externalProcRoot, { recursive: true });
+  await symlink(externalProcRoot, escapedProcRoot);
+  const result = fixture.run({ T4_MAINTAINER_TEST_PROC_ROOT: escapedProcRoot });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /test process root must be canonical/u);
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^apt-get\t/mu);
+  assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
+  await assertRestored(fixture);
+});
+
+test("test process roots must remain inside the canonical maintainer root", async (t) => {
+  const fixture = await createDeployFixture();
+  t.after(() => fixture.cleanup());
+  const externalProcRoot = join(fixture.root, "external-proc");
+  await mkdir(externalProcRoot, { recursive: true });
+  const result = fixture.run({ T4_MAINTAINER_TEST_PROC_ROOT: externalProcRoot });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /test process root must be a child of the maintainer root/u);
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^apt-get\t/mu);
+  assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
+  await assertRestored(fixture);
+});
+
+test("test maintainer roots must be canonical before process overrides", async (t) => {
+  const fixture = await createDeployFixture();
+  t.after(() => fixture.cleanup());
+  const maintainerAlias = join(fixture.root, "maintainer-alias");
+  await symlink(fixture.maintainerRoot, maintainerAlias);
+  const result = spawnSync(
+    bashPath,
+    [
+      deployScript,
+      join(maintainerAlias, "runs", "fixture", "result.json"),
+      join(maintainerAlias, "runs", "fixture", "local-deployment.json"),
+      join(maintainerAlias, "runs", "fixture", "local-work"),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...fixture.env,
+        T4_MAINTAINER_ROOT: maintainerAlias,
+        T4_MAINTAINER_TEST_PROC_ROOT: join(maintainerAlias, "mock-proc"),
+      },
+      timeout: 20_000,
+    },
+  );
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /maintainer root must be canonical/u);
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^apt-get\t/mu);
+  assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
+  await assertRestored(fixture);
+});
+
+test("direct deployer rejects a /tmp symlink-root escape before staging or mutation", async (t) => {
+  const fixture = await createDeployFixture();
+  const outsideRoot = await mkdtemp(join("/var/tmp", "t4-deploy-outside-"));
+  const tmpParent = join(tmpdir(), `t4-deploy-root-link-${process.pid}-${Date.now()}`);
+  await symlink(outsideRoot, tmpParent);
+  t.after(async () => {
+    await fixture.cleanup();
+    await rm(tmpParent, { force: true });
+    await rm(outsideRoot, { recursive: true, force: true });
+  });
+  const escapedRoot = join(tmpParent, "nonexistent-child");
+  const result = spawnSync(
+    bashPath,
+    [
+      deployScript,
+      join(escapedRoot, "runs", "fixture", "result.json"),
+      join(escapedRoot, "runs", "fixture", "local-deployment.json"),
+      join(escapedRoot, "runs", "fixture", "local-work"),
+    ],
+    {
+      encoding: "utf8",
+      env: { ...fixture.env, T4_MAINTAINER_ROOT: escapedRoot },
+      timeout: 20_000,
+    },
+  );
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /maintainer root must exist and be canonical/u);
+  assert.equal((await readdir(outsideRoot)).length, 0);
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^apt-get\t/mu);
+  assert.doesNotMatch(calls, /^systemctl\t.*(?:stop|start|restart)/mu);
 });
 
 test("a divergent fork main is retried and rejected before source staging", async (t) => {
@@ -2330,6 +2796,572 @@ test("normal recovery adopts a compatible in-flight main publication before Sol"
   );
   assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0);
 });
+test("sequential publication gate race defers before Sol and preserves local state", async (t) => {
+  const fixture = await createRunnerFixture({ prSequential: true, workflowsTerminal: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({ T4_MAINTAINER_TEST_PUBLICATION_GATE: "1" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+  assert.equal((await readFile(join(fixture.state, "t4-pr-queries"), "utf8")).trim(), "2");
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.pending), false);
+  await assertRestored(fixture);
+});
+test("a changed T4 main identity defers on the second gate without a stale Sol context", async (t) => {
+  const fixture = await createRunnerFixture({
+    t4MainCommitChangeAfter: 4,
+    workflowsTerminal: true,
+  });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({ T4_MAINTAINER_TEST_PUBLICATION_GATE: "1" });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0, calls);
+  assert.equal((await readFile(join(fixture.state, "t4-main-queries"), "utf8")).trim(), "5");
+  const runEntries = await readdir(join(fixture.maintainerRoot, "runs"));
+  for (const entry of runEntries) {
+    assert.equal(await pathExists(join(fixture.maintainerRoot, "runs", entry, "context.json")), false);
+  }
+});
+
+test("a corroborated post-Sol main change records collaborator defer without publication state", async (t) => {
+  const fixture = await createRunnerFixture({
+    publicIncompatible: true,
+    t4MainCommitChangeAfter: 6,
+  });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "t4-main-changed",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: changedT4MainCommit,
+    prNumber: null,
+  });
+  const notifier = join(fixture.root, "successful-deferral-notifier");
+  const secret = join(fixture.root, "hermes-secret");
+  const notificationPayload = join(fixture.root, "notification-payload.json");
+  await writeFile(notifier, `#!/usr/bin/env bash\ncat >"${notificationPayload}"\n`);
+  await chmod(notifier, 0o700);
+  await writeFile(secret, "test-secret\n", { mode: 0o600 });
+  const historicalProcessed = `${JSON.stringify({
+    upstream: { tag: "v0.9.0", commit: "9".repeat(40) },
+    t4: { version: "0.9.0", tag: "v0.9.0", commit: "8".repeat(40) },
+    publicVerification: "complete",
+    sentinel: "preserve-independent-history",
+  })}\n`;
+  await writeFile(fixture.processed, historicalProcessed, { mode: 0o600 });
+  t.after(() => fixture.cleanup());
+
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_DEFERRAL_SOURCE: marker,
+    T4_MAINTAINER_NOTIFY_HELPER: notifier,
+    T4_MAINTAINER_HERMES_SECRET_FILE: secret,
+  });
+  const mainQueryCount = (await readFile(join(fixture.state, "t4-main-queries"), "utf8")).trim();
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}\nmain queries: ${mainQueryCount}`);
+  assert.match(result.stdout, /Valid collaborator deferral marker accepted \(t4-main-changed\)/u);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("setpriv\t")).length, 1, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 1, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+  const runEntry = (await readdir(join(fixture.maintainerRoot, "runs"))).find((entry) =>
+    entry.startsWith("1.2.3-"),
+  );
+  assert.ok(runEntry);
+  const runDirectory = join(fixture.maintainerRoot, "runs", runEntry);
+  const contextPath = join(runDirectory, "context.json");
+  const context = JSON.parse(await readFile(contextPath, "utf8"));
+  assert.equal(context.deferralFile, join(runDirectory, "deferral.json"));
+  assert.equal(context.resultFile, join(runDirectory, "result.json"));
+  const deferralStat = await lstat(context.deferralFile);
+  assert.equal(deferralStat.isFile(), true);
+  assert.equal(deferralStat.isSymbolicLink(), false);
+  assert.equal(deferralStat.mode & 0o777, 0o600);
+  assert.ok(
+    calls.split("\n").includes(`sol-env\t${contextPath}\t${context.resultFile}\t${context.deferralFile}`),
+    calls,
+  );
+  assert.equal(await pathExists(notificationPayload), true);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await readFile(fixture.processed, "utf8"), historicalProcessed);
+  assert.equal(await pathExists(fixture.localApplied), false);
+  const notificationState = JSON.parse(
+    await readFile(join(fixture.maintainerRoot, "state", "notification-state.json"), "utf8"),
+  );
+  assert.equal(notificationState.blockers["t4-main-race"], true);
+});
+
+test("post-Sol PR and classification deferrals require live corroboration", async (t) => {
+  const cases = [
+    {
+      name: "release-critical PR",
+      options: { publicIncompatible: true, prChangeAfter: 2 },
+      marker: {
+        schemaVersion: 1,
+        reason: "release-critical-pr",
+        expectedT4MainSha: t4Commit,
+        observedT4MainSha: t4Commit,
+        prNumber: 42,
+      },
+      blockerKey: "t4-pr-42",
+    },
+    {
+      name: "classification incomplete",
+      options: { publicIncompatible: true, prFailAfter: 2 },
+      marker: {
+        schemaVersion: 1,
+        reason: "classification-incomplete",
+        expectedT4MainSha: t4Commit,
+        observedT4MainSha: t4Commit,
+        prNumber: null,
+      },
+      blockerKey: `t4-classification-${t4Commit}`,
+    },
+  ];
+  for (const { name, options, marker: markerBody, blockerKey } of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createRunnerFixture(options);
+      const marker = await writeSolDeferral(fixture, markerBody);
+      const notifier = join(fixture.root, "successful-deferral-notifier");
+      const secret = join(fixture.root, "hermes-secret");
+      await writeFile(notifier, "#!/usr/bin/env bash\ncat >/dev/null\n");
+      await chmod(notifier, 0o700);
+      await writeFile(secret, "test-secret\n", { mode: 0o600 });
+      subtest.after(() => fixture.cleanup());
+
+      const result = fixture.runRunner({
+        T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+        MOCK_SOL_STATUS: "0",
+        MOCK_SOL_DEFERRAL_SOURCE: marker,
+        T4_MAINTAINER_NOTIFY_HELPER: notifier,
+        T4_MAINTAINER_HERMES_SECRET_FILE: secret,
+      });
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(result.stdout, new RegExp(`Valid collaborator deferral marker accepted \\(${markerBody.reason}\\)`, "u"));
+      assert.equal(await pathExists(fixture.pending), false);
+      assert.equal(await pathExists(fixture.processed), false);
+      assert.equal(await pathExists(fixture.localApplied), false);
+      const notificationState = JSON.parse(
+        await readFile(join(fixture.maintainerRoot, "state", "notification-state.json"), "utf8"),
+      );
+      assert.equal(notificationState.blockers[blockerKey], true);
+    });
+  }
+});
+
+test("malformed and uncorroborated post-Sol deferral markers fail closed", async (t) => {
+  const cases = [
+    ["malformed", { schemaVersion: 1 }],
+    [
+      "extra field",
+      {
+        schemaVersion: 1,
+        reason: "classification-incomplete",
+        expectedT4MainSha: t4Commit,
+        observedT4MainSha: t4Commit,
+        prNumber: null,
+        unexpected: true,
+      },
+    ],
+    [
+      "uppercase identity",
+      {
+        schemaVersion: 1,
+        reason: "classification-incomplete",
+        expectedT4MainSha: t4Commit.toUpperCase(),
+        observedT4MainSha: t4Commit,
+        prNumber: null,
+      },
+    ],
+    [
+      "out-of-range PR number",
+      {
+        schemaVersion: 1,
+        reason: "release-critical-pr",
+        expectedT4MainSha: t4Commit,
+        observedT4MainSha: t4Commit,
+        prNumber: 1_000_001,
+      },
+    ],
+    [
+      "reason-field mismatch",
+      {
+        schemaVersion: 1,
+        reason: "release-critical-pr",
+        expectedT4MainSha: t4Commit,
+        observedT4MainSha: t4Commit,
+        prNumber: null,
+      },
+    ],
+    [
+      "uncorroborated",
+      {
+        schemaVersion: 1,
+        reason: "t4-main-changed",
+        expectedT4MainSha: mainCommit,
+        observedT4MainSha: changedT4MainCommit,
+        prNumber: null,
+      },
+    ],
+  ];
+  for (const [name, markerBody] of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createRunnerFixture({ publicIncompatible: true });
+      const marker = await writeSolDeferral(fixture, markerBody);
+      subtest.after(() => fixture.cleanup());
+      const result = fixture.runRunner({
+        T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+        MOCK_SOL_STATUS: "0",
+        MOCK_SOL_DEFERRAL_SOURCE: marker,
+      });
+      assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(result.stderr, /invalid or uncorroborated deferral marker/u);
+      const calls = await fixture.callsText();
+      assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+      assert.equal(await pathExists(fixture.pending), false);
+      assert.equal(await pathExists(fixture.processed), false);
+      assert.equal(await pathExists(fixture.localApplied), false);
+    });
+  }
+});
+
+test("a symlinked post-Sol deferral marker fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true, prFailAfter: 2 });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "classification-incomplete",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: t4Commit,
+    prNumber: null,
+  });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_DEFERRAL_SYMLINK_SOURCE: marker,
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /invalid or uncorroborated deferral marker/u);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a permissive post-Sol deferral marker mode fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true, prFailAfter: 2 });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "classification-incomplete",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: t4Commit,
+    prNumber: null,
+  });
+  await chmod(marker, 0o644);
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_DEFERRAL_SOURCE: marker,
+    MOCK_SOL_DEFERRAL_MODE: "0644",
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /invalid or uncorroborated deferral marker/u);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a deferral marker cannot convert a failed Sol child into a retry success", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true, prFailAfter: 2 });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "classification-incomplete",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: t4Commit,
+    prNumber: null,
+  });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "7",
+    MOCK_SOL_DEFERRAL_SOURCE: marker,
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /Sol maintainer exited with status 7/u);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a successful Sol child without a result or deferral marker fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /without a verified result or valid deferral marker/u);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a simultaneous Sol result and deferral marker fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "classification-incomplete",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: t4Commit,
+    prNumber: null,
+  });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_RESULT_SOURCE: fixture.result,
+    MOCK_SOL_DEFERRAL_SOURCE: marker,
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /both a result and a deferral marker/u);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a dangling deferral symlink plus a result is contradictory and fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true });
+  const missingMarkerTarget = join(fixture.root, "missing-deferral-target");
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_RESULT_SOURCE: fixture.result,
+    MOCK_SOL_DEFERRAL_SYMLINK_SOURCE: missingMarkerTarget,
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /both a result and a deferral marker/u);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("a dangling result symlink plus a deferral marker is contradictory and fails closed", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true, prFailAfter: 2 });
+  const marker = await writeSolDeferral(fixture, {
+    schemaVersion: 1,
+    reason: "classification-incomplete",
+    expectedT4MainSha: t4Commit,
+    observedT4MainSha: t4Commit,
+    prNumber: null,
+  });
+  const missingResultTarget = join(fixture.root, "missing-result-target");
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    MOCK_SOL_STATUS: "0",
+    MOCK_SOL_RESULT_SYMLINK_SOURCE: missingResultTarget,
+    MOCK_SOL_DEFERRAL_SOURCE: marker,
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /both a result and a deferral marker/u);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+  assert.equal(await pathExists(fixture.pending), false);
+  assert.equal(await pathExists(fixture.processed), false);
+  assert.equal(await pathExists(fixture.localApplied), false);
+});
+
+test("test mode cannot escape the canonical root through the Sol privilege runner", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_SETPRIV: "/usr/bin/setpriv",
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /privilege runner/u);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("setpriv\t")).length, 0, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+});
+
+
+test("nonexistent child roots behind /tmp symlink parents fail closed before outside state", async (t) => {
+  const fixture = await createRunnerFixture();
+  const outsideRoot = await mkdtemp(join("/var/tmp", "t4-maintainer-outside-"));
+  const tmpParent = join(tmpdir(), `t4-maintainer-root-link-${process.pid}-${Date.now()}`);
+  await symlink(outsideRoot, tmpParent);
+  t.after(async () => {
+    await fixture.cleanup();
+    await rm(tmpParent, { force: true });
+    await rm(outsideRoot, { recursive: true, force: true });
+  });
+  const result = fixture.runRunner({
+    T4_MAINTAINER_ROOT: join(tmpParent, "nonexistent-child"),
+  });
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /maintainer root must exist and be canonicalized/u);
+  assert.equal((await readdir(outsideRoot)).length, 0);
+  const calls = await fixture.callsText();
+  assert.doesNotMatch(calls, /^omp\t/mu);
+  assert.doesNotMatch(calls, /^local-deploy\t/mu);
+});
+test("test mode cannot bypass publication gates from a production root", async (t) => {
+  const fixture = await createRunnerFixture({
+    prSequential: true,
+    workflowsTerminal: true,
+    useHostPrivilegeTools: true,
+  });
+  const productionTemporaryRoot = await realpath("/var/tmp");
+  const productionRoot = await realpath(
+    await mkdtemp(join(productionTemporaryRoot, "t4-maintainer-production-")),
+  );
+  t.after(async () => {
+    await fixture.cleanup();
+    await rm(productionRoot, { recursive: true, force: true });
+  });
+  const result = fixture.runRunner({
+    T4_MAINTAINER_ROOT: productionRoot,
+    T4_MAINTAINER_TEST_PROC_ROOT: "/proc",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0, calls);
+  assert.equal(
+    calls.split("\n").filter((line) => line.includes("gh\tapi\trepos/LycaonLLC/t4-code/pulls\\?state")).length,
+    2,
+    calls,
+  );
+});
+
+test("notification failure cannot alter defer, deployment, or failure semantics", async (t) => {
+  const cases = [
+    ["collaborator defer", { prSequential: true, workflowsTerminal: true }, 0, false],
+    ["local deployment defer", {}, 0, true],
+    ["main failure", { publicIncompatible: true }, 1, false],
+  ];
+  for (const [name, options, expectedStatus, localDefer] of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createRunnerFixture(options);
+      subtest.after(() => fixture.cleanup());
+      if (localDefer) await writeFile(join(fixture.state, "tailnet-health"), "unhealthy");
+      const result = fixture.runRunner({
+        T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+        T4_MAINTAINER_NOTIFY_HELPER: join(fixture.root, "missing-notifier"),
+        T4_MAINTAINER_HERMES_SECRET_FILE: join(fixture.root, "missing-secret"),
+      });
+      assert.equal(result.status, expectedStatus, `${result.stdout}\n${result.stderr}`);
+      const notificationState = join(fixture.state, "notification-state.json");
+      const calls = await fixture.callsText();
+      if (name === "collaborator defer") {
+        assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 0, calls);
+        assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 0, calls);
+        assert.equal(
+          await pathExists(notificationState),
+          false,
+          "failed collaborator notification must not persist blocker dedupe",
+        );
+      }
+      if (name === "local deployment defer") {
+        assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 1, calls);
+      }
+    });
+  }
+});
+
+test("successful blocker delivery warns when durable dedupe persistence fails", async (t) => {
+  const fixture = await createRunnerFixture({ prSequential: true, workflowsTerminal: true });
+  const notifier = join(fixture.root, "successful-notifier");
+  const notifyMarker = join(fixture.root, "notify-delivered");
+  const secret = join(fixture.root, "hermes-secret");
+  const failingSync = join(fixture.root, "notification-failing-sync");
+  const syncMarker = join(fixture.root, "notification-sync-temp-seen");
+  await writeFile(notifier, `#!/usr/bin/env bash
+cat >/dev/null
+: >"${notifyMarker}"
+exit 0
+`);
+  await chmod(notifier, 0o700);
+  await writeFile(secret, "test-secret\n", { mode: 0o600 });
+  await writeFile(
+    failingSync,
+    `#!/usr/bin/env bash
+for argument in "$@"; do
+  case "$argument" in
+    *notification-state.json.*)
+      : >"${syncMarker}"
+      exec /bin/sync "$@"
+      ;;
+    ${fixture.state})
+      [[ -e ${syncMarker} ]] && exit 1
+      ;;
+  esac
+done
+exec /bin/sync "$@"
+`,
+  );
+  await chmod(failingSync, 0o700);
+  await writeFile(
+    join(fixture.state, "notification-state.json"),
+    '{"schemaVersion":1,"blockers":{"existing-blocker":true}}\n',
+  );
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    T4_MAINTAINER_NOTIFY_HELPER: notifier,
+    T4_MAINTAINER_HERMES_SECRET_FILE: secret,
+    T4_MAINTAINER_SYNC: failingSync,
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(await pathExists(notifyMarker), true);
+  assert.equal(await pathExists(syncMarker), true);
+  const notificationState = JSON.parse(await readFile(join(fixture.state, "notification-state.json"), "utf8"));
+  assert.equal(notificationState.blockers["existing-blocker"], true);
+});
+
+test("existing blocker dedupe survives a pre-mv persistence failure", async (t) => {
+  const fixture = await createRunnerFixture({ prSequential: true, workflowsTerminal: true });
+  const notifier = join(fixture.root, "successful-notifier");
+  const secret = join(fixture.root, "hermes-secret");
+  const failingSync = join(fixture.root, "notification-failing-sync");
+  await writeFile(notifier, "#!/usr/bin/env bash\ncat >/dev/null\nexit 0\n");
+  await chmod(notifier, 0o700);
+  await writeFile(secret, "test-secret\n", { mode: 0o600 });
+  await writeFile(
+    failingSync,
+    `#!/usr/bin/env bash
+for argument in "$@"; do
+  case "$argument" in
+    *notification-state.json.*) exit 1 ;;
+  esac
+done
+exec /bin/sync "$@"
+`,
+  );
+  await chmod(failingSync, 0o700);
+  const notificationStatePath = join(fixture.state, "notification-state.json");
+  await writeFile(notificationStatePath, '{"schemaVersion":1,"blockers":{"existing-blocker":true}}\n');
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner({
+    T4_MAINTAINER_TEST_PUBLICATION_GATE: "1",
+    T4_MAINTAINER_NOTIFY_HELPER: notifier,
+    T4_MAINTAINER_HERMES_SECRET_FILE: secret,
+    T4_MAINTAINER_SYNC: failingSync,
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const notificationState = JSON.parse(await readFile(notificationStatePath, "utf8"));
+  assert.equal(notificationState.blockers["existing-blocker"], true);
+  assert.equal(notificationState.blockers["t4-pr-42"], undefined);
+});
 
 test("normal recovery adopts the compatible latest public release before Sol", async (t) => {
   const fixture = await createRunnerFixture({ localDeployFail: true, mainIncompatible: true });
@@ -2409,7 +3441,11 @@ test("fresh verification downloads OMP assets once across later convergence retr
     T4_MAINTAINER_VERIFY_ATTEMPTS: "2",
   });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  const downloads = (await fixture.callsText())
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("setpriv\t")).length, 1, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 1, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("local-deploy\t")).length, 1, calls);
+  const downloads = calls
     .split("\n")
     .filter(
       (line) => line.startsWith("curl\t") && line.includes("mock://omp-") && line.includes("\t-o\t"),
@@ -2549,6 +3585,7 @@ test("an older exact-SHA push rerun is outside the mirror transaction and remain
     forkMainRunPreexisting: true,
     localDeployFail: true,
   });
+
   t.after(() => fixture.cleanup());
   const result = fixture.runRunner();
   assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
@@ -2559,6 +3596,34 @@ test("an older exact-SHA push rerun is outside the mirror transaction and remain
     await pathExists(join(fixture.maintainerRoot, "state", "fork-main-sync.json")),
     false,
   );
+});
+
+test("Sol receives the exact no-new-privileges maintainer execution argv", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner();
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const calls = await fixture.callsText();
+  const setprivCall = calls.split("\n").find((line) => line.startsWith("setpriv\t"));
+  const ompCall = calls.split("\n").find((line) => line.startsWith("omp\t"));
+  assert.ok(setprivCall, calls);
+  assert.ok(ompCall, calls);
+  assert.match(setprivCall, /^setpriv\t--no-new-privs\t--\t.*\/omp(?:\t|$)/u);
+  assert.match(
+    ompCall.replaceAll("\\ ", " "),
+    /omp\t--profile\tt4-maintainer\t--cwd\t[^\t]+\t--model\topenai-codex\/gpt-5\.6-sol\t--thinking\tmax\t--print\t--mode\tjson\t--approval-mode\tyolo\t/u,
+  );
+  assert.doesNotMatch(ompCall, /--no-tools|--tools=|--no-pty|bwrap/u);
+});
+
+test("Darwin invokes the Sol child directly without the Linux privilege runner", async (t) => {
+  const fixture = await createRunnerFixture({ publicIncompatible: true, platform: "Darwin" });
+  t.after(() => fixture.cleanup());
+  const result = fixture.runRunner();
+  assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const calls = await fixture.callsText();
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("setpriv\t")).length, 0, calls);
+  assert.equal(calls.split("\n").filter((line) => line.startsWith("omp\t")).length, 1, calls);
 });
 
 test("a human rerun attempt is never treated as the wrapper-created mirror run", async (t) => {
@@ -2572,6 +3637,7 @@ test("a human rerun attempt is never treated as the wrapper-created mirror run",
   const result = fixture.runRunner();
   assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
   const calls = await fixture.callsText();
+
   assert.doesNotMatch(calls, /actions\/runs\/4242\/cancel/u);
   assert.equal(await pathExists(join(fixture.state, "fork-main-run-cancelled")), false);
   assert.equal(
@@ -2579,6 +3645,7 @@ test("a human rerun attempt is never treated as the wrapper-created mirror run",
     false,
   );
 });
+
 
 test("malformed fork-main run state retains crash recovery and prevents Sol", async (t) => {
   const fixture = await createRunnerFixture({
@@ -2773,7 +3840,7 @@ count=0
 count=$((count + 1))
 printf '%s' "$count" >"$count_file"
 [[ $count != 3 ]] || exit 1
-exec /usr/bin/sync "$@"
+exec /bin/sync "$@"
 `,
   );
   await chmod(failingSync, 0o755);
@@ -2803,7 +3870,7 @@ for argument in "$@"; do
     ${mode === "fail" ? "exit 1" : "printf '{}\\n'; exit 0"}
   fi
 done
-exec /usr/bin/jq "$@"
+exec jq "$@"
 `,
       );
       await chmod(jq, 0o755);

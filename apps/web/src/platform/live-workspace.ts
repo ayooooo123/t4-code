@@ -3,12 +3,17 @@
 // protocol truth — session refs, host metadata, connection states — with no
 // fixture reads and no invented data. Remote absolute paths never surface;
 // projects display their advertised name or a basename.
-import type { DesktopRuntimeSnapshot, SessionProjection } from "@t4-code/client";
+import {
+  type DesktopRuntimeSnapshot,
+  readSessionAttention,
+  type SessionProjection,
+} from "@t4-code/client";
 import type { SessionStatus } from "@t4-code/ui";
 
 import type {
   WorkspaceData,
   WorkspaceHost,
+  SessionLifecycle,
   WorkspaceProject,
   WorkspaceSession,
 } from "../lib/workspace-data.ts";
@@ -23,6 +28,29 @@ import { hostSessionInventoryIsComplete } from "../features/session-runtime/sess
 /** Composite route id for one live session; unambiguous and URL-safe. */
 export function sessionViewId(hostId: string, sessionId: string): string {
   return `${encodeURIComponent(hostId)}/${encodeURIComponent(sessionId)}`;
+}
+
+export interface SessionAttentionOutcomeMarker {
+  readonly sessionKey: string;
+  readonly outcomeId: string;
+}
+
+/** Latest durable outcome for the route the user is actually viewing. */
+export function sessionAttentionOutcomeMarker(
+  snapshot: DesktopRuntimeSnapshot,
+  viewId: string,
+): SessionAttentionOutcomeMarker | null {
+  for (const ref of snapshot.projection.sessionIndex.values()) {
+    const hostId = String(ref.hostId);
+    const sessionId = String(ref.sessionId);
+    if (sessionViewId(hostId, sessionId) !== viewId) continue;
+    const attention = readSessionAttention(ref);
+    const outcome = attention.status === "valid" ? attention.value.latestOutcome : undefined;
+    return outcome === undefined
+      ? null
+      : { sessionKey: `${hostId}\u0000${sessionId}`, outcomeId: outcome.id };
+  }
+  return null;
 }
 
 export interface LiveSessionAddress {
@@ -182,11 +210,31 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
   }
 
   const hosts: WorkspaceHost[] = [];
-  for (const [hostId, meta] of snapshot.hosts) {
+  const hostIds = new Set(snapshot.hosts.keys());
+  for (const ref of snapshot.projection.sessionIndex.values()) {
+    hostIds.add(String(ref.hostId));
+  }
+  for (const hostId of hostIds) {
+    const meta = snapshot.hosts.get(hostId);
+    if (meta === undefined) {
+      // Projection caches retain stable host ids but intentionally do not
+      // persist target bindings or welcome capabilities. This display-only
+      // placeholder keeps cached rows grouped without inventing authority;
+      // the first live welcome replaces it with authenticated metadata.
+      hosts.push({
+        id: hostId,
+        runtimeKind: snapshot.integration.kind,
+        name: hostId,
+        kind: "remote",
+        sessionInventoryTruncated: true,
+      });
+      continue;
+    }
     const target = snapshot.targets.get(meta.targetId);
     const inventoryMetadata = snapshot.projection.sessionIndexMetadata.get(hostId);
     hosts.push({
       id: hostId,
+      runtimeKind: snapshot.integration.kind,
       name: target?.label ?? "This machine",
       kind: target?.kind ?? "local",
       ...(target?.kind === "local"
@@ -262,6 +310,10 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
     // read-only, but only a confirmed live lock may claim another app.
     const control = freshness === "live" ? readSessionControl(ref) : null;
     const controlKind = control === null ? undefined : sessionControlDisplayKind(control);
+    let lifecycle: SessionLifecycle = "unknown";
+    if (ref.status === "active") lifecycle = "active";
+    else if (ref.status === "idle") lifecycle = "idle";
+    else if (ref.status === "closed") lifecycle = "closed";
     let status: SessionStatus | null = null;
     if (connection.state === "connecting") status = "connecting";
     else if (freshness === "live" && controlKind === undefined) {
@@ -276,6 +328,7 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       title: ref.title,
       model: ref.model ?? "",
       status,
+      lifecycle,
       freshness,
       pendingApprovals,
       latestTurnCompletedAt: lastKnownWorking ? null : ref.updatedAt,

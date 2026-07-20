@@ -15,16 +15,23 @@ import type {
   CommandResult,
   ConfirmRequest,
   ConfirmResult,
-  RendererServerFrameEvent,
+  RendererServerEventEnvelope,
 } from "@t4-code/protocol/desktop-ipc";
 
 import type { LiveSettingsRuntimePort } from "../src/features/settings/live-controller.ts";
 import {
+  catalogExplorerInputForLiveState,
   createLiveSettingsScreenModel,
   type LiveSettingsScreenState,
 } from "../src/features/settings/live-screen-model.ts";
 import { SCOPE_LABEL } from "../src/features/settings/SettingRow.tsx";
-import { SCOPE_TAB_LABEL } from "../src/features/settings/SettingsWorkspace.tsx";
+import {
+  buildSettingsRailGroups,
+  buildSettingsRailSections,
+  SCOPE_TAB_LABEL,
+  UPDATE_SECTION_ID,
+} from "../src/features/settings/SettingsWorkspace.tsx";
+import { filterSections } from "../src/features/settings/view-model.ts";
 
 const SETTINGS_SRC = join(import.meta.dirname, "../src/features/settings");
 
@@ -107,9 +114,9 @@ class FakeRuntime implements LiveSettingsRuntimePort {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  subscribeFrames(
+  subscribeEvents(
     _filter: { readonly targetId: string },
-    _listener: (event: RendererServerFrameEvent) => void,
+    _listener: (event: RendererServerEventEnvelope) => void,
   ): () => void {
     return () => {};
   }
@@ -188,6 +195,7 @@ describe("live settings screen model", () => {
     expect(second.phase).toBe("ready");
     if (second.phase !== "ready") return;
     expect(second.api).toBe(first.api);
+    expect(second.catalog.revision).toBe("rev-2");
     expect(second.api.getState().viewModel.revision).toBe("rev-2");
     expect(second.api.getState().announcement).toBe("Settings refreshed from the host.");
   });
@@ -240,6 +248,45 @@ describe("live settings screen model", () => {
     const runtime = new FakeRuntime();
     const { model } = attachedModel(runtime);
     expect(model.getState()).toMatchObject({ phase: "waiting", detail: "no-host" });
+  });
+  it("mounts a waiting explorer for a connected host before catalog frames arrive", () => {
+    const runtime = new FakeRuntime();
+    runtime.connectLocal();
+    const { model } = attachedModel(runtime);
+    const input = catalogExplorerInputForLiveState(runtime, model.getState());
+    expect(input).toMatchObject({
+      host: { hostLabel: "This computer", hostId: "host-1" },
+      phase: "waiting",
+    });
+  });
+
+  it("mounts an unavailable explorer when the active host disconnects", () => {
+    const runtime = new FakeRuntime();
+    runtime.connectLocal();
+    runtime.snapshot.connections.set("local", "error");
+    const { model } = attachedModel(runtime);
+    const input = catalogExplorerInputForLiveState(runtime, model.getState());
+    expect(input).toMatchObject({
+      host: { hostLabel: "This computer", hostId: "host-1" },
+      phase: "unavailable",
+    });
+  });
+
+  it("does not guess an active host from duplicate display labels", () => {
+    const runtime = new FakeRuntime();
+    runtime.snapshot.targets.set("first", { targetId: "first", label: "Remote", state: "connected" });
+    runtime.snapshot.targets.set("second", { targetId: "second", label: "Remote", state: "connected" });
+    runtime.snapshot.targetHosts.set("first", "host-1");
+    runtime.snapshot.targetHosts.set("second", "host-2");
+    const state: LiveSettingsScreenState = {
+      phase: "waiting",
+      detail: "connecting",
+      hostLabel: "Remote",
+      hosts: [],
+      activeTargetId: null,
+    };
+
+    expect(catalogExplorerInputForLiveState(runtime, state)).toBeUndefined();
   });
 });
 
@@ -302,6 +349,155 @@ describe("full catalog rendering", () => {
       agents: [{ name: "scout", description: "Explores the repo." }],
       unavailableReason: null,
     });
+  });
+  it("renders each entry's raw host catalog ID as visible monospace metadata", () => {
+    const source = readFileSync(join(SETTINGS_SRC, "CatalogExplorerBlock.tsx"), "utf8");
+    expect(source).toMatch(/font-mono[^"]*" title="Raw host catalog ID"[\s\S]*\{entry\.id\}/);
+  });
+});
+
+// ─── Defensive labels, Advanced grouping, and search clarity ────────────────
+
+describe("defensive labels and advanced grouping", () => {
+  function readyViewModel(items: readonly Record<string, unknown>[]) {
+    const runtime = new FakeRuntime();
+    runtime.connectLocal();
+    runtime.publish(catalogFrame(items), settingsFrame());
+    const { model } = attachedModel(runtime);
+    const state = model.getState();
+    expect(state.phase).toBe("ready");
+    if (state.phase !== "ready") throw new Error("not ready");
+    return state.api.getState().viewModel;
+  }
+
+  const bare = (path: string, extra: Record<string, unknown> = {}) =>
+    settingItem(path, {
+      controlType: "number",
+      default: 1,
+      effectiveSource: "default",
+      configured: false,
+      sensitive: false,
+      ...extra,
+    });
+
+  it("humanizes unlabeled dotted camel/kebab keys and files them under Advanced, last", () => {
+    const vm = readyViewModel([
+      ...BASE_ITEMS,
+      bare("retry.baseDelayMs"),
+      bare("tui.maxInlineImages", { label: "tui.maxInlineImages" }),
+      bare("web.search-provider", { controlType: "string", default: "auto" }),
+    ]);
+    // Dotted camelCase, no label from the host.
+    expect(vm.rowsById.get("retry.baseDelayMs")?.label).toBe("Retry · Base Delay Ms");
+    // Older host echoing the raw key as the label: still humanized, acronym intact.
+    expect(vm.rowsById.get("tui.maxInlineImages")?.label).toBe("TUI · Max Inline Images");
+    // Kebab segments.
+    expect(vm.rowsById.get("web.search-provider")?.label).toBe("Web · Search Provider");
+    // Unlabeled host keys group under Advanced instead of shadowing schema tabs…
+    for (const id of ["retry.baseDelayMs", "tui.maxInlineImages", "web.search-provider"]) {
+      expect(vm.rowsById.get(id)?.sectionId).toBe("advanced");
+    }
+    // …and Advanced sits last, after the host's curated sections.
+    expect(vm.sections.map((section) => section.id)).toEqual(["appearance", "advanced"]);
+    expect(vm.sections.at(-1)?.label).toBe("Advanced");
+    // The canonical dotted key stays the row id and stays searchable.
+    const hits = filterSections(vm.sections, "retry.baseDelayMs");
+    expect(hits.flatMap((section) => section.rows.map((row) => row.id))).toEqual(["retry.baseDelayMs"]);
+  });
+
+  it("keeps explicit host labels and machine enum values without promoting them to copy", () => {
+    const vm = readyViewModel([
+      settingItem("ttsr.interruptMode", {
+        label: "Stream Rules Interruptions",
+        description: "When to interrupt mid-stream vs inject a warning after completion",
+        controlType: "enum",
+        options: [
+          { value: "always", label: "Always" },
+          { value: "prose-only", label: "Prose Only" },
+        ],
+        default: "always",
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "context",
+      }),
+    ]);
+    const row = vm.rowsById.get("ttsr.interruptMode");
+    // The explicit label wins over any derived fallback.
+    expect(row?.label).toBe("Stream Rules Interruptions");
+    expect(row?.sectionId).toBe("context");
+    if (row?.control.kind !== "enum") throw new Error("expected enum control");
+    // Machine values stay as values — discoverable, never the primary label.
+    expect(row.control.options).toEqual([
+      { value: "always", label: "Always" },
+      { value: "prose-only", label: "Prose Only" },
+    ]);
+  });
+
+  it("separates Speech from Stream Rules in search and names where sound plays", () => {
+    const vm = readyViewModel([
+      settingItem("speech.enabled", {
+        label: "Speech Vocalization",
+        description: "Speak the assistant's replies aloud as they stream. Sound plays on the computer running the session",
+        controlType: "boolean",
+        default: false,
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "providers",
+      }),
+      settingItem("ttsr.enabled", {
+        label: "Stream Rules",
+        description: "Interrupt the agent mid-stream when output matches rule patterns (Time-Traveling Stream Rules)",
+        controlType: "boolean",
+        default: true,
+        effectiveSource: "default",
+        configured: false,
+        sensitive: false,
+        tab: "context",
+      }),
+    ]);
+    const speechHits = filterSections(vm.sections, "speech").flatMap((section) =>
+      section.rows.map((row) => row.id),
+    );
+    expect(speechHits).toEqual(["speech.enabled"]);
+    const ruleHits = filterSections(vm.sections, "stream rules").flatMap((section) =>
+      section.rows.map((row) => row.id),
+    );
+    expect(ruleHits).toEqual(["ttsr.enabled"]);
+    expect(vm.rowsById.get("speech.enabled")?.help).toContain("computer running the session");
+  });
+
+  it("keeps the canonical key visible as wrapped mono metadata and Advanced reachable when narrow", () => {
+    // The row renders its dotted key as muted mono metadata that wraps
+    // (break-all) so narrow layouts never overflow; the label stays primary.
+    const rowSource = readFileSync(join(SETTINGS_SRC, "SettingRow.tsx"), "utf8");
+    expect(rowSource).toMatch(/break-all font-mono[^"]*"[^>]*>\{row\.id\}/);
+    // The narrow-layout section picker is built from the same rail list; the
+    // Advanced section stays selectable there, after every curated section.
+    const rail = buildSettingsRailSections([
+      { id: "appearance", label: "Appearance", summary: "", rows: [] },
+      { id: "advanced", label: "Advanced", summary: "", rows: [] },
+    ]);
+    expect(rail.map((entry) => entry.id)).toEqual(["appearance", "advanced", UPDATE_SECTION_ID]);
+  });
+
+  it("groups familiar settings while keeping unknown host sections honest and reachable", () => {
+    const groups = buildSettingsRailGroups([
+      { id: "general", label: "General", summary: "", rows: [] },
+      { id: "models", label: "Models", summary: "", rows: [] },
+      { id: "mcp", label: "MCP", summary: "", rows: [] },
+      { id: "vendor-runtime", label: "Vendor runtime", summary: "", rows: [] },
+      { id: "diagnostics", label: "Diagnostics", summary: "", rows: [] },
+    ]);
+    expect(groups.map((group) => [group.label, group.sections.map((section) => section.id)])).toEqual([
+      ["Personal", ["general"]],
+      ["AI & agents", ["models"]],
+      ["Integrations", ["mcp"]],
+      ["Host settings", ["vendor-runtime"]],
+      ["System", [UPDATE_SECTION_ID, "diagnostics"]],
+    ]);
+    expect(groups.flatMap((group) => group.sections).map((section) => section.id)).toHaveLength(6);
   });
 });
 

@@ -5,10 +5,30 @@ import {
   decodeDesktopInvokeRequest,
   decodeDesktopUpdateRendererReadyResult,
   decodeDesktopUpdateState,
+  decodeProjectionCacheLoadResult,
+  decodeProjectionCacheSaveRequestValue,
+  decodeProjectionCacheSaveResult,
+  decodePhoneSetupState,
+  decodeSpeechText,
+  MAX_PROJECTION_CACHE_BYTES,
+  MAX_SPEECH_TEXT_BYTES,
   isDesktopInvokeRequest,
 } from "../src/desktop-ipc.ts";
 
 describe("desktop IPC boundary", () => {
+  it("accepts only private root Tailnet URLs for phone setup", () => {
+    expect(decodePhoneSetupState({
+      phase: "ready",
+      message: "Ready",
+      url: "https://work-mac.example.ts.net:8445/",
+    })).toEqual({ phase: "ready", message: "Ready", url: "https://work-mac.example.ts.net:8445/" });
+    for (const url of [
+      "https://example.com:8445/",
+      "https://work-mac.example.ts.net:8445/path",
+      "https://user:secret@work-mac.example.ts.net:8445/",
+      "http://work-mac.example.ts.net:8445/",
+    ]) expect(() => decodePhoneSetupState({ phase: "ready", message: "Ready", url })).toThrow();
+  });
   it("keeps bounded actionable command errors while redacting secret-shaped details", () => {
     const error = commandResultError({
       code: "stale_revision",
@@ -270,24 +290,30 @@ describe("desktop IPC boundary", () => {
     });
     expect(
       decodeDesktopEvent({
-        channel: "omp:server-frame",
+        channel: "omp:server-event",
         payload: {
           targetId: "remote-1",
-          frame: {
-            v: "omp-app/1",
-            type: "response",
-            requestId: "request-1",
-            commandId: "command-1",
-            command: "session.archive",
-            hostId: "host-1",
-            sessionId: "session-1",
-            ok: true,
-            result: { archived: true },
+          event: {
+            kind: "response",
+            payload: {
+              requestId: "request-1",
+              commandId: "command-1",
+              command: "session.archive",
+              hostId: "host-1",
+              sessionId: "session-1",
+              ok: true,
+              result: { archived: true },
+            },
           },
         },
       }),
     ).toMatchObject({
-      payload: { frame: { command: "session.archive", ok: true, result: { archived: true } } },
+      payload: {
+        event: {
+          kind: "response",
+          payload: { command: "session.archive", ok: true, result: { archived: true } },
+        },
+      },
     });
   });
   it("decodes events and rejects hostile shapes", () => {
@@ -305,47 +331,66 @@ describe("desktop IPC boundary", () => {
     ).toBeTruthy();
     expect(
       decodeDesktopEvent({
-        channel: "omp:server-frame",
+        channel: "omp:server-event",
         payload: {
           targetId: "target-1",
-          frame: {
-            v: "omp-app/1",
-            type: "welcome",
-            selectedProtocol: "omp-app/1",
-            hostId: "host-1",
-            ompVersion: "16.4.3",
-            ompBuild: "test",
-            appserverVersion: "0.1.0",
-            appserverBuild: "test",
-            epoch: "epoch-1",
-            grantedCapabilities: [],
-            grantedFeatures: [],
-            negotiatedLimits: {},
-            authentication: "local",
-            resumed: false,
+          event: {
+            kind: "welcome",
+            payload: {
+              selectedProtocol: "omp-app/2",
+              hostId: "host-1",
+              ompVersion: "16.4.3",
+              ompBuild: "test",
+              appserverVersion: "0.1.0",
+              appserverBuild: "test",
+              epoch: "epoch-1",
+              grantedCapabilities: [],
+              grantedFeatures: [],
+              negotiatedLimits: {},
+              authentication: "local",
+              resumed: false,
+            },
           },
         },
       }),
     ).toMatchObject({
-      payload: { targetId: "target-1", frame: { type: "welcome", hostId: "host-1" } },
+      payload: {
+        targetId: "target-1",
+        event: { kind: "welcome", payload: { selectedProtocol: "omp-app/2", hostId: "host-1" } },
+      },
     });
+    for (const wireField of ["v", "type"] as const) {
+      expect(() =>
+        decodeDesktopEvent({
+          channel: "omp:server-event",
+          payload: {
+            targetId: "target-1",
+            event: {
+              kind: "welcome",
+              payload: { [wireField]: "welcome" },
+            },
+          },
+        }),
+      ).toThrow("wire envelope fields cannot cross renderer IPC");
+    }
     expect(() =>
       decodeDesktopEvent({
-        channel: "omp:server-frame",
+        channel: "omp:server-event",
         payload: {
           targetId: "target-1",
-          frame: {
-            v: "omp-app/1",
-            type: "pair.ok",
-            requestId: "request-1",
-            pairingId: "pairing-1",
-            deviceId: "device-1",
-            deviceName: "Workstation",
-            platform: "linux",
-            requestedCapabilities: ["sessions.read"],
-            grantedCapabilities: ["sessions.read"],
-            deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            expiresAt: "2026-07-11T12:00:00.000Z",
+          event: {
+            kind: "pair.ok",
+            payload: {
+              requestId: "request-1",
+              pairingId: "pairing-1",
+              deviceId: "device-1",
+              deviceName: "Workstation",
+              platform: "linux",
+              requestedCapabilities: ["sessions.read"],
+              grantedCapabilities: ["sessions.read"],
+              deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              expiresAt: "2026-07-11T12:00:00.000Z",
+            },
           },
         },
       }),
@@ -438,5 +483,49 @@ describe("desktop IPC boundary", () => {
         payload: { source: "renderer", url: "https://attacker.invalid" },
       }),
     ).toThrow();
+  });
+  it("bounds and rejects unsafe read-aloud requests", () => {
+    expect(decodeDesktopInvokeRequest({ channel: "omp:speech:speak", payload: { text: "hello\nworld" } })).toEqual({
+      channel: "omp:speech:speak",
+      payload: { text: "hello\nworld" },
+    });
+    expect(() => decodeSpeechText("x".repeat(MAX_SPEECH_TEXT_BYTES + 1))).toThrow();
+    expect(() => decodeSpeechText("bad\0text")).toThrow();
+    expect(() => decodeDesktopInvokeRequest({ channel: "omp:speech:stop", payload: {} })).not.toThrow();
+  });
+  it("strictly bounds and versions projection cache IPC payloads", () => {
+    const value = JSON.stringify({
+      kind: "t4-code-projection",
+      version: 1,
+      data: { sessions: [], sessionIndex: [], lru: [], freshness: "cached" },
+    });
+    expect(decodeDesktopInvokeRequest({
+      channel: "app:projection-cache:load",
+      payload: {},
+    })).toEqual({ channel: "app:projection-cache:load", payload: {} });
+    expect(decodeDesktopInvokeRequest({
+      channel: "app:projection-cache:save",
+      payload: { value },
+    })).toEqual({ channel: "app:projection-cache:save", payload: { value } });
+    expect(decodeProjectionCacheSaveRequestValue(value)).toBe(value);
+    expect(decodeProjectionCacheLoadResult({ available: true, value })).toEqual({
+      available: true,
+      value,
+    });
+    expect(decodeProjectionCacheSaveResult({ saved: true })).toEqual({ saved: true });
+
+    for (const invalid of [
+      { channel: "app:projection-cache:load", payload: { storageKey: "renderer-choice" } },
+      { channel: "app:projection-cache:save", payload: { value: JSON.stringify({ kind: "t4-code-projection", version: 2, data: {} }) } },
+      { channel: "app:projection-cache:save", payload: { value: "not-json" } },
+    ]) expect(() => decodeDesktopInvokeRequest(invalid)).toThrow();
+    expect(() => decodeProjectionCacheLoadResult({ available: false, value })).toThrow();
+    expect(() => decodeProjectionCacheSaveResult({ saved: "yes" })).toThrow();
+    const oversized = JSON.stringify({
+      kind: "t4-code-projection",
+      version: 1,
+      data: { padding: "x".repeat(MAX_PROJECTION_CACHE_BYTES) },
+    });
+    expect(() => decodeProjectionCacheSaveRequestValue(oversized)).toThrow();
   });
 });

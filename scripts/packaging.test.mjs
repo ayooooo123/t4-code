@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { join, resolve } from "node:path";
 import config from "../electron-builder.config.mjs";
+import { validateMacosIdentityContract } from "./inspect-macos-release.mjs";
+import {
+  createT4MacOptionsForFile,
+  isBundledOmpRuntime,
+  macSigner,
+  normalizeMacSignOptions,
+} from "./sign-macos.mjs";
 import { createPackage } from "@electron/asar";
 import { runPreflight, validatePreloadArtifact, validateWebIndex } from "./package-preflight.mjs";
 import { inspectPackage, locateAppRoot } from "./inspect-package.mjs";
@@ -24,7 +40,12 @@ import {
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
-const androidIdentity = JSON.parse(readFileSync(resolve(repoRoot, ".github/android-release-identity.json"), "utf8"));
+const androidIdentity = JSON.parse(
+  readFileSync(resolve(repoRoot, ".github/android-release-identity.json"), "utf8"),
+);
+const macosIdentity = JSON.parse(
+  readFileSync(resolve(repoRoot, ".github/macos-release-identity.json"), "utf8"),
+);
 const productionCertificate = "fa58f53c953a078d8db2b633ee8c226cfd2ad3f7220cd55dd03a2e195a81b0ac";
 
 function androidReleaseFixture(overrides = {}) {
@@ -55,7 +76,8 @@ function androidReleaseFixture(overrides = {}) {
     badgingOutput:
       overrides.badgingOutput ??
       `package: name='${contract.applicationId}' versionCode='${versionCode}' versionName='${packageVersion}' platformBuildVersionName='16' platformBuildVersionCode='36' compileSdkVersion='36' compileSdkVersionCodename='16'\nsdkVersion:'${contract.minSdkVersion}'\ntargetSdkVersion:'${contract.targetSdkVersion}'\n`,
-    manifestTreeOutput: overrides.manifestTreeOutput ?? "E: manifest\n  A: package=\"com.lycaonsolutions.t4code\"\n",
+    manifestTreeOutput:
+      overrides.manifestTreeOutput ?? 'E: manifest\n  A: package="com.lycaonsolutions.t4code"\n',
     signerOutput:
       overrides.signerOutput ??
       `Verifies\nVerified using v1 scheme (JAR signing): false\nVerified using v2 scheme (APK Signature Scheme v2): true\nNumber of signers: 1\nSigner #1 certificate SHA-256 digest: ${productionCertificate}\n`,
@@ -73,7 +95,82 @@ test("builder config keeps release contract", () => {
   ]);
   assert.equal(config.mac.category, "public.app-category.developer-tools");
   assert.deepEqual(config.mac.publish, []);
+  assert.equal(config.mac.identity, null);
+  assert.equal(config.mac.hardenedRuntime, false);
+  assert.equal(config.mac.notarize, false);
   assert.equal(config.artifactName, "T4-Code-${version}-${os}-${arch}.${ext}");
+  assert.ok(config.extraResources.some((entry) => entry.to === "runtime/t4-host"));
+});
+
+test("signed macOS packaging is explicit, credentialed, and release-gated", async () => {
+  const previousSignedBuild = process.env.T4_MACOS_SIGNED_BUILD;
+  process.env.T4_MACOS_SIGNED_BUILD = "1";
+  try {
+    const signedConfigUrl = new URL("../electron-builder.config.mjs", import.meta.url);
+    signedConfigUrl.searchParams.set("signed-test", String(Date.now()));
+    const { default: signedConfig } = await import(signedConfigUrl.href);
+    assert.equal(signedConfig.mac.identity, undefined);
+    assert.equal(signedConfig.mac.hardenedRuntime, true);
+    assert.equal(signedConfig.mac.notarize, true);
+    assert.equal(signedConfig.mac.entitlements, "apps/desktop/build/entitlements.mac.plist");
+    assert.equal(signedConfig.mac.entitlementsInherit, "apps/desktop/build/entitlements.mac.plist");
+    assert.equal(signedConfig.mac.sign, "scripts/sign-macos.mjs");
+    assert.deepEqual(signedConfig.mac.publish, []);
+  } finally {
+    if (previousSignedBuild === undefined) delete process.env.T4_MACOS_SIGNED_BUILD;
+    else process.env.T4_MACOS_SIGNED_BUILD = previousSignedBuild;
+  }
+
+  assert.doesNotThrow(() => validateMacosIdentityContract(macosIdentity));
+  const releaseWorkflow = readFileSync(resolve(repoRoot, ".github/workflows/release.yml"), "utf8");
+  for (const expected of [
+    "T4_MACOS_CERTIFICATE_BASE64",
+    "T4_MACOS_CERTIFICATE_PASSWORD",
+    "T4_APPLE_API_KEY_BASE64",
+    "T4_APPLE_API_KEY_ID",
+    "T4_APPLE_API_ISSUER_ID",
+    "T4_APPLE_TEAM_ID",
+    "pnpm package:mac",
+    "scripts/inspect-macos-release.mjs",
+  ]) {
+    assert.ok(releaseWorkflow.includes(expected), `release workflow must include ${expected}`);
+  }
+  assert.doesNotMatch(releaseWorkflow, /Build unsigned macOS packages/u);
+});
+
+test("signed macOS packaging relaxes library validation only for the bundled OMP runtime", () => {
+  const appPath = "/tmp/T4 Code.app";
+  const inherited = () => ({
+    entitlements: "apps/desktop/build/entitlements.mac.plist",
+    hardenedRuntime: true,
+  });
+  const optionsForFile = createT4MacOptionsForFile(inherited);
+  const runtimePath = `${appPath}/Contents/Resources/runtime/omp`;
+  const helperPath = `${appPath}/Contents/Frameworks/T4 Code Helper.app`;
+
+  assert.equal(isBundledOmpRuntime(runtimePath), true);
+  assert.equal(isBundledOmpRuntime(`${runtimePath}.backup`), false);
+  assert.deepEqual(optionsForFile(helperPath), inherited());
+  assert.deepEqual(optionsForFile(runtimePath), {
+    ...inherited(),
+    entitlements: "apps/desktop/build/entitlements.omp-runtime.plist",
+  });
+});
+
+test("macOS signing accepts current and legacy electron-builder callback shapes", () => {
+  const current = { app: "/tmp/current.app", identity: "certificate" };
+  assert.equal(normalizeMacSignOptions(current), current);
+  assert.deepEqual(
+    normalizeMacSignOptions({ path: "/tmp/legacy.app", options: { identity: "certificate" } }),
+    { app: "/tmp/legacy.app", identity: "certificate" },
+  );
+  assert.throws(() => normalizeMacSignOptions({}), /did not provide an application path/u);
+});
+
+test("macOS signing uses the Promise API that electron-builder can await", async () => {
+  const pending = macSigner({});
+  assert.equal(typeof pending?.then, "function");
+  await assert.rejects(pending);
 });
 
 test("Android release identity is public, pinned, and wired into the release workflow", () => {
@@ -97,7 +194,10 @@ test("Android release identity is public, pinned, and wired into the release wor
     "pnpm --filter @t4-code/mobile build:android:release",
   );
   assert.ok(androidDebugGate >= 0, "release workflow must run the Android debug verification gate");
-  assert.ok(androidDebugGate < androidReleaseBuild, "Android verification must precede the signed build");
+  assert.ok(
+    androidDebugGate < androidReleaseBuild,
+    "Android verification must precede the signed build",
+  );
 });
 
 test("Android versionCode is derived from the package version without a release-specific constant", () => {
@@ -152,46 +252,56 @@ test("Android release inspector fails closed on identity, SDK, split, and signer
     [
       "application id",
       {
-        badgingOutput: "package: name='example.wrong' versionCode='10017' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
+        badgingOutput:
+          "package: name='example.wrong' versionCode='10017' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
       },
       /applicationId example\.wrong/u,
     ],
     [
       "version name",
       {
-        badgingOutput: "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.18'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
+        badgingOutput:
+          "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.18'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
       },
       /versionName 0\.1\.18/u,
     ],
     [
       "version code",
       {
-        badgingOutput: "package: name='com.lycaonsolutions.t4code' versionCode='10016' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
+        badgingOutput:
+          "package: name='com.lycaonsolutions.t4code' versionCode='10016' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
       },
       /versionCode 10016/u,
     ],
     [
       "minimum sdk",
       {
-        badgingOutput: "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17'\nsdkVersion:'23'\ntargetSdkVersion:'36'\n",
+        badgingOutput:
+          "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17'\nsdkVersion:'23'\ntargetSdkVersion:'36'\n",
       },
       /minSdkVersion 23/u,
     ],
     [
       "target sdk",
       {
-        badgingOutput: "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'35'\n",
+        badgingOutput:
+          "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17'\nsdkVersion:'24'\ntargetSdkVersion:'35'\n",
       },
       /targetSdkVersion 35/u,
     ],
     [
       "split package",
       {
-        badgingOutput: "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17' split='config.arm64_v8a'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
+        badgingOutput:
+          "package: name='com.lycaonsolutions.t4code' versionCode='10017' versionName='0.1.17' split='config.arm64_v8a'\nsdkVersion:'24'\ntargetSdkVersion:'36'\n",
       },
       /standalone/u,
     ],
-    ["split manifest", { manifestTreeOutput: "E: manifest\n  A: split=\"config.en\"\n" }, /split-only metadata/u],
+    [
+      "split manifest",
+      { manifestTreeOutput: 'E: manifest\n  A: split="config.en"\n' },
+      /split-only metadata/u,
+    ],
     [
       "split output metadata",
       {
@@ -236,7 +346,10 @@ test("Android release inspector fails closed on identity, SDK, split, and signer
 });
 
 test("builder never publishes implicitly from a release tag", () => {
-  assert.deepEqual(buildElectronBuilderArgs(["--linux", "--x64"], repoRoot).slice(-2), ["--publish", "never"]);
+  assert.deepEqual(buildElectronBuilderArgs(["--linux", "--x64"], repoRoot).slice(-2), [
+    "--publish",
+    "never",
+  ]);
 });
 
 test("builder uses a public artifact umask without changing its caller", () => {
@@ -275,11 +388,24 @@ test("preflight accepts built desktop inputs", () => {
 });
 
 test("web index preflight rejects absolute assets, inline executable scripts, and missing bootstrap", () => {
-  const valid = '<script src="./t4-bootstrap.js"></script><script type="module" src="./assets/main.js"></script><link rel="stylesheet" href="./assets/main.css">';
+  const valid =
+    '<script src="./t4-bootstrap.js"></script><script type="module" src="./assets/main.js"></script><link rel="stylesheet" href="./assets/main.css">';
   assert.deepEqual(validateWebIndex(valid), []);
-  assert.ok(validateWebIndex('<script src="/src/main.js"></script><script src="./t4-bootstrap.js"></script>').some((error) => error.includes("root-absolute")));
-  assert.ok(validateWebIndex('<script src="./t4-bootstrap.js"></script><script>window.x=1</script>').some((error) => error.includes("inline")));
-  assert.ok(validateWebIndex('<script type="module" src="./main.js"></script>').some((error) => error.includes("missing external")));
+  assert.ok(
+    validateWebIndex(
+      '<script src="/src/main.js"></script><script src="./t4-bootstrap.js"></script>',
+    ).some((error) => error.includes("root-absolute")),
+  );
+  assert.ok(
+    validateWebIndex('<script src="./t4-bootstrap.js"></script><script>window.x=1</script>').some(
+      (error) => error.includes("inline"),
+    ),
+  );
+  assert.ok(
+    validateWebIndex('<script type="module" src="./main.js"></script>').some((error) =>
+      error.includes("missing external"),
+    ),
+  );
 });
 
 test("preload artifact guard rejects local edges and requires the bridge marker", () => {
@@ -315,12 +441,18 @@ test("artifact inspector reads macOS bundles with capitalized Resources", async 
     const resources = join(contents, "Resources");
     const asarSource = join(scratch, "asar-source");
     mkdirSync(join(resources, "web"), { recursive: true });
+    mkdirSync(join(resources, "runtime"), { recursive: true });
     mkdirSync(join(asarSource, "dist-electron"), { recursive: true });
     writeFileSync(join(resources, "web", "index.html"), "<!doctype html>");
     writeFileSync(join(resources, "LICENSE"), "MIT");
+    writeFileSync(join(resources, "runtime", "t4-host"), "host");
+    chmodSync(join(resources, "runtime", "t4-host"), 0o755);
     writeFileSync(join(asarSource, "dist-electron", "main.cjs"), "");
     writeFileSync(join(asarSource, "dist-electron", "preload.cjs"), "");
-    writeFileSync(join(asarSource, "package.json"), JSON.stringify({ productName: config.productName }));
+    writeFileSync(
+      join(asarSource, "package.json"),
+      JSON.stringify({ productName: config.productName }),
+    );
     await createPackage(asarSource, join(resources, "app.asar"));
     assert.equal(locateAppRoot(scratch), contents);
     const result = inspectPackage(contents);
@@ -336,7 +468,10 @@ test("builder config wires the T4 icon set for linux and the 1024 master for mac
   assert.ok(existsSync(resolve(repoRoot, config.mac.icon)));
   assert.ok(existsSync(resolve(repoRoot, "apps/desktop/build/icon.svg")));
   for (const size of LINUX_ICON_SIZES) {
-    assert.ok(existsSync(resolve(repoRoot, config.linux.icon, `${size}x${size}.png`)), `missing ${size}x${size}.png`);
+    assert.ok(
+      existsSync(resolve(repoRoot, config.linux.icon, `${size}x${size}.png`)),
+      `missing ${size}x${size}.png`,
+    );
   }
 });
 

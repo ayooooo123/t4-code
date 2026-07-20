@@ -19,11 +19,23 @@ import {
   useNavigate,
   useParams,
 } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { AppShell } from "./components/AppShell.tsx";
 import { HomePane } from "./components/HomePane.tsx";
 import { SessionScreen } from "./components/SessionScreen.tsx";
+import { AgentViewScreen } from "./features/agent-view/AgentViewScreen.tsx";
+import {
+  AGENT_VIEW_FIXTURE_GROUPS,
+  AGENT_VIEW_FIXTURE_NOW_MS,
+} from "./features/agent-view/fixtures.ts";
+import { getInspectorStore } from "./features/panes/inspector-store.ts";
+import { PreviewWorkspace } from "./features/preview/PreviewWorkspace.tsx";
+import { BrowserWorkspace } from "./features/browser/index.ts";
+import { FixturePreviewWorkspace } from "./features/preview/FixturePreviewWorkspace.tsx";
+import { LiveAttentionInbox } from "./features/attention/index.ts";
+import { LiveTranscriptSearch } from "./features/transcript-search/index.ts";
+import { TRANSCRIPT_SEARCH_ROUTE } from "./features/transcript-search/route.ts";
 import { SettingsWorkspace } from "./features/settings/index.ts";
 import { LiveSettingsScreen } from "./features/settings/LiveSettingsScreen.tsx";
 import { TargetsScreen } from "./features/targets/TargetsScreen.tsx";
@@ -33,6 +45,7 @@ import {
   type ProfilesPort,
   type TargetsStoreApi,
 } from "./features/targets/targets-store.ts";
+import type { WorkspaceProject, WorkspaceSession } from "./lib/workspace-data.ts";
 import {
   applySessionRoutePendingGrace,
   createSessionRouteActivationGate,
@@ -41,10 +54,12 @@ import {
   preferredHomeSessionId,
 } from "./lib/session-route.ts";
 import { desktopRuntime, useDesktopRuntimeSnapshot } from "./platform/desktop-runtime.ts";
+import { sessionAttentionOutcomeMarker } from "./platform/live-workspace.ts";
 import { useShellData } from "./state/shell-data.ts";
 import { RAIL_OVERLAY_QUERY, useMediaQuery } from "./hooks/useMediaQuery.ts";
 import { fixtureSettingsStore } from "./state/settings-instance.ts";
 import { rendererPlatform, useWorkspace, workspaceStore } from "./state/store-instance.ts";
+import { selectSessionView } from "./state/workspace-store.ts";
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -79,8 +94,35 @@ const indexRoute = createRoute({
   component: HomeRoute,
 });
 
-function SessionRoute() {
-  const { sessionId } = useParams({ from: "/sessions/$sessionId" });
+const inboxRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/inbox",
+  component: LiveAttentionInbox,
+});
+
+const searchRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: TRANSCRIPT_SEARCH_ROUTE,
+  component: LiveTranscriptSearch,
+});
+
+interface SessionRouteGateProps {
+  readonly sessionId: string;
+  readonly previewRoute: boolean;
+  readonly browserRoute?: boolean;
+  readonly children: (
+    session: WorkspaceSession,
+    project: WorkspaceProject,
+    nowMs: number,
+  ) => ReactNode;
+}
+
+function SessionRouteGate({
+  browserRoute = false,
+  children,
+  previewRoute,
+  sessionId,
+}: SessionRouteGateProps) {
   const navigate = useNavigate();
   const [nowMs] = useState(() => Date.now());
   const [pendingTimedOut, setPendingTimedOut] = useState(false);
@@ -103,18 +145,11 @@ function SessionRoute() {
   const pendingKey = rawDecision.kind === "pending" ? sessionId : null;
   const decision = applySessionRoutePendingGrace(rawDecision, pendingTimedOut);
 
-  // Arm grace only when raw route truth enters pending. A healthy session does
-  // not burn its future reconnect grace, and an expired pending route remains
-  // unavailable until raw truth recovers or the route changes.
   useEffect(() => {
     pendingGrace.update(pendingKey);
   }, [pendingGrace, pendingKey]);
   useEffect(() => () => pendingGrace.dispose(), [pendingGrace]);
 
-  // Activation stamps the visit and closes the overlay rail — once per
-  // present route session ID. Streamed projections rebuild `session` on
-  // every output/status update; the gate keeps that churn from re-closing
-  // a rail the user just reopened.
   const [activationGate] = useState(() => createSessionRouteActivationGate());
   useEffect(() => {
     const target = activationGate.resolve(decision, session);
@@ -122,6 +157,21 @@ function SessionRoute() {
       workspaceStore.getState().activateSession(target, new Date().toISOString());
     }
   }, [activationGate, decision, session]);
+
+  const attentionOutcome =
+    runtimeSnapshot === null ? null : sessionAttentionOutcomeMarker(runtimeSnapshot, sessionId);
+  const attentionOutcomeId = attentionOutcome?.outcomeId;
+  const attentionSessionKey = attentionOutcome?.sessionKey;
+  useEffect(() => {
+    if (
+      decision.kind !== "present" ||
+      attentionOutcomeId === undefined ||
+      attentionSessionKey === undefined
+    ) {
+      return;
+    }
+    workspaceStore.getState().markAttentionOutcomeSeen(attentionSessionKey, attentionOutcomeId);
+  }, [attentionOutcomeId, attentionSessionKey, decision.kind]);
 
   if (decision.kind === "pending") {
     return (
@@ -143,7 +193,19 @@ function SessionRoute() {
     return <Navigate replace to="/" />;
   }
   if (decision.kind === "redirect-session") {
-    return (
+    return previewRoute ? (
+      <Navigate
+        params={{ sessionId: decision.sessionId }}
+        replace
+        to="/sessions/$sessionId/preview"
+      />
+    ) : browserRoute ? (
+      <Navigate
+        params={{ sessionId: decision.sessionId }}
+        replace
+        to="/sessions/$sessionId/browser"
+      />
+    ) : (
       <Navigate params={{ sessionId: decision.sessionId }} replace to="/sessions/$sessionId" />
     );
   }
@@ -195,13 +257,111 @@ function SessionRoute() {
       </div>
     );
   }
-  return <SessionScreen key={session.id} nowMs={nowMs} project={project} session={session} />;
+  return children(session, project, nowMs);
 }
+
+function SessionRoute() {
+  const navigate = useNavigate();
+  const { sessionId } = useParams({ from: "/sessions/$sessionId" });
+  return (
+    <SessionRouteGate previewRoute={false} sessionId={sessionId}>
+      {(session, project, nowMs) => (
+        <SessionScreen
+          key={session.id}
+          nowMs={nowMs}
+          onOpenHostHealth={() => void navigate({ to: "/hosts" })}
+          project={project}
+          session={session}
+        />
+      )}
+    </SessionRouteGate>
+  );
+}
+
+function PreviewRoute() {
+  const { sessionId } = useParams({ from: "/sessions/$sessionId/preview" });
+  return (
+    <SessionRouteGate previewRoute sessionId={sessionId}>
+      {(session, project) =>
+        rendererPlatform.demo ? (
+          <FixturePreviewWorkspace project={project} session={session} />
+        ) : (
+          <PreviewWorkspace project={project} session={session} />
+        )
+      }
+    </SessionRouteGate>
+  );
+}
+
+function BrowserRoute() {
+  const { sessionId } = useParams({ from: "/sessions/$sessionId/browser" });
+  return (
+    <SessionRouteGate browserRoute previewRoute={false} sessionId={sessionId}>
+      {(session, project) => (
+        <BrowserWorkspace key={session.id} project={project} session={session} />
+      )}
+    </SessionRouteGate>
+  );
+}
+
+const browserRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sessions/$sessionId/browser",
+  component: BrowserRoute,
+});
 
 const sessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
   component: SessionRoute,
+});
+
+const previewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sessions/$sessionId/preview",
+  component: PreviewRoute,
+});
+
+function AgentViewRoute() {
+  const navigate = useNavigate();
+  const activeSessionId = useWorkspace((state) => state.activeSessionId);
+  const snapshot = useDesktopRuntimeSnapshot();
+  return (
+    <AgentViewScreen
+      controller={desktopRuntime()}
+      {...(rendererPlatform.demo
+        ? {
+            fixtureGroups: AGENT_VIEW_FIXTURE_GROUPS,
+            fixtureNowMs: AGENT_VIEW_FIXTURE_NOW_MS,
+          }
+        : {})}
+      onBack={() => {
+        if (activeSessionId === null) void navigate({ to: "/" });
+        else void navigate({ params: { sessionId: activeSessionId }, to: "/sessions/$sessionId" });
+      }}
+      onOpenSession={(sessionId, agentId) => {
+        const inspector = getInspectorStore(sessionId);
+        if (
+          agentId !== undefined &&
+          inspector?.getState().agentMap.agents[agentId] !== undefined
+        ) {
+          inspector.getState().selectAgent(agentId);
+        }
+        const state = workspaceStore.getState();
+        const view = selectSessionView(state, sessionId);
+        if (view.paneFamily === "agents") state.setPaneOpen(sessionId, true);
+        else state.togglePaneFamily(sessionId, "agents");
+        void navigate({ params: { sessionId }, to: "/sessions/$sessionId" });
+      }}
+      snapshot={snapshot}
+    />
+  );
+}
+
+const agentViewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/agents",
+  component: AgentViewRoute,
 });
 
 // Settings keeps the shell frame: the rail and titlebar stay put, and
@@ -309,6 +469,12 @@ function HostsRoute() {
         api={targetsStoreInstance}
         onBack={() => void navigate({ to: "/settings" })}
         profilesAvailable={localProfiles !== undefined}
+        {...(shell?.inspectPhoneSetup && shell.configurePhoneSetup ? {
+          phoneSetup: {
+            inspect: shell.inspectPhoneSetup,
+            configure: shell.configurePhoneSetup,
+          },
+        } : {})}
         serviceAvailable={shell?.serviceInspect !== undefined}
         snapshot={snapshot}
       />
@@ -341,7 +507,12 @@ const usageRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
+  inboxRoute,
+  searchRoute,
   sessionRoute,
+  previewRoute,
+  browserRoute,
+  agentViewRoute,
   settingsRoute,
   hostsRoute,
   usageRoute,

@@ -126,18 +126,38 @@ async function runChecked(
   runner: ServiceRunner,
   command: readonly string[],
 ): Promise<ServiceRunnerResult> {
-  let result: ServiceRunnerResult;
-  try {
-    result = await runner.run(command);
-  } catch (cause) {
-    throw new ServiceCommandError(command, {
-      exitCode: null,
-      stdout: "",
-      stderr: sanitizeDiagnostic(String(cause)),
-    });
+  const isLaunchctlBootstrap = command[0] === "launchctl" && command[1] === "bootstrap";
+  // launchd can accept bootout before it has finished removing the service.
+  // A replacement bootstrap can then return EINPROGRESS (37), or the less
+  // specific EIO (5), for several seconds even though the plist is valid.
+  const retryDeadline = Date.now() + 30_000;
+  while (true) {
+    let result: ServiceRunnerResult;
+    try {
+      result = await runner.run(command);
+    } catch (cause) {
+      throw new ServiceCommandError(command, {
+        exitCode: null,
+        stdout: "",
+        stderr: sanitizeDiagnostic(String(cause)),
+      });
+    }
+    if (result.exitCode === 0) return result;
+    const diagnostics = `${result.stdout}\n${result.stderr}`;
+    const removalStillFinishing =
+      isLaunchctlBootstrap &&
+      (
+        result.exitCode === 37 ||
+        /operation already in progress|bootstrap failed:\s*37\b/iu.test(diagnostics) ||
+        (
+          result.exitCode === 5 &&
+          /bootstrap failed:\s*5\s*:\s*input\/output error/iu.test(diagnostics)
+        )
+      );
+    if (!removalStillFinishing || Date.now() >= retryDeadline)
+      throw new ServiceCommandError(command, result);
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
   }
-  if (result.exitCode !== 0) throw new ServiceCommandError(command, result);
-  return result;
 }
 
 abstract class BaseManager implements ServiceManager {

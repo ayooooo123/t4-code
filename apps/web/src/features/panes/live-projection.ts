@@ -2,10 +2,14 @@
 // desktop runtime already validated and bounded) to the inspector pane
 // view models. Every function here is derivation only: unknown fields stay
 // null, unsafe paths disappear, and nothing is invented to fill a gap.
-import type { AgentTranscriptProjection, ResultProjection, SessionProjection } from "@t4-code/client";
-import type { AgentFrame, FileFrame, LiveEventFrame, ReviewFrame } from "@t4-code/protocol";
+import type {
+  AgentTranscriptProjection,
+  PreviewFreshness,
+  ResultProjection,
+  SessionProjection,
+} from "@t4-code/client";
 
-import { classifySessionEvent } from "./activity-log.ts";
+import { classifyPreviewEvent, classifySessionEvent } from "./activity-log.ts";
 import { displayStateFromWire } from "./model.ts";
 import type {
   ActivityEntry,
@@ -17,6 +21,13 @@ import type {
   ReviewFileStatus,
 } from "./model.ts";
 import { countPatchChanges } from "./review-model.ts";
+
+type SessionMapValue<Key extends keyof SessionProjection> =
+  SessionProjection[Key] extends ReadonlyMap<string, infer Value> ? Value : never;
+type ProjectionAgentFrame = SessionMapValue<"agents">;
+type ProjectionFileFrame = SessionMapValue<"files">;
+type ProjectionReviewFrame = SessionMapValue<"reviews">;
+type ProjectionLiveEventFrame = SessionProjection["events"][number];
 
 // ---------------------------------------------------------------------------
 // Path safety. Mirrors app-wire's safeRelativePath rules: relative POSIX
@@ -30,20 +41,20 @@ export function isSafeRelativePath(value: string): boolean {
   if (/[\u0000-\u001f\u007f]/u.test(value)) return false;
   if (value.includes("\\") || value.startsWith("/") || value.startsWith("~")) return false;
   if (/^[A-Za-z]:/u.test(value)) return false;
-  return value
-    .split("/")
-    .every((part) => part.length > 0 && part !== "." && part !== "..");
+  return value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
 }
 
 function readString(record: Readonly<Record<string, unknown>>, key: string): string | null {
   const value = record[key];
   return typeof value === "string" && value.length > 0 ? value : null;
 }
-function readNonNegativeNumber(record: Readonly<Record<string, unknown>>, key: string): number | null {
+function readNonNegativeNumber(
+  record: Readonly<Record<string, unknown>>,
+  key: string,
+): number | null {
   const value = record[key];
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
-
 
 function readSafePath(record: Readonly<Record<string, unknown>>, key: string): string | null {
   const value = readString(record, key);
@@ -76,8 +87,8 @@ function transcriptEntryFrom(
  * agent's real id — never a made-up label.
  */
 export function agentNodeFromFrame(
-  frame: AgentFrame,
-  events: readonly LiveEventFrame[],
+  frame: ProjectionAgentFrame,
+  events: readonly ProjectionLiveEventFrame[],
   durableTranscript?: AgentTranscriptProjection,
 ): AgentNode {
   const id = String(frame.agentId);
@@ -115,7 +126,8 @@ export function agentNodeFromFrame(
       ? (rawContext as Readonly<Record<string, unknown>>)
       : null;
   const contextUsed = contextRecord === null ? null : readNonNegativeNumber(contextRecord, "used");
-  const contextLimit = contextRecord === null ? null : readNonNegativeNumber(contextRecord, "limit");
+  const contextLimit =
+    contextRecord === null ? null : readNonNegativeNumber(contextRecord, "limit");
   const validContext = contextUsed !== null && contextLimit !== null && contextUsed <= contextLimit;
   const parentId = readString(detail, "parentId");
   const kindValue = detail.kind;
@@ -199,6 +211,19 @@ export function collectActivity(session: SessionProjection): KeyedActivityEntry[
       entry: classifySessionEvent(frame.event, 0, ""),
     });
   }
+  for (const event of session.previewEvents) {
+    let freshness: PreviewFreshness | undefined;
+    for (const preview of session.previews.values()) {
+      if (preview.previewId === event.previewId) {
+        freshness = preview.freshness;
+        break;
+      }
+    }
+    entries.push({
+      key: `preview:${event.cursor.epoch}:${event.cursor.seq}`,
+      entry: classifyPreviewEvent(event, 0, "", freshness),
+    });
+  }
   for (const frame of session.audit) {
     entries.push({
       key: `audit:${frame.timestamp}\u0000${frame.action}\u0000${frame.actor}`,
@@ -256,10 +281,12 @@ const REVIEW_FILE_STATUSES: Readonly<Record<ReviewFileStatus, true>> = {
   modified: true,
   deleted: true,
   renamed: true,
+  copied: true,
+  untracked: true,
 };
 
 function reviewFileFrom(
-  frame: ReviewFrame,
+  frame: ProjectionReviewFrame,
   path: string,
   source: Readonly<Record<string, unknown>>,
 ): ReviewFile {
@@ -288,7 +315,11 @@ function reviewFileFrom(
     patch,
     sizeBytes: typeof sizeBytes === "number" && Number.isFinite(sizeBytes) ? sizeBytes : null,
     applyState:
-      frame.status === "applied" ? "applied" : frame.status === "discarded" ? "discarded" : "pending",
+      frame.status === "applied"
+        ? "applied"
+        : frame.status === "discarded"
+          ? "discarded"
+          : "pending",
   };
 }
 
@@ -411,7 +442,7 @@ export function sameListing(a: readonly FileTreeNode[], b: readonly FileTreeNode
 }
 
 /** Preview straight from a pushed file frame; no content, honest message. */
-export function previewFromFileFrame(frame: FileFrame): FilePreview {
+export function previewFromFileFrame(frame: ProjectionFileFrame): FilePreview {
   if (frame.content === undefined) {
     return {
       kind: "diagnostic",

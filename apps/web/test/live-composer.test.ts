@@ -11,6 +11,7 @@ import {
   applyPublicFrame,
   createDesktopRuntimeController,
   createProjectionSnapshot,
+  decodeProjectionCache,
   encodeProjectionCache,
   type DesktopRuntimeController,
   type DesktopRuntimeSnapshot,
@@ -58,7 +59,7 @@ import {
 } from "../src/platform/desktop-runtime.ts";
 import { createMemoryPersistence } from "../src/state/persistence.ts";
 import { createWorkspaceStore, selectSessionView } from "../src/state/workspace-store.ts";
-import { deferred, FakeShell, makeTarget, makeWelcome } from "./fake-shell.ts";
+import { bindProjectionInventoryResults, deferred, FakeShell, makeTarget, makeWelcome } from "./fake-shell.ts";
 
 const V = "omp-app/1" as const;
 const HOST = "host-a";
@@ -268,7 +269,11 @@ async function startedController(
       truncated: false,
     } satisfies SessionsFrame,
   });
+  bindProjectionInventoryResults(shell, controller);
   return { shell, controller };
+}
+async function settle(rounds = 12): Promise<void> {
+  for (let index = 0; index < rounds; index += 1) await Promise.resolve();
 }
 
 interface LiveSetup extends ControllerSetup {
@@ -2137,6 +2142,7 @@ describe("session lifecycle", () => {
     });
     expect(deriveWorkspaceData(controller.getSnapshot()).sessions[0]).toMatchObject({
       freshness: "live",
+      lifecycle: "active",
       status: "working",
     });
   });
@@ -2358,6 +2364,106 @@ describe("session lifecycle", () => {
     expect(again).toBe(first);
     await Promise.resolve();
     expect(shell.commandCount("session.attach")).toBe(1);
+  });
+
+  it("paints a bounded cold tail before starting the full live attach", async () => {
+    const shell = new FakeShell();
+    shell.commandResult = (request) =>
+      request.intent.command === "transcript.page"
+        ? {
+            entries: [entry("tail-1", "Newest saved answer")],
+            nextCursor: "older-1",
+            hasMore: true,
+            generation: "generation-1",
+          }
+        : undefined;
+    const controller = createDesktopRuntimeController({ shell });
+    await controller.start();
+    shell.emitFrame({
+      targetId: "local",
+      frame: makeWelcome(HOST, ["sessions.read"], ["transcript.page"]),
+    });
+    shell.emitFrame({ targetId: "local", frame: pendingPromptsSessionsFrame([], 0, "idle") });
+
+    const runtime = createLiveSessionRuntime({
+      controller,
+      targetId: "local",
+      hostId: HOST,
+      sessionId: SESSION,
+    });
+    await settle();
+
+    expect(
+      shell.commands
+        .map((request) => request.intent.command)
+        .filter((command) => command === "transcript.page" || command === "session.attach"),
+    ).toEqual(["transcript.page", "session.attach"]);
+    expect(runtime.getSnapshot().projection.entries.map((value) => value.id)).toEqual(["tail-1"]);
+    expect(runtime.getSnapshot().transcriptHistory).toMatchObject({
+      phase: "ready",
+      hasMore: true,
+    });
+
+    runtime.dispose();
+    await controller.stop();
+  });
+
+  it("prepends overlapping history without changing the live cursor", async () => {
+    const shell = new FakeShell();
+    shell.commandResult = (request) => {
+      if (request.intent.command !== "transcript.page") return undefined;
+      return request.intent.args.before === "older-1"
+        ? {
+            entries: [entry("history-1", "Earlier"), entry("tail-1", "Overlap")],
+            hasMore: false,
+            generation: "generation-1",
+          }
+        : {
+            entries: [entry("tail-1", "Tail"), entry("tail-2", "Tail two")],
+            nextCursor: "older-1",
+            hasMore: true,
+            generation: "generation-1",
+          };
+    };
+    const controller = createDesktopRuntimeController({ shell });
+    await controller.start();
+    shell.emitFrame({
+      targetId: "local",
+      frame: makeWelcome(HOST, ["sessions.read"], ["transcript.page"]),
+    });
+    shell.emitFrame({
+      targetId: "local",
+      frame: snapshotFrame(5, [
+        entry("tail-1", "Tail"),
+        entry("tail-2", "Tail two"),
+        entry("live-1", "Live"),
+      ]),
+    });
+    shell.emitFrame({ targetId: "local", frame: pendingPromptsSessionsFrame([], 0, "idle") });
+    const runtime = createLiveSessionRuntime({
+      controller,
+      targetId: "local",
+      hostId: HOST,
+      sessionId: SESSION,
+    });
+    await settle();
+
+    await runtime.loadEarlierTranscript?.();
+
+    expect(runtime.getSnapshot().projection.entries.map((value) => value.id)).toEqual([
+      "history-1",
+      "tail-1",
+      "tail-2",
+      "live-1",
+    ]);
+    expect(runtime.getSnapshot().projection.cursor).toEqual({ epoch: "epoch-1", seq: 5 });
+    expect(runtime.getSnapshot().transcriptHistory).toMatchObject({
+      phase: "ready",
+      hasMore: false,
+    });
+
+    runtime.dispose();
+    await controller.stop();
   });
 
   it("rebuilds retained ask, approval, and plan state across runtime recreation", async () => {
@@ -2610,18 +2716,12 @@ describe("session lifecycle", () => {
     const cache = new Map<string, SessionRuntime>();
     shell.commandBehavior = { kind: "reject" };
     obtainLiveRuntime(controller, sessionViewId(HOST, SESSION), cache);
-    await Promise.resolve();
-    await Promise.resolve();
+    await settle();
     expect(shell.commandCount("session.attach")).toBe(1);
 
     shell.commandBehavior = { kind: "accept" };
     shell.emitState({ targetId: "local", state: "connected" });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    shell.emitState({ targetId: "local", state: "connected" });
-    await Promise.resolve();
+    await settle();
     expect(shell.commandCount("session.attach")).toBe(2);
   });
 
@@ -2763,6 +2863,7 @@ describe("workspace projection safety", () => {
       });
 
       expect(deriveWorkspaceData(controller.getSnapshot()).sessions[0]).toMatchObject({
+        lifecycle: "idle",
         status: "working",
         latestTurnCompletedAt: null,
       });
@@ -2935,6 +3036,128 @@ describe("window runtime slot", () => {
     expect(shell.bootstrapCalls).toBe(1);
     expect(shell.connectCalls).toBe(1);
     await first.stop();
+  });
+  it("hydrates the renderer projection from shell cache and persists later mutations", async () => {
+    let warm = applyPublicFrame(
+      createProjectionSnapshot(),
+      snapshotFrame(1, [entry("cached", "from shell cache")]),
+    );
+    warm = applyPublicFrame(warm, pendingPromptsSessionsFrame([], 1, "idle"));
+    const cachedValue = encodeProjectionCache(warm);
+    const saves: string[] = [];
+    let loads = 0;
+    const cacheLoad = deferred<{ available: boolean; value: string | null }>();
+    type CacheShell = FakeShell & {
+      loadProjectionCache: () => Promise<{ available: boolean; value: string | null }>;
+      saveProjectionCache: (request: { value: string }) => Promise<{ saved: boolean }>;
+    };
+    const shell = new FakeShell() as CacheShell;
+    shell.loadProjectionCache = () => {
+      loads += 1;
+      return cacheLoad.promise;
+    };
+    shell.saveProjectionCache = async ({ value }) => {
+      saves.push(value);
+      return { saved: true };
+    };
+    const holder: RuntimeSlotHolder = {};
+    const controller = acquireRuntimeController(shell, holder);
+    const starting = controller.start();
+    await settle();
+    expect(loads).toBe(1);
+    expect(shell.bootstrapCalls).toBe(0);
+    cacheLoad.resolve({ available: true, value: cachedValue });
+    await starting;
+    expect(shell.bootstrapCalls).toBe(1);
+    const cachedSession = controller.getSnapshot().projection.sessions.get(`${HOST}\u0000${SESSION}`);
+    expect(cachedSession?.entries.map((item) => item.data)).toContainEqual({
+      role: "assistant",
+      text: "from shell cache",
+    });
+    const cachedGroups = buildProjectGroups(
+      deriveWorkspaceData(controller.getSnapshot()),
+      {},
+      {},
+    );
+    expect(cachedGroups).toHaveLength(1);
+    expect(cachedGroups[0]?.sessions.map((row) => row.session.id)).toContain(
+      sessionViewId(HOST, SESSION),
+    );
+    expect(cachedGroups[0]?.host).toMatchObject({
+      id: HOST,
+      name: HOST,
+      kind: "remote",
+    });
+    const cachedRow = cachedGroups[0]?.sessions[0];
+    expect(cachedRow?.session.freshness).toBe("offline");
+    const cachedRuntime = createLiveSessionRuntime({
+      controller,
+      targetId: "local",
+      hostId: HOST,
+      sessionId: SESSION,
+    });
+    expect(cachedRuntime.getSnapshot()).toMatchObject({
+      link: "cached",
+      canPrompt: false,
+      canCancel: false,
+    });
+    expect(shell.commandCount("session.attach")).toBe(0);
+
+    expect(shell.connectCalls).toBe(1);
+    shell.emitFrame({
+      targetId: "local",
+      frame: makeWelcome(HOST, ["sessions.prompt"]),
+    });
+    shell.emitFrame({
+      targetId: "local",
+      frame: durableEntryFrame(2, entry("live", "persist this mutation")),
+    });
+    await settle();
+    expect(shell.commandCount("session.attach")).toBe(1);
+    cachedRuntime.dispose();
+    expect(saves.length).toBeGreaterThan(0);
+    const persisted = decodeProjectionCache(saves.at(-1)!);
+    const persistedSession = persisted.sessions.get(`${HOST}\u0000${SESSION}`);
+    expect(persistedSession?.entries.map((item) => item.data)).toContainEqual({
+      role: "assistant",
+      text: "persist this mutation",
+    });
+    await controller.stop();
+  });
+
+  it("skips projection cache saves when the shell reports caching unavailable", async () => {
+    let loads = 0;
+    let saves = 0;
+    type CacheShell = FakeShell & {
+      loadProjectionCache: () => Promise<{ available: boolean; value: string | null }>;
+      saveProjectionCache: (request: { value: string }) => Promise<{ saved: boolean }>;
+    };
+    const shell = new FakeShell() as CacheShell;
+    shell.loadProjectionCache = async () => {
+      loads += 1;
+      return { available: false, value: null };
+    };
+    shell.saveProjectionCache = async () => {
+      saves += 1;
+      return { saved: false };
+    };
+    const holder: RuntimeSlotHolder = {};
+    const controller = acquireRuntimeController(shell, holder);
+
+    await controller.start();
+    shell.emitFrame({
+      targetId: "local",
+      frame: makeWelcome(HOST, ["sessions.prompt"]),
+    });
+    shell.emitFrame({
+      targetId: "local",
+      frame: durableEntryFrame(2, entry("live", "do not persist")),
+    });
+    await settle();
+    await controller.stop();
+
+    expect(loads).toBe(1);
+    expect(saves).toBe(0);
   });
 
   it("retains one live controller across a persisted pagehide/pageshow", async () => {
