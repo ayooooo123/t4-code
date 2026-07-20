@@ -113,7 +113,7 @@ const hello = {
 	type: "hello" as const,
 	protocol: { min: "omp-app/1", max: "omp-app/1" },
 	client: { name: "test", version: "1", build: "test", platform: "linux" },
-	requestedFeatures: ["resume", "cluster.operator"],
+	requestedFeatures: ["resume", "preview.control", "cluster.operator"],
 	savedCursors: [],
 	capabilities: { client: ["sessions.read", "sessions.manage", "preview.read", "preview.control", "ci.trigger"] },
 };

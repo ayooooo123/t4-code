@@ -62,6 +62,9 @@ describe("cluster operator client contract", () => {
 
   it("does not issue cluster bootstrap commands while the local option is off", async () => {
     const issue = vi.fn(async (_intent: Parameters<DesktopBootstrapCommand>[0]) => ({
+      targetId: "cluster",
+      requestId: "bootstrap-request",
+      commandId: "bootstrap-command",
       accepted: true as const,
       result: { cursor: { epoch: "session-epoch", seq: 1 }, sessions: [] },
     }));

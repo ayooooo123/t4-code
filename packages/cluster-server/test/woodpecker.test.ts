@@ -45,6 +45,7 @@ describe("bounded Woodpecker provider", () => {
 			correlation: "exact",
 			repositoryId: "t4-code",
 			ref: correlation.ref,
+			branch: "agent/t4-cluster-operator",
 			commit: correlation.commit,
 			pipelineNumber: 42,
 			status: "running",
