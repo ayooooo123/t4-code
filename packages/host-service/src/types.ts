@@ -143,7 +143,7 @@ export interface ChildHandle {
 }
 
 export type SessionLockStatus = "missing" | "live" | "suspect" | "stale" | "malformed";
-export type SessionLockInspector = (session: SessionRecord) => SessionLockStatus;
+export type SessionLockInspector = (session: SessionRecord) => SessionLockStatus | Promise<SessionLockStatus>;
 export type LockCheckHook = (session: SessionRecord) => Promise<void> | void;
 export interface RpcChildFactory {
 	spawn(spec: { session: SessionRecord; argv: string[]; cwd: string }): ChildHandle;
