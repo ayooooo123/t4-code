@@ -66,21 +66,27 @@ func stableName(prefix, name string, uid types.UID) string {
 
 func storageClassAllowsRWX(annotations map[string]string) bool {
 	for _, mode := range strings.Split(annotations[clusterv1alpha1.RWXStorageClassAnnotation], ",") {
-		if strings.TrimSpace(mode) == string(corev1.ReadWriteMany) { return true }
+		if strings.TrimSpace(mode) == string(corev1.ReadWriteMany) {
+			return true
+		}
 	}
 	return false
 }
 
 func pvcHasRWX(pvc *corev1.PersistentVolumeClaim) bool {
 	for _, mode := range pvc.Spec.AccessModes {
-		if mode == corev1.ReadWriteMany { return true }
+		if mode == corev1.ReadWriteMany {
+			return true
+		}
 	}
 	return false
 }
 
 func hasString(values []string, wanted string) bool {
 	for _, value := range values {
-		if value == wanted { return true }
+		if value == wanted {
+			return true
+		}
 	}
 	return false
 }
@@ -88,7 +94,9 @@ func hasString(values []string, wanted string) bool {
 func removeString(values []string, unwanted string) []string {
 	result := values[:0]
 	for _, value := range values {
-		if value != unwanted { result = append(result, value) }
+		if value != unwanted {
+			result = append(result, value)
+		}
 	}
 	return result
 }

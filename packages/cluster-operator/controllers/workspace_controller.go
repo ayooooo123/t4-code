@@ -27,11 +27,11 @@ type WorkspaceReconciler struct {
 }
 
 const (
-	workspacePVCPartOfLabel         = "app.kubernetes.io/part-of"
-	workspacePVCPartOfValue         = "t4-cluster"
-	workspacePVCWorkspaceLabel      = "cluster.t4.dev/workspace"
-	hostStorageClassIndexField      = "t4.workspace.host.storageClassName"
-	workspaceHostRefIndexField      = "t4.workspace.spec.hostRef"
+	workspacePVCPartOfLabel    = "app.kubernetes.io/part-of"
+	workspacePVCPartOfValue    = "t4-cluster"
+	workspacePVCWorkspaceLabel = "cluster.t4.dev/workspace"
+	hostStorageClassIndexField = "t4.workspace.host.storageClassName"
+	workspaceHostRefIndexField = "t4.workspace.spec.hostRef"
 )
 
 func (r *WorkspaceReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, err error) {

@@ -91,13 +91,13 @@ type RepositoryMetadata struct {
 }
 
 type T4WorkspaceSpec struct {
-	HostRef         string              `json:"hostRef"`
-	DisplayName     string              `json:"displayName"`
-	Owner           string              `json:"owner"`
-	Repository      *RepositoryMetadata `json:"repository,omitempty"`
-	Size            resource.Quantity   `json:"size"`
+	HostRef     string              `json:"hostRef"`
+	DisplayName string              `json:"displayName"`
+	Owner       string              `json:"owner"`
+	Repository  *RepositoryMetadata `json:"repository,omitempty"`
+	Size        resource.Quantity   `json:"size"`
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="retentionPolicy is immutable"
-	RetentionPolicy RetentionPolicy     `json:"retentionPolicy"`
+	RetentionPolicy RetentionPolicy `json:"retentionPolicy"`
 }
 
 type T4WorkspaceStatus struct {

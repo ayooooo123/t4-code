@@ -46,7 +46,9 @@ func TestWorkspaceRequestsForPVC(t *testing.T) {
 		{name: "unrelated PVC", mutate: func(pvc *corev1.PersistentVolumeClaim) { pvc.Labels = nil }},
 		{name: "wrong part-of label", mutate: func(pvc *corev1.PersistentVolumeClaim) { pvc.Labels[workspacePVCPartOfLabel] = "other-system" }},
 		{name: "missing workspace label", mutate: func(pvc *corev1.PersistentVolumeClaim) { delete(pvc.Labels, workspacePVCWorkspaceLabel) }},
-		{name: "missing workspace UID", mutate: func(pvc *corev1.PersistentVolumeClaim) { delete(pvc.Annotations, clusterv1alpha1.WorkspaceUIDAnnotation) }},
+		{name: "missing workspace UID", mutate: func(pvc *corev1.PersistentVolumeClaim) {
+			delete(pvc.Annotations, clusterv1alpha1.WorkspaceUIDAnnotation)
+		}},
 		{name: "wrong deterministic name", mutate: func(pvc *corev1.PersistentVolumeClaim) { pvc.Name = "unrelated" }},
 		{name: "missing namespace", mutate: func(pvc *corev1.PersistentVolumeClaim) { pvc.Namespace = "" }},
 	}
