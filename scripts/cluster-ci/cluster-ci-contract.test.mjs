@@ -242,6 +242,10 @@ function liveClusterResponses() {
 
 test("Woodpecker keeps upstream gates and serializes bounded cluster publication", async () => {
   const pipeline = yaml.load(await readFile(resolve(repoRoot, ".woodpecker.yml"), "utf8"));
+  const legacyInstaller = await readFile(
+    resolve(repoRoot, "scripts/cluster-ci/install-legacy-authority-toolchain.sh"),
+    "utf8",
+  );
   assert.equal(typeof pipeline, "object");
   const steps = pipeline.steps;
   const coreCommands = steps["upstream-core"].commands;
@@ -263,6 +267,35 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
       `pipeline 38:64 reproduced unfiltered core workspace traversal as "Failed to find executable flutter": ${command}`,
     );
   }
+  assert.deepEqual(steps["legacy-authority-build"].depends_on, [
+    "legacy-authority-source",
+    "bun-runtime",
+  ]);
+  assert.equal(
+    steps["legacy-authority-build"].image,
+    "docker.io/library/rust:1.86-slim-bookworm@sha256:57d415bbd61ce11e2d5f73de068103c7bd9f3188dc132c97cef4a8f62989e944",
+  );
+  assert.equal(
+    steps["legacy-authority-build"].environment.RUSTFLAGS,
+    "-C link-arg=-fuse-ld=lld",
+  );
+  assert.match(legacyInstaller, /apt-get install[^\n]*\blld\b/u);
+  assert.match(legacyInstaller, /command -v ld\.lld >\/dev\/null/u);
+  assert.equal(
+    steps["legacy-authority-build"].backend_options.kubernetes.resources.limits.memory,
+    "6Gi",
+  );
+  assert.equal(
+    steps["legacy-authority-build"].backend_options.kubernetes.resources.limits[
+      "ephemeral-storage"
+    ],
+    "12Gi",
+  );
+  assert.deepEqual(steps["legacy-authority-build"].commands, [
+    "sh scripts/cluster-ci/install-legacy-authority-toolchain.sh",
+    "(cd .continuity/omp && bun install --frozen-lockfile)",
+    "(cd .continuity/omp && bun run build:native)",
+  ]);
   assert.ok(steps["legacy-bridge-continuity"].commands.includes("pnpm test:legacy-bridge-continuity"));
   assert.equal(steps["legacy-bridge-continuity"].environment.T4_OMP_SOURCE_DIR, ".continuity/omp");
   assert.ok(
@@ -276,7 +309,13 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   ]);
   assert.equal(
     steps["cluster-operator-tests"].backend_options.kubernetes.resources.limits.memory,
-    "2Gi",
+    "4Gi",
+  );
+  assert.equal(
+    steps["cluster-operator-tests"].backend_options.kubernetes.resources.limits[
+      "ephemeral-storage"
+    ],
+    "6Gi",
   );
   assert.ok(
     steps["cluster-chart-tests"].commands.includes("helm lint ../../../deploy/charts/t4-cluster"),
