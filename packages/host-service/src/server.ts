@@ -4269,64 +4269,78 @@ export class LocalAppserver implements AppserverHandle {
 		});
 		if (reconciling) await this.broadcastIndex(reconciling);
 		if (!this.observerIsCurrent(sessionId, observer, record, projection)) return;
-		if (!this.hasAttachedClient(sessionId)) return;
-		if (!pollRecordMatches || !poll.stable || poll.transcript !== "live") return;
-		if (poll.unresolvedPendingCount !== 0) return;
-		let promotionLockStatus: SessionLockStatus;
-		try {
-			promotionLockStatus = await this.#lockStatus(record);
-		} catch {
-			promotionLockStatus = "malformed";
-		}
-		if (promotionLockStatus !== "missing" && promotionLockStatus !== "stale") return;
-		const attemptFingerprint = this.promotionFingerprint(record, projection, poll);
-		if (this.#promotionFailures.get(sessionId) === attemptFingerprint) return;
-		let supervisor: RpcChildSupervisor;
-		if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
-		try {
-			// startSupervisor performs the final write-lock gate immediately before spawn.
-			supervisor = await this.ensureSupervisor(sessionId);
-		} catch {
-			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
-			return;
-		}
-		if (this.#supervisors.get(sessionId) !== supervisor) {
-			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
-			return;
-		}
-		const final = await observer.poll();
-		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
-			await this.discardPromotionSupervisor(sessionId, supervisor);
-			return;
-		}
-		if (final.record?.sessionId !== sessionId) {
-			await this.discardPromotionSupervisor(sessionId, supervisor);
-			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
-			return;
-		}
-		await this.applyObserverPoll(sessionId, projection, final);
-		const loaded = supervisor.loadedWatermark();
-		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
-			await this.discardPromotionSupervisor(sessionId, supervisor);
-			return;
-		}
-		const matches =
-			final.record?.sessionId === sessionId &&
-			final.stable &&
-			final.transcript === "live" &&
-			final.unresolvedPendingCount === 0 &&
-			loaded !== undefined &&
-			loaded.entryCount === final.watermark.entryCount &&
-			loaded.lastEntryId === final.watermark.lastEntryId;
-		if (!matches) {
-			await this.discardPromotionSupervisor(sessionId, supervisor);
-			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
-			return;
-		}
-		if (this.#supervisors.get(sessionId) !== supervisor) return;
-		const control = projection.setSessionControl();
-		if (control) await this.broadcastIndex(control);
-		this.cleanupObserverState(sessionId);
+               if (!this.hasAttachedClient(sessionId)) return;
+               if (!pollRecordMatches || !poll.stable || poll.transcript !== "live") return;
+               // Free-lock sessions can carry orphaned pending tool markers from an abandoned
+               // run. Those markers must not strand the client in reconciling forever: no other
+               // process holds the lock, so promote and let the RPC child own durable state.
+               let promotionLockStatus: SessionLockStatus;
+               try {
+                       promotionLockStatus = await this.#lockStatus(record);
+               } catch {
+                       promotionLockStatus = "malformed";
+               }
+               if (promotionLockStatus !== "missing" && promotionLockStatus !== "stale") return;
+               const attemptFingerprint = this.promotionFingerprint(record, projection, poll);
+               if (this.#promotionFailures.get(sessionId) === attemptFingerprint) return;
+               let supervisor: RpcChildSupervisor;
+               if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
+               try {
+                       // startSupervisor performs the final write-lock gate immediately before spawn.
+                       supervisor = await this.ensureSupervisor(sessionId);
+               } catch {
+                       this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
+                       return;
+               }
+               if (this.#supervisors.get(sessionId) !== supervisor) {
+                       this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
+                       return;
+               }
+               const final = await observer.poll();
+               if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
+                       await this.discardPromotionSupervisor(sessionId, supervisor);
+                       return;
+               }
+               if (final.record?.sessionId !== sessionId) {
+                       await this.discardPromotionSupervisor(sessionId, supervisor);
+                       this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
+                       return;
+               }
+               await this.applyObserverPoll(sessionId, projection, final);
+               const loaded = supervisor.loadedWatermark();
+               if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
+                       await this.discardPromotionSupervisor(sessionId, supervisor);
+                       return;
+               }
+               const watermarkMatches =
+                       final.stable &&
+                       final.transcript === "live" &&
+                       loaded !== undefined &&
+                       loaded.entryCount === final.watermark.entryCount &&
+                       loaded.lastEntryId === final.watermark.lastEntryId;
+               // Prefer a clean watermark handoff, but once the RPC child owns a free-lock
+               // session, clear reconciling even if the observer still sees orphaned pending
+               // tools. Leaving control set makes the composer permanently read-only.
+               if (!watermarkMatches) {
+                       let lockAfterStart: SessionLockStatus;
+                       try {
+                               lockAfterStart = await this.#lockStatus(record);
+                       } catch {
+                               lockAfterStart = "malformed";
+                       }
+                       if (
+                               this.#supervisors.get(sessionId) !== supervisor ||
+                               (lockAfterStart !== "missing" && lockAfterStart !== "stale" && lockAfterStart !== "live")
+                       ) {
+                               await this.discardPromotionSupervisor(sessionId, supervisor);
+                               this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, final));
+                               return;
+                       }
+               }
+               if (this.#supervisors.get(sessionId) !== supervisor) return;
+               const control = projection.setSessionControl();
+               if (control) await this.broadcastIndex(control);
+               this.cleanupObserverState(sessionId);
 	}
 	private startExternalObserver(sessionId: SessionId): void {
 		if (this.#observerTimers.has(sessionId)) return;

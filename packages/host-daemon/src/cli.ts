@@ -2,12 +2,15 @@
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createAppserver,
   createRemoteAppserver,
+  FileSessionDiscovery,
+  loadPersistentHostId,
   OmpAuthorityBridgeClient,
   profileSocketPath,
+  realFs,
   TranscriptSearchIndex,
   type AppserverHandle,
   type AppserverOptions,
@@ -173,6 +176,17 @@ export async function runHostDaemon(
       dependencies.createTranscriptSearch?.(paths.transcriptSearchPath) ??
       new TranscriptSearchIndex(paths.transcriptSearchPath);
     const identity = bridge.identity;
+    // Route session discovery (list/load/page) through the host's own bounded
+    // filesystem reader instead of the OMP authority bridge. OMP's session.list
+    // inlines the full transcript for any session it has loaded, so once a large
+    // session is opened the list frame exceeds the 1 MiB bridge limit and OMP
+    // refuses to send it — permanently wedging inventory until a restart. Reading
+    // the session files directly (same machine, same user) is bounded per entry
+    // and never overflows; the bridge stays authoritative for mutations,
+    // operations, terminals, locks, and usage.
+    const discoveryHostId = await loadPersistentHostId(paths.hostIdPath);
+    const sessionsRoot = join(dirname(hostInfo.transcriptImageRoot), "sessions");
+    const fileDiscovery = new FileSessionDiscovery(sessionsRoot, realFs, discoveryHostId, true);
     const options: AppserverOptions = {
       ...identity,
       appserverVersion: T4_HOST_VERSION,
@@ -181,7 +195,7 @@ export async function runHostDaemon(
       hostIdPath: paths.hostIdPath,
       attentionOutcomePath: paths.attentionOutcomePath,
       sessionAuthority: authorities.sessionAuthority,
-      discovery: authorities.discovery,
+      discovery: fileDiscovery,
       operationsAuthority: authorities.operationsAuthority,
       usageAuthority: authorities.usageAuthority,
       transcriptSearchAuthority,
