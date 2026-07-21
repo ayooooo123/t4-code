@@ -4,11 +4,12 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:file_selector/file_selector.dart';
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:xterm/xterm.dart';
 
-import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'transcript_markdown.dart';
 import '../client/app_state.dart';
 import '../client/model_labels.dart';
 import '../platform/platform_lifecycle.dart';
@@ -16,8 +17,11 @@ import '../protocol/protocol.dart';
 import '../platform/platform_lifecycle_controller.dart';
 
 part 'adaptive_session_shell.dart';
+part 'access_mode_selector.dart';
+part 'command_palette.dart';
 part 'attention_pane.dart';
 part 'conversation_pane.dart';
+part 'context_panel.dart';
 part 'developer_surfaces.dart';
 part 'host_management.dart';
 part 'quick_open_dialog.dart';
@@ -37,6 +41,7 @@ final class T4App extends StatelessWidget {
     required this.state,
     required this.actions,
     required this.credentialsAreVolatile,
+    this.demoMode = false,
     this.platformState = const PlatformLifecycleViewState.initial(),
     this.platformActions,
     super.key,
@@ -45,6 +50,7 @@ final class T4App extends StatelessWidget {
   final T4ViewState state;
   final T4Actions actions;
   final bool credentialsAreVolatile;
+  final bool demoMode;
   final PlatformLifecycleViewState platformState;
   final PlatformLifecycleActions? platformActions;
 
@@ -60,7 +66,16 @@ final class T4App extends StatelessWidget {
         T4ThemePreference.light => ThemeMode.light,
         T4ThemePreference.dark => ThemeMode.dark,
       },
-      home: credentialsAreVolatile
+      home: demoMode
+          ? _DemoModeShell(
+              child: _AdaptiveSessionShell(
+                state: state,
+                actions: actions,
+                platformState: platformState,
+                platformActions: platformActions,
+              ),
+            )
+          : credentialsAreVolatile
           ? _VolatileCredentialsShell(
               child: _AdaptiveSessionShell(
                 state: state,
@@ -75,6 +90,54 @@ final class T4App extends StatelessWidget {
               platformState: platformState,
               platformActions: platformActions,
             ),
+    );
+  }
+}
+
+final class _DemoModeShell extends StatelessWidget {
+  const _DemoModeShell({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        Semantics(
+          container: true,
+          label: 'Public preview using sample data. Actions are disabled.',
+          child: Material(
+            color: colors.secondaryContainer,
+            child: SafeArea(
+              bottom: false,
+              child: SizedBox(
+                height: 32,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.visibility_outlined,
+                      size: 16,
+                      color: colors.onSecondaryContainer,
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        'Public preview · sample data · actions disabled',
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelMedium
+                            ?.copyWith(color: colors.onSecondaryContainer),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        Expanded(child: child),
+      ],
     );
   }
 }
