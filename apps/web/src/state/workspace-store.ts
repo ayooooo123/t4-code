@@ -53,6 +53,11 @@ export interface SessionViewState {
   /** Set only by an explicit user profile selection; never inferred at boot. */
   readonly browserProfileId: string | null;
 }
+export interface WorkspaceRailProject {
+  readonly hostId: string;
+  readonly projectId: string;
+  readonly name: string;
+}
 
 export const DEFAULT_SESSION_VIEW: SessionViewState = {
   scrollTop: null,
@@ -92,6 +97,7 @@ interface PersistedWorkspaceState {
   /** Latest terminal attention outcome the user has seen for each session. */
   readonly lastSeenAttentionOutcomeBySessionKey?: Record<string, string>;
   readonly sessionViewById: Record<string, SessionViewState>;
+  readonly workspaceProjects?: readonly WorkspaceRailProject[];
 }
 
 export interface WorkspaceState {
@@ -126,6 +132,7 @@ export interface WorkspaceState {
   /** Renderer-local read markers; OMP remains the outcome authority. */
   readonly lastSeenAttentionOutcomeBySessionKey: Record<string, string>;
   readonly sessionViewById: Record<string, SessionViewState>;
+  readonly workspaceProjects: readonly WorkspaceRailProject[];
 }
 
 export interface WorkspaceActions {
@@ -154,6 +161,7 @@ export interface WorkspaceActions {
   /** Mark one host-authored terminal outcome as seen on this client. */
   markAttentionOutcomeSeen(sessionKey: string, outcomeId: string): void;
   setProjectExpanded(projectId: string, expanded: boolean): void;
+  addWorkspaceProject(project: WorkspaceRailProject): void;
   setEmptyProjectDismissed(projectId: string, dismissed: boolean): void;
   setSessionDraft(sessionId: string, draft: string): void;
   setSessionScrollTop(sessionId: string, scrollTop: number | null): void;
@@ -195,7 +203,20 @@ const INITIAL_STATE: WorkspaceState = {
   lastVisitedAtBySessionId: {},
   lastSeenAttentionOutcomeBySessionKey: {},
   sessionViewById: {},
+  workspaceProjects: [],
 };
+
+function readWorkspaceProjects(value: unknown): readonly WorkspaceRailProject[] {
+  if (!Array.isArray(value)) return [];
+  const result = new Map<string, WorkspaceRailProject>();
+  for (const item of value) {
+    if (item === null || typeof item !== "object") continue;
+    const project = item as Partial<WorkspaceRailProject>;
+    if (typeof project.hostId !== "string" || typeof project.projectId !== "string" || typeof project.name !== "string" || project.hostId === "" || project.projectId === "" || project.name === "" || /[\\/]/u.test(project.projectId)) continue;
+    result.set(`${project.hostId}\u0000${project.projectId}`, { hostId: project.hostId, projectId: project.projectId, name: project.name });
+  }
+  return [...result.values()];
+}
 
 function sanitizeBooleanRecord(value: unknown): Record<string, boolean> {
   if (typeof value !== "object" || value === null) return {};
@@ -374,6 +395,7 @@ export function parsePersistedWorkspace(raw: unknown): WorkspaceState | null {
       parsed.lastSeenAttentionOutcomeBySessionKey,
     ),
     sessionViewById,
+    workspaceProjects: readWorkspaceProjects(parsed.workspaceProjects),
   };
 }
 
@@ -398,6 +420,7 @@ export function toPersistedWorkspace(state: WorkspaceState): PersistedWorkspaceS
     lastVisitedAtBySessionId: state.lastVisitedAtBySessionId,
     lastSeenAttentionOutcomeBySessionKey: state.lastSeenAttentionOutcomeBySessionKey,
     sessionViewById: state.sessionViewById,
+    workspaceProjects: state.workspaceProjects,
   };
 }
 
@@ -566,6 +589,9 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions): Work
       set((state) => ({
         projectExpandedById: { ...state.projectExpandedById, [projectId]: expanded },
       })),
+    addWorkspaceProject: (project) => set((state) => ({
+      workspaceProjects: readWorkspaceProjects([...state.workspaceProjects, project]),
+    })),
     setEmptyProjectDismissed: (projectId, dismissed) =>
       set((state) => {
         if (dismissed) {

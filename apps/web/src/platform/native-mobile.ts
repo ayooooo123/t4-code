@@ -6,6 +6,7 @@ import {
   type StoredMobileBackend,
   type StoredMobileBackendDirectory,
 } from "./native-mobile-backend.ts";
+import { parsePeerBackend, type StoredPeerMobileBackend } from "./mobile-connection-records.ts";
 
 export {
   MOBILE_BACKEND_STORAGE_KEY,
@@ -57,6 +58,37 @@ interface NativeMobileCredentials {
 export interface T4SpeechPlugin {
   speakText(options: { readonly text: string }): Promise<{ readonly accepted: boolean; readonly error?: string }>;
   stopSpeaking(): Promise<{ readonly accepted: boolean; readonly error?: string }>;
+}
+
+export interface T4PeerConnectionPlugin {
+  open(options: { readonly publicKey: string; readonly attemptId: string }): Promise<{ readonly sessionId: string }>;
+  cancelOpen(options: { readonly attemptId: string }): Promise<void>;
+  write(options: { readonly sessionId: string; readonly data: string }): Promise<void>;
+  close(options: { readonly sessionId: string }): Promise<void>;
+  addListener(
+    event: "peerData" | "peerClosed",
+    listener: (payload: { readonly sessionId: string; readonly data?: string }) => void,
+  ): Promise<{ readonly remove: () => Promise<void> | void }>;
+}
+
+export type T4QrCameraPermission = "prompt" | "denied" | "blocked" | "granted";
+export type T4QrScannerEventName = "scanResult" | "scanClosed" | "scanError";
+export interface T4QrScannerEvent {
+  readonly attemptId: string;
+  readonly rawValue?: string;
+  readonly reason?: "cancelled" | "background" | string;
+  readonly code?: string;
+}
+export interface T4QrScannerPlugin {
+  isSupported(): Promise<{ readonly supported: boolean }>;
+  cameraPermission(): Promise<{ readonly camera: T4QrCameraPermission }>;
+  requestCameraPermission(): Promise<{ readonly camera: T4QrCameraPermission }>;
+  startScan(options: { readonly attemptId: string }): Promise<void>;
+  cancelScan(options: { readonly attemptId: string }): Promise<void>;
+  addListener(
+    event: T4QrScannerEventName,
+    listener: (payload: T4QrScannerEvent) => void,
+  ): Promise<{ readonly remove: () => Promise<void> | void }>;
 }
 
 class SecureStorageBridgeTimeoutError extends Error {
@@ -142,6 +174,8 @@ interface CapacitorBridge {
     readonly T4SecureStorage?: T4SecureStoragePlugin;
     readonly T4Update?: T4UpdatePlugin;
     readonly T4Speech?: T4SpeechPlugin;
+    readonly T4PeerConnection?: T4PeerConnectionPlugin;
+    readonly T4QrScanner?: T4QrScannerPlugin;
   };
   readonly getPlatform?: () => string;
   readonly isNativePlatform?: () => boolean;
@@ -151,16 +185,40 @@ declare global {
   interface Window {
     Capacitor?: CapacitorBridge;
     __t4MobileBackend?: NativeMobileBackendConfig;
+    __t4MobilePeer?: MobilePeerConnectionConfig;
   }
+}
+
+export const MOBILE_PEER_BACKEND_STORAGE_KEY = "t4-code:mobile-peer:v1";
+
+/** Renderer-local projection of the active HyperDHT private connection. */
+export interface MobilePeerConnectionConfig {
+  readonly invite: string;
+  readonly label: string;
 }
 
 export type MobileBootResult =
   | { readonly kind: "web" }
   | { readonly kind: "ready"; readonly backend: StoredMobileBackend }
-  | { readonly kind: "setup"; readonly message?: string };
+  | { readonly kind: "ready"; readonly peer: MobilePeerConnectionConfig }
+  | { readonly kind: "setup"; readonly mode: "first-run"; readonly message?: string }
+  | {
+      readonly kind: "setup";
+      readonly mode: "repair";
+      readonly repairAction: "tailnet" | "unavailable";
+      readonly message: string;
+    };
 
 function secureStorage(): T4SecureStoragePlugin | null {
   return window.Capacitor?.Plugins?.T4SecureStorage ?? null;
+}
+
+export function peerConnection(): T4PeerConnectionPlugin | null {
+  return window.Capacitor?.Plugins?.T4PeerConnection ?? null;
+}
+
+export function nativeQrScanner(): T4QrScannerPlugin | null {
+  return window.Capacitor?.Plugins?.T4QrScanner ?? null;
 }
 
 export function nativeMobilePlatform(): NativeMobilePlatform | null {
@@ -318,6 +376,138 @@ export function selectStoredMobileBackend(
   writeStoredMobileBackendDirectory({ ...directory, activeEndpointKey: backend.endpointKey }, storage);
 }
 
+function decodeStoredPeerBackend(raw: string): StoredPeerMobileBackend {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  const record = value as Record<string, unknown>;
+  if (record.version !== 2 || record.kind !== "peer" || typeof record.invite !== "string") {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  const canonical = parsePeerBackend(record.invite);
+  if (canonical.invite !== record.invite || canonical.label !== record.label) {
+    throw new Error("The saved private connection is damaged. Scan the key again.");
+  }
+  return canonical;
+}
+
+export function readStoredPeerMobileBackend(
+  storage: ReadableMobileStorage = window.localStorage,
+): StoredPeerMobileBackend | null {
+  const raw = storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY);
+  if (raw === null) return null;
+  return decodeStoredPeerBackend(raw);
+}
+
+function firstRunStorageIsEmpty(storage: ReadableMobileStorage): boolean {
+  try {
+    return [
+      storage.getItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY),
+      storage.getItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY),
+      storage.getItem(MOBILE_BACKEND_STORAGE_KEY),
+      storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY),
+    ].every((value) => value === null);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The only persistence boundary used by first-run private pairing. Existing
+ * bytes at any connection key are a refusal: a scan or paste preview must
+ * never overwrite a record that appeared while the preview was open.
+ */
+export function writeFirstRunPeerBackend(
+  candidate: StoredPeerMobileBackend,
+  storage: Pick<Storage, "getItem" | "setItem"> = window.localStorage,
+): boolean {
+  let canonical: StoredPeerMobileBackend;
+  try {
+    canonical = parsePeerBackend(candidate.invite);
+    if (canonical.label !== candidate.label) return false;
+  } catch {
+    return false;
+  }
+  if (!firstRunStorageIsEmpty(storage)) return false;
+  try {
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(canonical));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Guarded first-run equivalent for a verified Tailnet backend. */
+export function writeFirstRunTailnetBackend(
+  candidate: StoredMobileBackend,
+  storage: MutableMobileStorage = window.localStorage,
+): boolean {
+  if (!firstRunStorageIsEmpty(storage)) return false;
+  try {
+    writeStoredMobileBackend(candidate, storage);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Explicit repair boundary for a QR/pasted private key. A healthy Tailnet
+ * directory or a healthy stored private connection is never replaced here;
+ * only unreadable state is.
+ */
+export function replaceBrokenMobileConnectionWithPeer(
+  candidate: StoredPeerMobileBackend,
+  storage: MutableMobileStorage = window.localStorage,
+): boolean {
+  let canonical: StoredPeerMobileBackend;
+  try {
+    canonical = parsePeerBackend(candidate.invite);
+    if (canonical.label !== candidate.label) return false;
+  } catch {
+    return false;
+  }
+  let broken = false;
+  try {
+    if (readStoredMobileBackendDirectory(storage) !== null) return false;
+    try {
+      if (readStoredPeerMobileBackend(storage) !== null) return false;
+    } catch {
+      broken = true;
+    }
+  } catch {
+    broken = true;
+  }
+  if (!broken) return false;
+  try {
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(canonical));
+    const written = storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY);
+    if (written === null) return false;
+    decodeStoredPeerBackend(written);
+  } catch {
+    return false;
+  }
+  try { storage.removeItem(MOBILE_BACKEND_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKENDS_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
+  try { storage.removeItem(LEGACY_MOBILE_BACKEND_STORAGE_KEY); } catch { /* peer key is now authoritative */ }
+  return true;
+}
+
+export function currentNativeMobilePeer(): MobilePeerConnectionConfig | null {
+  if (typeof window === "undefined") return null;
+  return window.__t4MobilePeer ?? null;
+}
+
+export function currentNativeMobilePeerInvite(): string | null {
+  return currentNativeMobilePeer()?.invite ?? null;
+}
+
 export function currentNativeMobileBackend(): NativeMobileBackendConfig | null {
   if (typeof window === "undefined") return null;
   return window.__t4MobileBackend ?? null;
@@ -327,6 +517,8 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   const platform = nativeMobilePlatform();
   if (platform === null) return { kind: "web" };
   document.documentElement.dataset.platform = platform;
+  delete window.__t4MobileBackend;
+  delete window.__t4MobilePeer;
   let shouldMigrateLegacyCredentials = false;
   let backend: StoredMobileBackend | null;
   try {
@@ -342,14 +534,38 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
   } catch (error) {
     return {
       kind: "setup",
+      mode: "repair",
+      repairAction: "tailnet",
       message: error instanceof Error ? error.message : "Enter the host address again.",
     };
   }
-  if (backend === null) return { kind: "setup" };
+  if (backend === null) {
+    let peer: StoredPeerMobileBackend | null;
+    try {
+      peer = readStoredPeerMobileBackend();
+    } catch {
+      return {
+        kind: "setup",
+        mode: "repair",
+        repairAction: "tailnet",
+        message: "The saved private connection cannot be opened. Scan a replacement key or use a Tailnet address.",
+      };
+    }
+    if (peer !== null) {
+      window.__t4MobilePeer = { invite: peer.invite, label: peer.label };
+      return { kind: "ready", peer: { invite: peer.invite, label: peer.label } };
+    }
+    return { kind: "setup", mode: "first-run" };
+  }
 
   const plugin = secureStorage();
   if (plugin === null) {
-    return { kind: "setup", message: "The Android security bridge did not start. Close T4 Code and open it again." };
+    return {
+      kind: "setup",
+      mode: "repair",
+      repairAction: "unavailable",
+      message: "The Android security bridge did not start. Close T4 Code and open it again.",
+    };
   }
 
   let credentials: NativeMobileCredentials | null = null;
@@ -363,6 +579,8 @@ export async function prepareNativeMobileBackend(): Promise<MobileBootResult> {
     if (error instanceof SecureStorageBridgeTimeoutError) {
       return {
         kind: "setup",
+        mode: "repair",
+        repairAction: "unavailable",
         message: "Android secure storage did not answer. Close T4 Code and open it again.",
       };
     }

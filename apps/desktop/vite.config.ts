@@ -5,6 +5,8 @@ const external = new Set([
   "electron",
   "electron-store",
   "electron-updater",
+  "hyperdht",
+  "sodium-native",
   "ws",
   ...builtinModules,
   ...builtinModules.map((name) => `node:${name}`),

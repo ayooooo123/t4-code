@@ -107,6 +107,68 @@ describe("desktop IPC lifecycle proof", () => {
     await expect(handler(event, request("omp:targets:list", { extra: true }))).rejects.toThrow();
     await expect(handler(event, request("omp:connect", {}))).rejects.toThrow();
   });
+  it("starts, reports, and revokes a desktop peer share without leaking its invite from status", async () => {
+    const ipc = new FakeIpc();
+    const { runtime: baseRuntime } = makeRuntime();
+    const calls: string[] = [];
+    let sharing = false;
+    const runtime: IpcRuntime = {
+      ...baseRuntime,
+      peerShare: {
+        start: async () => {
+          calls.push("start");
+          sharing = true;
+          return { invite: "t4peer://v1/desktop/capability" };
+        },
+        regenerate: async () => {
+          calls.push("regenerate");
+          return { invite: "t4peer://v1/desktop/replacement" };
+        },
+        status: () => sharing
+          ? { state: "sharing" as const, desktopPublicKey: "desktop" }
+          : { state: "stopped" as const },
+        stop: async () => { calls.push("stop"); sharing = false; },
+      },
+    } as IpcRuntime;
+    new DesktopIpcRegistry(runtime, ipc).install();
+    const event = { sender: runtime.window.webContents, senderFrame: runtime.window.webContents.mainFrame };
+
+    expect(await ipc.handlers.get("omp:peer-share:start")!(event, request("omp:peer-share:start"))).toEqual({
+      invite: "t4peer://v1/desktop/capability",
+    });
+    expect(await ipc.handlers.get("omp:peer-share:status")!(event, request("omp:peer-share:status"))).toEqual({
+      state: "sharing",
+      desktopPublicKey: "desktop",
+    });
+    expect(await ipc.handlers.get("omp:peer-share:stop")!(event, request("omp:peer-share:stop"))).toEqual({ state: "stopped" });
+    expect(await ipc.handlers.get("omp:peer-share:regenerate")!(event, request("omp:peer-share:regenerate"))).toEqual({ invite: "t4peer://v1/desktop/replacement" });
+    expect(calls).toEqual(["start", "stop", "regenerate"]);
+    await expect(ipc.handlers.get("omp:peer-share:start")!(event, request("omp:peer-share:start", { invite: "forbidden" }))).rejects.toThrow();
+  });
+  it("serves only approved workspace roots and serializes project creation", async () => {
+    const ipc = new FakeIpc();
+    const { runtime: baseRuntime } = makeRuntime();
+    const calls: string[] = [];
+    const runtime: IpcRuntime = {
+      ...baseRuntime,
+      workspaceRoots: {
+        list: async () => ({ roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1" }),
+        addRoot: async () => ({ id: "root-1", label: "Projects" }),
+        selectRoot: async (id: string) => { calls.push(`select:${id}`); },
+        createProject: async (name: string) => { calls.push(`create:${name}`); return { id: "project-1", name }; },
+      },
+    } as IpcRuntime;
+    new DesktopIpcRegistry(runtime, ipc).install();
+    const event = { sender: runtime.window.webContents, senderFrame: runtime.window.webContents.mainFrame };
+    expect(await ipc.handlers.get("omp:workspace:roots:list")!(event, request("omp:workspace:roots:list"))).toEqual({
+      roots: [{ id: "root-1", label: "Projects" }], activeRootId: "root-1",
+    });
+    await ipc.handlers.get("omp:workspace:root:select")!(event, request("omp:workspace:root:select", { rootId: "root-1" }));
+    expect(await ipc.handlers.get("omp:workspace:project:create")!(event, request("omp:workspace:project:create", { name: "Mobile app" }))).toEqual({
+      project: { id: "project-1", name: "Mobile app" },
+    });
+    expect(calls).toEqual(["select:root-1", "create:Mobile app"]);
+  });
   it("routes projection cache load/save through the trusted shell service", async () => {
     const ipc = new FakeIpc();
     const { runtime: baseRuntime } = makeRuntime();

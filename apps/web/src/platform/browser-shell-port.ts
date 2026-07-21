@@ -52,11 +52,15 @@ import type {
   TerminalInputRequest,
   TerminalResizeRequest,
   TerminalResult,
+  WorkspaceProjectCreateResult,
+  WorkspaceRootSelectRequest,
+  WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
 import { commandResultError, decodeSpeechText } from "@t4-code/protocol/desktop-ipc";
 import type { DesktopShellPort } from "@t4-code/client";
 
 import { BrowserWebSocketTransport } from "./browser-transport.ts";
+import { CapacitorPeerTransport } from "./peer-transport.ts";
 import {
   bindBrowserConnectionWake,
   type BrowserConnectionLifecycleOptions,
@@ -64,6 +68,7 @@ import {
 import {
   assertCurrentNativeMobileEndpoint,
   currentNativeMobileBackend,
+  currentNativeMobilePeer,
   nativeMobilePlatform,
   persistNativeMobileCredentials,
 } from "./native-mobile.ts";
@@ -74,10 +79,17 @@ const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
     (feature) => feature !== "prompt.images" && feature !== "transcript.images",
   ),
 );
+const HYPERDHT_REQUESTED_FEATURES: readonly string[] = Object.freeze(
+  ADDITIVE_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
+const HYPERDHT_COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
+  COMPATIBILITY_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
 
 const MAX_URL_LENGTH = 2048;
 const MAX_LABEL_LENGTH = 128;
 const MAX_DEVICE_ID_LENGTH = 256;
+const NATIVE_RESUME_GRACE_MS = 500;
 
 export interface BrowserBackendConfig {
   readonly wsUrl: string;
@@ -208,7 +220,11 @@ export interface BrowserShellPortOptions {
 export function createBrowserShellPort(
   options: BrowserShellPortOptions = {},
 ): DesktopShellPort | null {
-  const config = detectBackend();
+  const peer = currentNativeMobilePeer();
+  const peerInvite = peer?.invite ?? null;
+  const config = peerInvite === null
+    ? detectBackend()
+    : { wsUrl: "wss://private.invalid", label: peer?.label ?? "T4 private host" };
   if (config === null) return null;
   const backendConfig = config;
   const nativeEndpointKey = currentNativeMobileBackend()?.endpointKey;
@@ -220,10 +236,12 @@ export function createBrowserShellPort(
 
   // We hold one OmpClient for one explicitly configured remote target.
   let client: OmpClient | undefined;
-  let transport: BrowserWebSocketTransport | undefined;
-  const pendingOpens = new Set<BrowserWebSocketTransport>();
+  let activePeerTransport: CapacitorPeerTransport | undefined;
+  let transport: OmpTransport | undefined;
+  const pendingOpens = new Set<OmpTransport>();
   let welcomeAuthentication: "local" | "pairing-required" | "paired" | undefined;
   let stopLifecycle: Unsubscribe | undefined;
+  let cancelNativeResumeWake: (() => void) | undefined;
   let connectionState: DesktopTarget["state"] = "disconnected";
   let authentication: { deviceId: string; deviceToken: string } | undefined =
     backendConfig.deviceId === undefined || backendConfig.deviceToken === undefined
@@ -275,31 +293,42 @@ export function createBrowserShellPort(
   }
   function buildClient(): OmpClient {
     const transportFactory = async (): Promise<OmpTransport> => {
-      const current = new BrowserWebSocketTransport({ url: backendConfig.wsUrl });
-      transport = current;
-      pendingOpens.add(current);
+      const next = peerInvite === null
+        ? new BrowserWebSocketTransport({ url: backendConfig.wsUrl })
+        : new CapacitorPeerTransport(peerInvite);
+      transport = next;
+      pendingOpens.add(next);
       try {
-        await current.open();
-        if (transport !== current) {
-          current.close();
+        await next.open();
+        if (transport !== next) {
+          next.close();
           throw new Error("browser transport superseded");
         }
-        return current;
+        if (next instanceof CapacitorPeerTransport) {
+          activePeerTransport = next;
+          next.onClose(() => {
+            if (activePeerTransport === next) activePeerTransport = undefined;
+          });
+        }
+        return next;
       } finally {
-        pendingOpens.delete(current);
+        pendingOpens.delete(next);
       }
     };
 
     const c = (options.clientFactory ?? createOmpClient)({
       transport: transportFactory,
       capabilities: DEVICE_CAPABILITIES,
-      requestedFeatures: ADDITIVE_FEATURES,
-      compatibilityRequestedFeatures: COMPATIBILITY_FEATURES,
+      requestedFeatures: peerInvite === null ? ADDITIVE_FEATURES : HYPERDHT_REQUESTED_FEATURES,
+      compatibilityRequestedFeatures:
+        peerInvite === null ? COMPATIBILITY_FEATURES : HYPERDHT_COMPATIBILITY_FEATURES,
       authentication: () => authentication,
       privilegedPairResult: async (result) => {
-        await persistNativeMobileCredentials(result, nativeEndpointKey);
-        if (nativeEndpointKey !== undefined) {
-          assertCurrentNativeMobileEndpoint(nativeEndpointKey);
+        if (peerInvite === null) {
+          await persistNativeMobileCredentials(result, nativeEndpointKey);
+          if (nativeEndpointKey !== undefined) {
+            assertCurrentNativeMobileEndpoint(nativeEndpointKey);
+          }
         }
         authentication = { deviceId: result.deviceId, deviceToken: result.deviceToken };
       },
@@ -341,8 +370,29 @@ export function createBrowserShellPort(
     return c;
   }
 
+  function clearNativeResumeWake(): void {
+    cancelNativeResumeWake?.();
+    cancelNativeResumeWake = undefined;
+  }
+
   function ensureLifecycle(): void {
-    stopLifecycle ??= bindBrowserConnectionWake(() => {
+    stopLifecycle ??= bindBrowserConnectionWake((source) => {
+      if (source === "browser" && cancelNativeResumeWake !== undefined) return;
+      clearNativeResumeWake();
+      if (
+        source === "native-resume" &&
+        peerInvite !== null &&
+        (client?.state === "ready" || client?.state === "pairing")
+      ) {
+        const timer = setTimeout(() => {
+          cancelNativeResumeWake = undefined;
+          client?.wake();
+          // eslint-disable-next-line unicorn/no-useless-spread -- listeners may unsubscribe during wake dispatch.
+          for (const listener of [...wakeListeners]) listener();
+        }, NATIVE_RESUME_GRACE_MS);
+        cancelNativeResumeWake = () => clearTimeout(timer);
+        return;
+      }
       client?.wake();
       // eslint-disable-next-line unicorn/no-useless-spread -- listeners may unsubscribe during wake dispatch.
       for (const listener of [...wakeListeners]) listener();
@@ -427,6 +477,7 @@ export function createBrowserShellPort(
     },
 
     async disconnect(_request: TargetRequest): Promise<DisconnectResult> {
+      clearNativeResumeWake();
       // Settle any active speech first: a disconnected session must not keep
       // talking, and a pending speech promise must resolve before the client
       // and lifecycle bindings are torn down.
@@ -446,6 +497,19 @@ export function createBrowserShellPort(
       stopLifecycle = undefined;
       emitState(TARGET_ID, "disconnected");
       return { targetId: TARGET_ID, state: "disconnected" };
+    },
+
+    async workspaceRootsList(): Promise<WorkspaceRootsResult> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      return activePeerTransport.workspaceRoots();
+    },
+    async workspaceRootSelect(request: WorkspaceRootSelectRequest): Promise<void> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      await activePeerTransport.selectWorkspaceRoot(request.rootId);
+    },
+    async workspaceProjectCreate(request: { readonly name: string }): Promise<WorkspaceProjectCreateResult> {
+      if (activePeerTransport === undefined) throw new Error("Connect to the private host first.");
+      return { project: await activePeerTransport.createWorkspaceProject(request.name) };
     },
 
     async command(request: CommandRequest): Promise<CommandResult> {

@@ -118,7 +118,7 @@ describe("mobile saved-host manager", () => {
     const result = probeAndSaveMobileBackend(backend, {
       signal: controller.signal,
       probe: () => pendingProbe,
-      save: (candidate) => calls.push(`save:${candidate.origin}`),
+      save: (candidate) => { calls.push(`save:${candidate.origin}`); },
       reload: () => calls.push("reload"),
     });
     controller.abort();
@@ -131,7 +131,7 @@ describe("mobile saved-host manager", () => {
   it("reuses one probing address form for startup and in-app add", () => {
     const saved: string[] = [];
     const markup = renderToStaticMarkup(
-      <TailnetAddressForm save={(backend) => saved.push(backend.origin)} submitLabel="Check and add" />,
+      <TailnetAddressForm save={(backend) => { saved.push(backend.origin); }} submitLabel="Check and add" />,
     );
     expect(markup).toContain("Tailnet address");
     expect(markup).toContain("Check and add");

@@ -21,6 +21,8 @@ import type {
   PairRequest,
   PairResult,
   PairLinksDrainResult,
+  PeerShareStartResult,
+  PeerShareStatusResult,
   PhoneSetupState,
   RendererServerEventEnvelope,
   RendererServerEvent,
@@ -36,6 +38,10 @@ import type {
   TerminalInputRequest,
   TerminalResizeRequest,
   TerminalResult,
+  WorkspaceProjectCreateResult,
+  WorkspaceRootChooseResult,
+  WorkspaceRootSelectRequest,
+  WorkspaceRootsResult,
   SpeechRequest,
   SpeechResult,
   ProjectionCacheLoadResult,
@@ -68,6 +74,14 @@ export interface DesktopShellPort {
   readonly serviceStop?: () => Promise<ServiceActionResult>;
   readonly serviceRestart?: () => Promise<ServiceActionResult>;
   readonly serviceUninstall?: () => Promise<ServiceActionResult>;
+  readonly peerShareStart?: () => Promise<PeerShareStartResult>;
+  readonly peerShareStatus?: () => Promise<PeerShareStatusResult>;
+  readonly peerShareStop?: () => Promise<PeerShareStatusResult>;
+  readonly peerShareRegenerate?: () => Promise<PeerShareStartResult>;
+  readonly workspaceRootsList?: () => Promise<WorkspaceRootsResult>;
+  readonly workspaceRootSelect?: (request: WorkspaceRootSelectRequest) => Promise<void>;
+  readonly workspaceRootChoose?: () => Promise<WorkspaceRootChooseResult>;
+  readonly workspaceProjectCreate?: (request: { readonly name: string }) => Promise<WorkspaceProjectCreateResult>;
   readonly listProfiles?: () => Promise<LocalProfileListResult>;
   readonly addProfile?: (request: LocalProfileAddRequest) => Promise<LocalProfileResult>;
   readonly updateProfile?: (request: LocalProfileUpdateRequest) => Promise<LocalProfileResult>;

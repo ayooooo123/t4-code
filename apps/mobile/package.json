@@ -4,11 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "prepare:web": "node ./scripts/prepare-web.mjs",
+    "prepare:web": "pnpm --filter @t4-code/web build && node ./scripts/prepare-web.mjs",
     "sync:android": "pnpm prepare:web && cap sync android",
     "build:android:debug": "pnpm sync:android && node ./scripts/run-gradle.mjs assembleDebug",
     "check:android:debug": "pnpm sync:android && node ./scripts/run-gradle.mjs testDebugUnitTest assembleDebug lintDebug",
     "build:android:release": "pnpm sync:android && node ./scripts/run-gradle.mjs assembleRelease",
+    "inspect:qr": "node ./scripts/inspect-qr-scanner.mjs",
+    "fixtures:qr": "node ./scripts/generate-qr-acceptance-fixtures.mjs",
+    "inspect:storage": "node ./scripts/inspect-mobile-storage.mjs",
     "test": "node --test ./scripts/*.test.mjs"
   },
   "dependencies": {
@@ -16,6 +19,7 @@
   },
   "devDependencies": {
     "@capacitor/android": "8.4.1",
-    "@capacitor/cli": "8.4.1"
+    "@capacitor/cli": "8.4.1",
+    "qrcode": "1.5.4"
   }
 }

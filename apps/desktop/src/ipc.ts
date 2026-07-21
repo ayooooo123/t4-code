@@ -33,6 +33,8 @@ import {
   type PairResult,
   type PhoneSetupState,
   type PairLinksDrainResult,
+  type PeerShareStartResult,
+  type PeerShareStatusResult,
   type ProjectionCacheLoadResult,
   type ProjectionCacheSaveRequest,
   type ProjectionCacheSaveResult,
@@ -51,6 +53,11 @@ import {
   type SpeechRequest,
   type SpeechResult,
   type TerminalResult,
+  type WorkspaceProjectCreateRequest,
+  type WorkspaceProjectCreateResult,
+  type WorkspaceRootChooseResult,
+  type WorkspaceRootSelectRequest,
+  type WorkspaceRootsResult,
 } from "@t4-code/protocol/desktop-ipc";
 import {
   decodeBrowserCall,
@@ -63,8 +70,10 @@ import {
 import type { ServiceManager } from "@t4-code/service-manager";
 import { redactedMessage } from "@t4-code/client";
 import { isTrustedNavigation, trustedSender, type TrustedRenderer } from "./security.ts";
+import type { PeerShareHost } from "./peer-share.ts";
 import type { DesktopSpeechService } from "./speech.ts";
 import type { LocalTargetManager } from "./target-manager.ts";
+import type { WorkspaceRootsService } from "./workspace-roots.ts";
 import type { LocalProfileRuntime } from "./profile-runtime.ts";
 export interface IpcRuntime {
   readonly manager: LocalTargetManager;
@@ -82,6 +91,9 @@ export interface IpcRuntime {
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly profileRuntime?: LocalProfileRuntime;
   readonly drainPairLinks?: () => readonly PairLinkEvent[];
+  readonly peerShare?: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  readonly workspaceRoots?: Pick<WorkspaceRootsService, "list" | "addRoot" | "selectRoot" | "createProject">;
+  readonly chooseWorkspaceRoot?: () => Promise<string | null>;
   readonly drainPendingUpdateOpen?: () => boolean;
   readonly updateController?: {
     readonly getState: () => DesktopUpdateState;
@@ -156,6 +168,8 @@ export class DesktopIpcRegistry {
   private browserTarget: BrowserCallTarget | undefined;
   private readonly runtime: IpcRuntime;
   private readonly serviceQueue = { tail: Promise.resolve() };
+  private readonly peerShareQueue = { tail: Promise.resolve() };
+  private readonly workspaceQueue = { tail: Promise.resolve() };
   private serviceInspectionPromise: Promise<ServiceInspection> | undefined;
   private updateUnsubscribe: (() => void) | undefined;
   private readonly ipc: IpcMainLike;
@@ -315,6 +329,53 @@ export class DesktopIpcRegistry {
         return { completed: true };
       });
     }
+    this.ipc.handle("omp:peer-share:start", async (event, payload: unknown): Promise<PeerShareStartResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:start", payload);
+      return this.enqueuePeerShare(() => this.peerShare().start());
+    });
+    this.ipc.handle("omp:peer-share:status", async (event, payload: unknown): Promise<PeerShareStatusResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:status", payload);
+      return this.enqueuePeerShare(async () => this.peerShare().status());
+    });
+    this.ipc.handle("omp:peer-share:stop", async (event, payload: unknown): Promise<PeerShareStatusResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:stop", payload);
+      return this.enqueuePeerShare(async () => {
+        const peerShare = this.peerShare();
+        await peerShare.stop();
+        return peerShare.status();
+      });
+    });
+    this.ipc.handle("omp:peer-share:regenerate", async (event, payload: unknown): Promise<PeerShareStartResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:peer-share:regenerate", payload);
+      return this.enqueuePeerShare(() => this.peerShare().regenerate());
+    });
+    this.ipc.handle("omp:workspace:roots:list", async (event, payload: unknown): Promise<WorkspaceRootsResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:workspace:roots:list", payload);
+      return this.enqueueWorkspace(() => this.workspaceRoots().list());
+    });
+    this.ipc.handle("omp:workspace:root:select", async (event, payload: unknown): Promise<void> => {
+      this.assertSender(event);
+      const input = decodeRequest("omp:workspace:root:select", payload).payload as WorkspaceRootSelectRequest;
+      await this.enqueueWorkspace(() => this.workspaceRoots().selectRoot(input.rootId));
+    });
+    this.ipc.handle("omp:workspace:root:choose", async (event, payload: unknown): Promise<WorkspaceRootChooseResult> => {
+      this.assertSender(event);
+      decodeRequest("omp:workspace:root:choose", payload);
+      return this.enqueueWorkspace(async () => {
+        const path = await this.runtime.chooseWorkspaceRoot?.();
+        return { root: path === null || path === undefined ? null : await this.workspaceRoots().addRoot(path) };
+      });
+    });
+    this.ipc.handle("omp:workspace:project:create", async (event, payload: unknown): Promise<WorkspaceProjectCreateResult> => {
+      this.assertSender(event);
+      const input = decodeRequest("omp:workspace:project:create", payload).payload as WorkspaceProjectCreateRequest;
+      return this.enqueueWorkspace(async () => ({ project: await this.workspaceRoots().createProject(input.name) }));
+    });
     this.ipc.handle("app:update:get-state", (event, payload: unknown): DesktopUpdateState => {
       this.assertSender(event);
       decodeRequest("app:update:get-state", payload);
@@ -387,6 +448,9 @@ export class DesktopIpcRegistry {
       "omp:profiles:status", "omp:profiles:start", "omp:profiles:stop", "omp:profiles:restart",
       "omp:service:inspect", "omp:service:install", "omp:service:start", "omp:service:stop",
       "omp:service:restart", "omp:service:uninstall",
+      "omp:peer-share:start", "omp:peer-share:status", "omp:peer-share:stop", "omp:peer-share:regenerate",
+      "omp:workspace:roots:list", "omp:workspace:root:select", "omp:workspace:root:choose",
+      "omp:workspace:project:create",
       "app:update:get-state", "app:update:check", "app:update:download", "app:update:restart",
       "app:update:renderer-ready",
       "app:projection-cache:load", "app:projection-cache:save",
@@ -473,6 +537,24 @@ export class DesktopIpcRegistry {
   private enqueueService<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.serviceQueue.tail.then(operation, operation);
     this.serviceQueue.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+  private peerShare(): Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> {
+    if (this.runtime.peerShare === undefined) throw new Error("peer sharing is unavailable");
+    return this.runtime.peerShare;
+  }
+  private enqueuePeerShare<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.peerShareQueue.tail.then(operation, operation);
+    this.peerShareQueue.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+  private workspaceRoots(): Pick<WorkspaceRootsService, "list" | "addRoot" | "selectRoot" | "createProject"> {
+    if (this.runtime.workspaceRoots === undefined) throw new Error("workspace folders are unavailable");
+    return this.runtime.workspaceRoots;
+  }
+  private enqueueWorkspace<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = this.workspaceQueue.tail.then(operation, operation);
+    this.workspaceQueue.tail = result.then(() => undefined, () => undefined);
     return result;
   }
   private updateController(): NonNullable<IpcRuntime["updateController"]> {

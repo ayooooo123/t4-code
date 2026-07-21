@@ -66,6 +66,14 @@ export const DESKTOP_IPC_CHANNELS = [
   "omp:service:stop",
   "omp:service:restart",
   "omp:service:uninstall",
+  "omp:peer-share:start",
+  "omp:peer-share:status",
+  "omp:peer-share:stop",
+  "omp:peer-share:regenerate",
+  "omp:workspace:roots:list",
+  "omp:workspace:root:select",
+  "omp:workspace:root:choose",
+  "omp:workspace:project:create",
   "app:update:get-state",
   "app:update:check",
   "app:update:download",
@@ -113,6 +121,23 @@ export interface ServiceActionRequest {}
 export interface ServiceActionResult {
   completed: true;
 }
+export interface PeerShareRequest {}
+export interface PeerShareStartResult {
+  readonly invite: string;
+}
+export type PeerShareStatusResult =
+  | { readonly state: "stopped" }
+  | { readonly state: "sharing"; readonly desktopPublicKey: string };
+/** Approved host directories. Their paths never cross the renderer IPC boundary. */
+export interface WorkspaceRoot { readonly id: string; readonly label: string; }
+export interface WorkspaceProject { readonly id: string; readonly name: string; }
+export interface WorkspaceRootsListRequest {}
+export interface WorkspaceRootsResult { readonly roots: readonly WorkspaceRoot[]; readonly activeRootId: string | null; }
+export interface WorkspaceRootSelectRequest { readonly rootId: string; }
+export interface WorkspaceRootChooseRequest {}
+export interface WorkspaceRootChooseResult { readonly root: WorkspaceRoot | null; }
+export interface WorkspaceProjectCreateRequest { readonly name: string; }
+export interface WorkspaceProjectCreateResult { readonly project: WorkspaceProject; }
 export type PhoneSetupPhase = "unsupported" | "tailscale-required" | "not-configured" | "ready" | "error";
 export interface PhoneSetupState {
   readonly phase: PhoneSetupPhase;
@@ -499,6 +524,14 @@ export interface DesktopInvokeRequestMap {
   "omp:service:stop": ServiceActionRequest;
   "omp:service:restart": ServiceActionRequest;
   "omp:service:uninstall": ServiceActionRequest;
+  "omp:peer-share:start": PeerShareRequest;
+  "omp:peer-share:status": PeerShareRequest;
+  "omp:peer-share:stop": PeerShareRequest;
+  "omp:peer-share:regenerate": PeerShareRequest;
+  "omp:workspace:roots:list": WorkspaceRootsListRequest;
+  "omp:workspace:root:select": WorkspaceRootSelectRequest;
+  "omp:workspace:root:choose": WorkspaceRootChooseRequest;
+  "omp:workspace:project:create": WorkspaceProjectCreateRequest;
   "app:update:get-state": DesktopUpdateRequest;
   "app:update:check": DesktopUpdateRequest;
   "app:update:download": DesktopUpdateRequest;
@@ -537,6 +570,14 @@ export interface DesktopInvokeResponseMap {
   "omp:service:stop": ServiceActionResult;
   "omp:service:restart": ServiceActionResult;
   "omp:service:uninstall": ServiceActionResult;
+  "omp:peer-share:start": PeerShareStartResult;
+  "omp:peer-share:status": PeerShareStatusResult;
+  "omp:peer-share:stop": PeerShareStatusResult;
+  "omp:peer-share:regenerate": PeerShareStartResult;
+  "omp:workspace:roots:list": WorkspaceRootsResult;
+  "omp:workspace:root:select": void;
+  "omp:workspace:root:choose": WorkspaceRootChooseResult;
+  "omp:workspace:project:create": WorkspaceProjectCreateResult;
   "omp:speech:speak": SpeechResult;
   "omp:speech:stop": SpeechResult;
   "app:update:get-state": DesktopUpdateState;
@@ -909,6 +950,12 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "omp:service:stop":
     case "omp:service:restart":
     case "omp:service:uninstall":
+    case "omp:peer-share:start":
+    case "omp:peer-share:status":
+    case "omp:peer-share:stop":
+    case "omp:peer-share:regenerate":
+    case "omp:workspace:roots:list":
+    case "omp:workspace:root:choose":
     case "app:update:get-state":
     case "app:update:check":
     case "app:update:download":
@@ -918,6 +965,12 @@ export function decodeDesktopInvokeRequest(input: unknown): DesktopInvokeRequest
     case "app:phone-setup:configure":
       exact(payload, []);
       return { channel, payload: {} };
+    case "omp:workspace:root:select":
+      exact(payload, ["rootId"]);
+      return { channel, payload: { rootId: controlFree(payload.rootId, "rootId", 128) } };
+    case "omp:workspace:project:create":
+      exact(payload, ["name"]);
+      return { channel, payload: { name: controlFree(payload.name, "name", 81) } };
     case "app:projection-cache:load":
       exact(payload, []);
       return { channel, payload: {} };

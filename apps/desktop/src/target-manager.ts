@@ -7,7 +7,13 @@ import { createRemoteWebSocketTransport, type RemoteWebSocketTransport } from ".
 import { validateRemoteTarget, type CredentialStore, type PublicRemoteTarget, type RemoteTargetRecord, type RemoteTargetRegistry } from "./remote-runtime/registry.ts";
 import { DEFAULT_LOCAL_PROFILE, localTargetId, type LocalProfileRecord } from "./local-profiles.ts";
 const DEFAULT_CAPABILITIES: readonly DeviceCapability[] = Object.freeze([...DEVICE_CAPABILITIES]);
-const REQUESTED_FEATURES: readonly string[] = ADDITIVE_FEATURES;
+// OMP 17 can enqueue one retained agent-transcript frame per subagent during
+// attach and exceed its 1 MiB WebSocket backpressure limit, closing the entire
+// session with code 1006. Lifecycle/progress frames remain available without
+// negotiating the bulk transcript replay feature.
+const REQUESTED_FEATURES: readonly string[] = Object.freeze(
+  ADDITIVE_FEATURES.filter((feature) => feature !== "agent.transcript"),
+);
 const COMPATIBILITY_FEATURES: readonly string[] = Object.freeze(
   REQUESTED_FEATURES.filter(
     (feature) => feature !== "prompt.images" && feature !== "transcript.images",
@@ -339,7 +345,26 @@ export class DesktopTargetManager {
         if (welcome !== undefined) this.events.onEvent(targetId, welcome);
         return { result: Promise.resolve("connected") };
       }
-      if (existing.client.state === "connecting" || existing.client.state === "handshaking" || existing.client.state === "pairing" || existing.client.state === "reconnect-wait") {
+      if (existing.client.state === "reconnect-wait") {
+        const pending = this.connectAttempts.get(targetId);
+        const result = pending?.generation === existing.generation
+          ? pending.result
+          : existing.client.connect().then(() => existing.client.state === "ready" ? "connected" as const : "connecting" as const);
+        if (pending?.generation !== existing.generation) {
+          this.connectAttempts.set(targetId, { generation: existing.generation, result });
+          void result.then(
+            () => {
+              if (this.connectAttempts.get(targetId)?.generation === existing.generation) this.connectAttempts.delete(targetId);
+            },
+            () => {
+              if (this.connectAttempts.get(targetId)?.generation === existing.generation) this.connectAttempts.delete(targetId);
+            },
+          );
+        }
+        existing.client.wake();
+        return { result };
+      }
+      if (existing.client.state === "connecting" || existing.client.state === "handshaking" || existing.client.state === "pairing") {
         const pending = this.connectAttempts.get(targetId);
         return { result: pending?.generation === existing.generation ? pending.result : Promise.resolve("connecting") };
       }

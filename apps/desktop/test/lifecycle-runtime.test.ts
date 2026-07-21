@@ -142,6 +142,12 @@ function setup(
     readonly discoverExecutable?: () => Promise<string | undefined>;
     readonly discoverHostExecutable?: () => Promise<string | undefined>;
     readonly createServiceManager?: NonNullable<DesktopLifecycleOptions["createServiceManager"]>;
+    readonly createPeerShare?: () => {
+      start(): Promise<{ readonly invite: string }>;
+      regenerate(): Promise<{ readonly invite: string }>;
+      status(): { readonly state: "sharing"; readonly desktopPublicKey: string };
+      stop(): Promise<void>;
+    };
     readonly createProjectionCache?: NonNullable<DesktopLifecycleOptions["createProjectionCache"]>;
     readonly createBrowserRuntime?: NonNullable<DesktopLifecycleOptions["createBrowserRuntime"]>;
   } = {},
@@ -226,6 +232,12 @@ function setup(
     loadIdentity: () => ({ deviceId: "device-test", deviceName: "Desktop Test" }),
     createCursorStore: () => ({ load: () => [], save: () => {} }),
     createCredentials: () => undefined,
+    createPeerShare: overrides.createPeerShare ?? (() => ({
+      start: async () => ({ invite: "t4peer://v1/test/capability" }),
+      regenerate: async () => ({ invite: "t4peer://v1/test/capability" }),
+      status: () => ({ state: "sharing" as const, desktopPublicKey: "test" }),
+      stop: async () => {},
+    })),
     createLocalProfileRegistry: () => localProfileRegistry,
     ...(overrides.createProjectionCache === undefined
       ? {}
@@ -282,6 +294,28 @@ function setup(
 }
 
 describe("desktop Electron lifecycle", () => {
+  it("opens the desktop window while private peer sharing is still starting", async () => {
+    let resolveStart: (() => void) | undefined;
+    const peerStart = new Promise<void>((resolve) => { resolveStart = resolve; });
+    const fixture = setup(undefined, async () => true, {
+      createPeerShare: () => ({
+        start: async () => { await peerStart; return { invite: "t4peer://v1/test/capability" }; },
+        regenerate: async () => ({ invite: "t4peer://v1/test/capability" }),
+        status: () => ({ state: "sharing" as const, desktopPublicKey: "test" }),
+        stop: async () => {},
+      }),
+    });
+    const starting = fixture.lifecycle.start();
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(fixture.windows).toHaveLength(1);
+    } finally {
+      resolveStart?.();
+      await starting;
+      await fixture.lifecycle.stop();
+    }
+  });
+
   it("queues initial argv, second-instance, and open-url links until renderer load", async () => {
     const original = [...process.argv];
     process.argv.push("t4-code://pair/argv-host/123456");
