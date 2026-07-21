@@ -378,6 +378,38 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.match(buildSource, /quarantine/u);
   assert.match(buildSource, /chmod 1777 "\$artifact_dir"/u);
   assert.match(buildSource, /chmod 0444 "\$metadata" "\$digest_file"/u);
+
+  const sourceArgument = "ARG SOURCE_REPOSITORY=https://github.com/LycaonLLC/t4-code";
+  const sourceLabel = 'org.opencontainers.image.source="${SOURCE_REPOSITORY}"';
+  for (const component of IMAGE_COMPONENTS) {
+    const dockerfileSource = await readFile(resolve(repoRoot, "cluster/images", component, "Dockerfile"), "utf8");
+    const finalStageOffset = dockerfileSource.lastIndexOf("\nFROM ");
+    const sourceArgumentOffset = dockerfileSource.indexOf(sourceArgument, finalStageOffset);
+    const sourceLabelOffset = dockerfileSource.indexOf(sourceLabel, sourceArgumentOffset);
+    assert.ok(finalStageOffset >= 0, `${component} must have a final image stage`);
+    assert.ok(sourceArgumentOffset > finalStageOffset, `${component} must declare SOURCE_REPOSITORY in its final stage`);
+    assert.ok(sourceLabelOffset > sourceArgumentOffset, `${component} must use SOURCE_REPOSITORY for its OCI source label`);
+    assert.equal(dockerfileSource.match(/ARG SOURCE_REPOSITORY=/gu)?.length, 1);
+    assert.equal(dockerfileSource.match(/org\.opencontainers\.image\.source=/gu)?.length, 1);
+    assert.doesNotMatch(dockerfileSource, /org\.opencontainers\.image\.source="https:\/\//u);
+  }
+
+  const promotionSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/promote-images.sh"), "utf8");
+  const preflightResolveOffset = promotionSource.indexOf('if resolved=$(oras resolve "$destination" 2>&1); then');
+  const differentDigestGuardOffset = promotionSource.indexOf('if [ "$resolved" != "$digest" ]; then', preflightResolveOffset);
+  const recursiveCopyOffset = promotionSource.indexOf('oras copy --recursive "$source" "$destination"', differentDigestGuardOffset);
+  const verificationResolveOffset = promotionSource.indexOf('resolved=$(oras resolve "$destination")', recursiveCopyOffset);
+  assert.ok(
+    preflightResolveOffset >= 0 &&
+      preflightResolveOffset < differentDigestGuardOffset &&
+      differentDigestGuardOffset < recursiveCopyOffset &&
+      recursiveCopyOffset < verificationResolveOffset,
+    "promotion must resolve and reject an occupied tag before copying, then verify the result",
+  );
+  const promotionGuard = promotionSource.slice(preflightResolveOffset, recursiveCopyOffset);
+  assert.match(promotionGuard, /if \[ "\$resolved" != "\$digest" \]; then[\s\S]*?exit 65\n    fi\n  else/u);
+  assert.match(promotionGuard, /"failed to resolve digest: \$CI_COMMIT_SHA: not found"/u);
+  assert.doesNotMatch(promotionSource.slice(0, preflightResolveOffset), /oras copy/u);
   const authSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/load-registry-auth.sh"), "utf8");
   assert.match(authSource, /chmod 0711 "\$auth_parent" "\$auth_dir"/u);
   const provenanceSource = await readFile(resolve(repoRoot, "scripts/cluster-ci/capture-image-evidence.sh"), "utf8");
