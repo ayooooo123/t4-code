@@ -401,10 +401,12 @@ export async function runHostDaemon(
     onSignal("SIGTERM", stop);
     try {
       await appserver.start();
-      const bridgeFailure = await Promise.race([
-        stopped.promise.then<Error | undefined>(() => undefined),
-        bridge.closed,
-      ]);
+      const bridgeFailure = bridge
+        ? await Promise.race([
+            stopped.promise.then<Error | undefined>(() => undefined),
+            bridge.closed,
+          ])
+        : await stopped.promise.then<Error | undefined>(() => undefined);
       if (bridgeFailure) {
         process.stderr.write(
           `t4-host: OMP authority bridge closed unexpectedly; exiting so the service restarts: ${bridgeFailure.message}\n`,
