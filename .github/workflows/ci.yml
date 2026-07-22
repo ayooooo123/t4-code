@@ -13,6 +13,50 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      continuity: ${{ steps.classify.outputs.continuity }}
+      cluster: ${{ steps.classify.outputs.cluster }}
+      official_omp_gate0: ${{ steps.classify.outputs.official_omp_gate0 }}
+      tooling: ${{ steps.classify.outputs.tooling }}
+      android_debug: ${{ steps.classify.outputs.android_debug }}
+      flutter: ${{ steps.classify.outputs.flutter }}
+      flutter_android: ${{ steps.classify.outputs.flutter_android }}
+      flutter_apple: ${{ steps.classify.outputs.flutter_apple }}
+    steps:
+      - name: Check out source and base history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.13.1
+
+      - name: Test path classification
+        run: node --test scripts/ci-paths.test.mjs
+
+      - name: Classify affected CI legs
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            node scripts/ci-paths.mjs --all >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git diff --name-only -z "$BASE_SHA...$HEAD_SHA" | node scripts/ci-paths.mjs >> "$GITHUB_OUTPUT"
+
   core:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -58,6 +102,8 @@ jobs:
         run: pnpm test:packaging
 
   legacy-bridge-continuity:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.continuity == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -129,7 +175,130 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  official-omp-gate0:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.official_omp_gate0 == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-15
+    name: official-omp-gate0 (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact T4 source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.10.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.13.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prove the pinned unmodified official OMP runtime
+        run: pnpm --filter @t4-code/host-service verify:official-omp-lifecycle
+
+      - name: Prove the packaged T4 host against official OMP
+        run: pnpm --filter @t4-code/host-daemon verify:official-omp-packaged
+
+      - name: Upload official OMP Gate 0 evidence
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: official-omp-gate0-${{ matrix.platform }}-${{ github.run_id }}
+          path: |
+            artifacts/official-omp-gate0/${{ matrix.platform }}.json
+            artifacts/official-omp-packaged-host/${{ matrix.platform }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  cluster:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.cluster == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.10.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.13.1
+          cache: pnpm
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.25.5"
+          cache-dependency-path: packages/cluster-operator/go.sum
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install pinned Helm
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/helm.tar.gz https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz
+          echo "a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496  /tmp/helm.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+
+      - name: Run cluster CI proof contracts
+        run: pnpm test:cluster:ci
+
+      - name: Run cluster server tests
+        run: pnpm --filter @t4-code/cluster-server test
+
+      - name: Typecheck cluster server
+        run: pnpm --filter @t4-code/cluster-server typecheck
+
+      - name: Run cluster protocol contracts
+        run: |
+          pnpm --filter @t4-code/host-wire exec bun test test/cluster-operator.test.ts
+          pnpm --filter @t4-code/host-service exec bun test test/cluster-default-off.test.ts
+
+      - name: Run operator tests
+        working-directory: packages/cluster-operator
+        run: go test ./...
+
+      - name: Lint cluster chart
+        run: helm lint deploy/charts/t4-cluster
+
   tooling:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.tooling == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -154,6 +323,8 @@ jobs:
         run: pnpm test:tooling
 
   android-debug:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.android_debug == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
@@ -194,6 +365,8 @@ jobs:
         run: pnpm --filter @t4-code/mobile check:android:debug
 
   flutter:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.flutter == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -231,6 +404,8 @@ jobs:
         run: pnpm build:flutter:web
 
   flutter-android:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.flutter_android == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
@@ -271,6 +446,8 @@ jobs:
           script: cd apps/flutter && flutter test integration_test/app_smoke_test.dart -d emulator-5554
 
   flutter-apple:
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.flutter_apple == 'true' }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -341,15 +518,18 @@ jobs:
   verify:
     name: verify
     if: ${{ always() }}
-    needs: [core, legacy-bridge-continuity, tooling, android-debug, flutter, flutter-android, flutter-apple]
+    needs: [changes, core, legacy-bridge-continuity, official-omp-gate0, cluster, tooling, android-debug, flutter, flutter-android, flutter-apple]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Require every CI leg
+      - name: Require every selected CI leg
         shell: bash
         env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
           CORE_RESULT: ${{ needs.core.result }}
           CONTINUITY_RESULT: ${{ needs.legacy-bridge-continuity.result }}
+          OFFICIAL_OMP_GATE0_RESULT: ${{ needs.official-omp-gate0.result }}
+          CLUSTER_RESULT: ${{ needs.cluster.result }}
           TOOLING_RESULT: ${{ needs.tooling.result }}
           ANDROID_RESULT: ${{ needs.android-debug.result }}
           FLUTTER_RESULT: ${{ needs.flutter.result }}
@@ -357,10 +537,20 @@ jobs:
           FLUTTER_APPLE_RESULT: ${{ needs.flutter-apple.result }}
         run: |
           set -euo pipefail
+          test "$CHANGES_RESULT" = success
           test "$CORE_RESULT" = success
-          test "$CONTINUITY_RESULT" = success
-          test "$TOOLING_RESULT" = success
-          test "$ANDROID_RESULT" = success
-          test "$FLUTTER_RESULT" = success
-          test "$FLUTTER_ANDROID_RESULT" = success
-          test "$FLUTTER_APPLE_RESULT" = success
+          for result in \
+            "$CONTINUITY_RESULT" \
+            "$OFFICIAL_OMP_GATE0_RESULT" \
+            "$CLUSTER_RESULT" \
+            "$TOOLING_RESULT" \
+            "$ANDROID_RESULT" \
+            "$FLUTTER_RESULT" \
+            "$FLUTTER_ANDROID_RESULT" \
+            "$FLUTTER_APPLE_RESULT"
+          do
+            case "$result" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

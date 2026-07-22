@@ -6,6 +6,8 @@ import 'package:t4code/src/protocol/protocol.dart';
 
 const _corpusPath =
     '../../packages/client/test/fixtures/protocol/omp-app-v1-corpus.json';
+const _operationCapabilitiesPath =
+    '../../packages/host-wire/test/fixtures/operation-capabilities.json';
 
 void main() {
   final corpus = _loadCorpus();
@@ -195,6 +197,78 @@ void main() {
         expect(() => decoded.raw['changed'] = true, throwsUnsupportedError);
       }
     });
+    test('shared operation capability fixture decodes into typed models', () {
+      final scenario = _asMap(
+        jsonDecode(File(_operationCapabilitiesPath).readAsStringSync()),
+      );
+      final catalog =
+          WireDecoder.decode(jsonEncode(scenario['catalog'])) as ResponseFrame;
+      final result = catalog.catalogResult!;
+
+      expect(result.revision, 'capabilities-v1');
+      expect(
+        result.operations!.map((operation) => operation.operationId),
+        <String>[
+          'session.prompt',
+          'slash.compact',
+          'slash.plan',
+          'goal.create',
+        ],
+      );
+      expect(
+        result.operations!.map((operation) => operation.execution),
+        <OperationExecution>[
+          OperationExecution.typed,
+          OperationExecution.headless,
+          OperationExecution.terminalOnly,
+          OperationExecution.unavailable,
+        ],
+      );
+      expect(
+        result.operations!
+            .skip(2)
+            .map((operation) => operation.disabledReason!.code),
+        <String>['terminal_only', 'capability_unavailable'],
+      );
+      expect(
+        () => result.operations!.add(result.operations!.first),
+        throwsUnsupportedError,
+      );
+
+      final rejections = _asList(scenario['rejections'])
+          .map((wire) => WireDecoder.decode(jsonEncode(wire)) as ResponseFrame)
+          .toList(growable: false);
+      expect(rejections.every((frame) => !frame.ok), isTrue);
+      expect(rejections.map((frame) => frame.error!.code), <String>[
+        'terminal_only',
+        'capability_unavailable',
+      ]);
+    });
+
+    test(
+      'catalog decoding preserves missing versus authoritative empty operations',
+      () {
+        Map<String, Object?> catalog([List<Object?>? operations]) {
+          final frame = <String, Object?>{
+            'v': 'omp-app/1',
+            'type': 'catalog',
+            'hostId': 'host-alpha',
+            'revision': operations == null ? 'legacy' : 'authoritative-empty',
+            'items': <Object?>[],
+          };
+          if (operations != null) frame['operations'] = operations;
+          return frame;
+        }
+
+        final legacy =
+            WireDecoder.decode(jsonEncode(catalog())) as CatalogFrame;
+        final authoritative =
+            WireDecoder.decode(jsonEncode(catalog(<Object?>[])))
+                as CatalogFrame;
+        expect(legacy.operations, isNull);
+        expect(authoritative.operations, isEmpty);
+      },
+    );
 
     test(
       'every non-corpus ServerFrame branch rejects a missing requirement',

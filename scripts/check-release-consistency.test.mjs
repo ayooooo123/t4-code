@@ -7,6 +7,7 @@ import { load as parseYaml } from "js-yaml";
 
 import {
   collectReleaseConsistencyErrors,
+  discoverReleasePackagePaths,
   loadReleaseContractFiles,
 } from "./check-release-consistency.mjs";
 
@@ -65,6 +66,10 @@ test("current source tree has one consistent release version", () => {
   assert.deepEqual(collectReleaseConsistencyErrors(files), []);
 });
 
+test("release package discovery ignores non-Node package directories", () => {
+  assert.equal(discoverReleasePackagePaths(repoRoot).includes("packages/cluster-operator/package.json"), false);
+});
+
 test("rejects duplicate keys in JSON release contracts", () => {
   const duplicated = changed("compat/omp-app-matrix.json", (text) =>
     text.replace(
@@ -85,6 +90,31 @@ test("promotes the verified runtime into the product release", () => {
   assert.equal(matrix.verifiedRuntime.sourceTag, "t4code-17.0.5-appserver-10");
   assert.equal(matrix.publishedRuntime.sourceTag, "t4code-17.0.5-appserver-10");
   assert.deepEqual(matrix.publishedRuntime, matrix.verifiedRuntime);
+});
+
+test("pins official OMP artifacts and the Gate 0 proof contract", () => {
+  const officialDrift = changedRuntime("officialRuntime", (runtime) => {
+    runtime.artifacts["linux-arm64"].sha256 = "invalid";
+  });
+  assert.ok(
+    collectReleaseConsistencyErrors(officialDrift).some((error) =>
+      error.includes("official runtime linux-arm64 artifact SHA-256"),
+    ),
+  );
+
+  const snapshotDrift = changed("compat/official-omp-gate0.json", (text) => {
+    const snapshot = JSON.parse(text);
+    snapshot.runtime.commit = "0".repeat(40);
+    snapshot.requiredScenarios = snapshot.requiredScenarios.filter((item) => item !== "approval");
+    snapshot.t4AdapterCoverage.liveEntryDeduplication = false;
+    snapshot.packagedHostProof.requiredScenarios = ["prompt"];
+    return JSON.stringify(snapshot);
+  });
+  const errors = collectReleaseConsistencyErrors(snapshotDrift);
+  assert.ok(errors.some((error) => error.includes("runtime commit must match")));
+  assert.ok(errors.some((error) => error.includes("requiredScenarios must match")));
+  assert.ok(errors.some((error) => error.includes("liveEntryDeduplication must be true")));
+  assert.ok(errors.some((error) => error.includes("packagedHostProof.requiredScenarios")));
 });
 
 test("rejects a tag that differs from the package version", () => {
@@ -245,14 +275,14 @@ test("rejects updater channel, stable manifest, and publication-contract drift",
       ".github/workflows/ci.yml",
       (text) =>
         text.replace(
-          "needs: [core, legacy-bridge-continuity, tooling, android-debug, flutter, flutter-android, flutter-apple]",
-          "needs: [core, tooling, android-debug]",
+          "needs: [changes, core, legacy-bridge-continuity, official-omp-gate0, cluster, tooling, android-debug, flutter, flutter-android, flutter-apple]",
+          "needs: [changes, core, tooling, android-debug]",
         ),
     ],
     [
       ".github/workflows/ci.yml",
       (text) =>
-        text.replace(
+        text.replaceAll(
           "ref: ${{ github.event.pull_request.head.sha || github.sha }}",
           "ref: ${{ github.ref }}",
         ),
@@ -524,6 +554,11 @@ test("deploys release site source only after artifact publication", () => {
   assert.ok(ciWorkflow.includes("path: artifacts/legacy-bridge-continuity/"));
   assert.ok(ciWorkflow.includes("if-no-files-found: error"));
   assert.ok(ciWorkflow.includes("tooling:"));
+  assert.ok(ciWorkflow.includes("cluster:"));
+  assert.ok(ciWorkflow.includes("actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16"));
+  assert.ok(ciWorkflow.includes("run: pnpm test:cluster:ci"));
+  assert.ok(ciWorkflow.includes("run: go test ./..."));
+  assert.ok(ciWorkflow.includes("run: helm lint deploy/charts/t4-cluster"));
   assert.ok(ciWorkflow.includes("flutter:"));
   assert.ok(ciWorkflow.includes("flutter-android:"));
   assert.ok(ciWorkflow.includes("flutter-apple:"));
@@ -545,16 +580,13 @@ test("deploys release site source only after artifact publication", () => {
   assert.ok(ciWorkflow.includes("if: ${{ always() }}"));
   assert.ok(
     ciWorkflow.includes(
-      "needs: [core, legacy-bridge-continuity, tooling, android-debug, flutter, flutter-android, flutter-apple]",
+      "needs: [changes, core, legacy-bridge-continuity, official-omp-gate0, cluster, tooling, android-debug, flutter, flutter-android, flutter-apple]",
     ),
   );
+  assert.ok(ciWorkflow.includes('test "$CHANGES_RESULT" = success'));
   assert.ok(ciWorkflow.includes('test "$CORE_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$CONTINUITY_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$TOOLING_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$ANDROID_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$FLUTTER_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$FLUTTER_ANDROID_RESULT" = success'));
-  assert.ok(ciWorkflow.includes('test "$FLUTTER_APPLE_RESULT" = success'));
+  assert.ok(ciWorkflow.includes("for result in \\"));
+  assert.ok(ciWorkflow.includes("success|skipped) ;;"));
   assert.ok(ciWorkflow.includes("github.event_name == 'pull_request' && github.ref || github.sha"));
   assert.ok(ciWorkflow.includes("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"));
   assert.ok(ciWorkflow.includes('java-version: "21"'));

@@ -1,5 +1,40 @@
 {
   "appProtocol": "omp-app/1",
+  "officialRuntime": {
+    "package": "omp",
+    "version": "17.0.6",
+    "sourceRepository": "https://github.com/can1357/oh-my-pi",
+    "sourceCommit": "89d6a8f6d14286f32f09ec9c8aa8af7b3451d2d6",
+    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/89d6a8f6d14286f32f09ec9c8aa8af7b3451d2d6",
+    "sourceTag": "v17.0.6",
+    "artifacts": {
+      "darwin-arm64": {
+        "name": "omp-darwin-arm64",
+        "size": 119425152,
+        "sha256": "d747470bcff0412e5bde7860f5dead7de15aad6b973a4b46c34f8527d9d6a4b9"
+      },
+      "darwin-x64": {
+        "name": "omp-darwin-x64",
+        "size": 124901872,
+        "sha256": "9e5b4560b61fc4373f604cba9e2cc3bdab04549e830f3d5ecd80b1f7facc86bc"
+      },
+      "linux-arm64": {
+        "name": "omp-linux-arm64",
+        "size": 149072016,
+        "sha256": "4d2f3e9948f81f4c3813b5c89e5eda4bdcd42ef22285d40cf48402ebfa15436d"
+      },
+      "linux-x64": {
+        "name": "omp-linux-x64",
+        "size": 173901952,
+        "sha256": "27fec143aa646cae5eae9b3a0677c54d43465fc49a79b161bac739dbba244c8c"
+      },
+      "win32-x64": {
+        "name": "omp-windows-x64.exe",
+        "size": 152957440,
+        "sha256": "b5c7a5b008ae2342664161ed5615337501ae833a7ce825dbbf0918281dafb2d6"
+      }
+    }
+  },
   "appWire": {
     "package": "@oh-my-pi/app-wire",
     "version": "0.7.0",
@@ -31,6 +66,16 @@
         "sha256": "f7d4438e163aabc4ca624468bf5bd4a243b5e1ab5360e84cef52abe93683ea55",
         "releaseCodeSignature": "adhoc",
         "distributionSigningBoundary": "t4-product-package"
+      },
+      "linux-arm64": {
+        "name": "omp-linux-arm64",
+        "size": 150513808,
+        "sha256": "968a939fc26329590ba53b11c9cb0eccc0e849e8988c8da9fc58c7c2fcfe8ef5"
+      },
+      "linux-x64": {
+        "name": "omp-linux-x64",
+        "size": 175372416,
+        "sha256": "deb7dae793a2191746681980305ab8b5ed0480410950ca7d5e555257f4f3fb04"
       }
     },
     "upstreamRepository": "https://github.com/can1357/oh-my-pi",
@@ -122,6 +167,16 @@
         "sha256": "f7d4438e163aabc4ca624468bf5bd4a243b5e1ab5360e84cef52abe93683ea55",
         "releaseCodeSignature": "adhoc",
         "distributionSigningBoundary": "t4-product-package"
+      },
+      "linux-arm64": {
+        "name": "omp-linux-arm64",
+        "size": 150513808,
+        "sha256": "968a939fc26329590ba53b11c9cb0eccc0e849e8988c8da9fc58c7c2fcfe8ef5"
+      },
+      "linux-x64": {
+        "name": "omp-linux-x64",
+        "size": 175372416,
+        "sha256": "deb7dae793a2191746681980305ab8b5ed0480410950ca7d5e555257f4f3fb04"
       }
     },
     "upstreamRepository": "https://github.com/can1357/oh-my-pi",

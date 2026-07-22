@@ -459,6 +459,182 @@ void main() {
     },
   );
 
+  test(
+    'composer uses official OMP operation capabilities and keeps terminal-only commands disabled',
+    () async {
+      final profile = _profile('alpha');
+      final connector = _FakeConnector();
+      final controller = _controller(
+        _MemoryDirectoryStore(
+          directory: const HostDirectory.empty().upsert(profile),
+        ),
+        _MemoryCredentialStore(),
+        connector,
+      );
+      addTearDown(controller.dispose);
+      await controller.initialize();
+      final channel = connector.channels.single;
+
+      channel.emit(
+        _welcome(
+          'host-alpha',
+          capabilities: const <String>[
+            'sessions.read',
+            'sessions.prompt',
+            'catalog.read',
+          ],
+          features: const <String>['catalog.metadata'],
+        ),
+      );
+      await _flush();
+      final list = channel.sentJson.firstWhere(
+        (frame) => frame['command'] == 'session.list',
+      );
+      channel.emit(
+        _response(
+          list,
+          command: 'session.list',
+          result: _sessionListResult('host-alpha'),
+        ),
+      );
+      channel.emit(<String, Object?>{
+        'v': 'omp-app/1',
+        'type': 'catalog',
+        'hostId': 'host-alpha',
+        'revision': 'catalog-operation-capabilities',
+        'items': <Object?>[
+          <String, Object?>{
+            'id': 'command:session.cancel',
+            'kind': 'command',
+            'name': 'session.cancel',
+          },
+        ],
+        'operations': <Object?>[
+          <String, Object?>{
+            'operationId': 'session.prompt',
+            'label': 'Prompt',
+            'execution': 'typed',
+            'supported': true,
+          },
+          <String, Object?>{
+            'operationId': 'slash.compact',
+            'label': '/compact',
+            'description': 'Compact the active conversation',
+            'execution': 'headless',
+            'supported': true,
+            'metadata': <String, Object?>{
+              'aliases': <Object?>['compress'],
+            },
+          },
+          <String, Object?>{
+            'operationId': 'slash.plan',
+            'label': '/plan',
+            'description': 'Toggle plan mode',
+            'execution': 'terminal-only',
+            'supported': false,
+            'disabledReason': <String, Object?>{
+              'code': 'terminal_only',
+              'message': '/plan requires the OMP terminal interface.',
+            },
+          },
+        ],
+      });
+      await _flush();
+
+      final commands = controller.state.composer.slashCommands;
+      expect(commands.map((command) => command.name), <String>[
+        '/compact',
+        '/plan',
+      ]);
+      expect(commands.first.aliases, <String>['/compress']);
+      expect(commands.first.disabledReason, isNull);
+      expect(
+        commands.last.disabledReason,
+        '/plan requires the OMP terminal interface.',
+      );
+
+      channel.emit(<String, Object?>{
+        'v': 'omp-app/1',
+        'type': 'catalog',
+        'hostId': 'host-alpha',
+        'revision': 'catalog-authoritative-empty',
+        'items': <Object?>[
+          <String, Object?>{
+            'id': 'command:legacy-compact',
+            'kind': 'command',
+            'name': '/compact',
+          },
+          <String, Object?>{
+            'id': 'command:session.cancel',
+            'kind': 'command',
+            'name': 'session.cancel',
+          },
+        ],
+        'operations': <Object?>[],
+      });
+      await _flush();
+      expect(controller.state.composer.slashCommands, isEmpty);
+    },
+  );
+
+  test(
+    'read-only catalog clients see official headless commands disabled',
+    () async {
+      final profile = _profile('alpha');
+      final connector = _FakeConnector();
+      final controller = _controller(
+        _MemoryDirectoryStore(
+          directory: const HostDirectory.empty().upsert(profile),
+        ),
+        _MemoryCredentialStore(),
+        connector,
+      );
+      addTearDown(controller.dispose);
+      await controller.initialize();
+      final channel = connector.channels.single;
+
+      channel.emit(
+        _welcome(
+          'host-alpha',
+          capabilities: const <String>['sessions.read', 'catalog.read'],
+          features: const <String>['catalog.metadata'],
+        ),
+      );
+      await _flush();
+      final list = channel.sentJson.firstWhere(
+        (frame) => frame['command'] == 'session.list',
+      );
+      channel.emit(
+        _response(
+          list,
+          command: 'session.list',
+          result: _sessionListResult('host-alpha'),
+        ),
+      );
+      channel.emit(<String, Object?>{
+        'v': 'omp-app/1',
+        'type': 'catalog',
+        'hostId': 'host-alpha',
+        'revision': 'catalog-read-only',
+        'items': <Object?>[],
+        'operations': <Object?>[
+          <String, Object?>{
+            'operationId': 'slash.compact',
+            'label': '/compact',
+            'execution': 'headless',
+            'supported': true,
+          },
+        ],
+      });
+      await _flush();
+
+      expect(
+        controller.state.composer.slashCommands.single.disabledReason,
+        'Not granted on this host',
+      );
+    },
+  );
+
   test('command ids are unique across controller restarts', () async {
     final profile = _profile('alpha');
     final directory = _MemoryDirectoryStore(
@@ -1771,6 +1947,120 @@ void main() {
     expect(channel.sentJson.last, containsPair('type', 'confirm'));
     expect(channel.sentJson.last, containsPair('decision', 'deny'));
   });
+
+  test(
+    'searches project files and runs pause resume and compact controls',
+    () async {
+      final profile = _profile('alpha');
+      final connector = _FakeConnector();
+      final controller = _controller(
+        _MemoryDirectoryStore(
+          directory: const HostDirectory.empty().upsert(profile),
+        ),
+        _MemoryCredentialStore(),
+        connector,
+      );
+      addTearDown(controller.dispose);
+      await controller.initialize();
+      final channel = connector.channels.single;
+      channel.emit(
+        _welcome(
+          'host-alpha',
+          capabilities: t4RequestedCapabilities,
+          features: const <String>['files.search'],
+        ),
+      );
+      await _flush();
+      final list = channel.sentJson.last;
+      channel.emit(
+        _response(
+          list,
+          command: 'session.list',
+          result: _sessionListResult('host-alpha'),
+        ),
+      );
+      await _flush();
+      channel.emit(
+        _snapshot(
+          'host-alpha',
+          'session-alpha',
+          revision: 'revision-session-alpha',
+        ),
+      );
+      await _flush();
+
+      final searching = controller.searchProjectFiles('  main  ', limit: 5);
+      await _flush();
+      final search = channel.sentJson.last;
+      expect(search['command'], 'files.search');
+      expect(search['args'], <String, Object?>{'query': 'main', 'limit': 5});
+      channel.emit(
+        _response(
+          search,
+          command: 'files.search',
+          result: <String, Object?>{
+            'matches': <Object?>[
+              <String, Object?>{'path': 'lib/main.dart'},
+              <String, Object?>{'path': 'test/main_test.dart'},
+            ],
+            'truncated': true,
+          },
+        ),
+      );
+      final searchResult = await searching;
+      expect(searchResult.paths, <String>[
+        'lib/main.dart',
+        'test/main_test.dart',
+      ]);
+      expect(searchResult.truncated, isTrue);
+
+      final pausing = controller.pauseSession();
+      await _flush();
+      final pause = channel.sentJson.last;
+      expect(pause['command'], 'session.pause');
+      channel.emit(
+        _response(
+          pause,
+          command: 'session.pause',
+          result: <String, Object?>{'paused': true, 'changed': true},
+        ),
+      );
+      await pausing;
+      expect(controller.state.composer.isPaused, isTrue);
+
+      final resuming = controller.resumeSession();
+      await _flush();
+      final resume = channel.sentJson.last;
+      expect(resume['command'], 'session.resume');
+      channel.emit(
+        _response(
+          resume,
+          command: 'session.resume',
+          result: <String, Object?>{'resumed': true, 'paused': false},
+        ),
+      );
+      await resuming;
+      expect(controller.state.composer.isPaused, isFalse);
+
+      final compacting = controller.compactSession(
+        instructions: 'Keep the current implementation plan.',
+      );
+      await _flush();
+      final compact = channel.sentJson.last;
+      expect(compact['command'], 'session.compact');
+      expect(compact['args'], <String, Object?>{
+        'instructions': 'Keep the current implementation plan.',
+      });
+      channel.emit(
+        _response(
+          compact,
+          command: 'session.compact',
+          result: <String, Object?>{'compacted': true},
+        ),
+      );
+      await compacting;
+    },
+  );
 
   test(
     'projects terminal, files, audit, and preview developer state',

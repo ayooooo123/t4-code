@@ -22,14 +22,17 @@ import {
 	type HelloFrame,
 	type HostId,
 	IMAGE_UPLOAD_CHUNK_BYTES,
+	MAX_ARRAY_ITEMS,
 	type ImageId,
 	type PendingAttentionItem,
 	type PromptImageMimeType,
 	type ProviderTransportState,
 	parseBounded,
+	type OperationCapability,
 	projectId,
 	type ResultFrame,
 	requiredCapability,
+	revision as wireRevision,
 	type ServerFrame,
 	type SessionId,
 	type SessionImageReadArguments,
@@ -90,8 +93,9 @@ import {
 	sameIdentity,
 	unlinkIfExists,
 } from "./ownership.ts";
+import { OfficialOmpCapabilityAdapter, OfficialOmpOperationError } from "./official-omp-capabilities.ts";
 import { SessionProjection } from "./projection.ts";
-import { BunRemoteListener, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
+import { BunRemoteListener, createInternalListenerPlan, createListenerPlan, createServeProxyPlan } from "./remote/listener.ts";
 import type { RemoteConnection, RemoteListenerConfig } from "./remote/types.ts";
 import { BunRpcChildFactory, RpcChildSupervisor } from "./rpc-child.ts";
 import type {
@@ -686,6 +690,7 @@ export function appserverSupportedFeatures(
 	const unsupportedAdditiveFeatures = new Set(["host.watch", "session.watch"]);
 	const implementedFeatures = new Set<string>([
 		"resume",
+		"session.delta",
 		"prompt.images",
 		"agent.transcript",
 		"session.observer",
@@ -756,6 +761,7 @@ export class LocalAppserver implements AppserverHandle {
 	#createdPending = new Map<SessionId, { record: SessionRecord; refreshesRemaining: number }>();
 	#projections = new Map<SessionId, SessionProjection>();
 	#supervisors = new Map<SessionId, RpcChildSupervisor>();
+	#baseOperationCapabilities: readonly OperationCapability[];
 	#externalRuntimes = new Map<SessionId, ExternalRuntimeOwner>();
 	readonly #openingExternalRuntimes = new Map<string, number>();
 	readonly #archivingWorkspaces = new Set<string>();
@@ -822,6 +828,7 @@ export class LocalAppserver implements AppserverHandle {
 	#partialMarker?: { device: number; inode: number };
 	#ompVersion: string;
 	#ompBuild: string;
+	#rpcDialect: NonNullable<AppserverOptions["rpcDialect"]>;
 	#appserverVersion: string;
 	#appserverBuild: string;
 	#supportedFeatures: Set<string>;
@@ -829,6 +836,7 @@ export class LocalAppserver implements AppserverHandle {
 	#supportedCapabilities: Set<string>;
 	#projectRootForProject?: AppserverOptions["projectRootForProject"];
 	#projectRevealer?: AppserverOptions["projectRevealer"];
+	#claimLocklessSessions: boolean;
 	#runtimeAdapters?: RuntimeAdapterRegistry;
 	#workspaceAuthority?: WorkspaceAuthority;
 	#workspaceTargetPathForProject?: AppserverOptions["workspaceTargetPathForProject"];
@@ -877,6 +885,7 @@ export class LocalAppserver implements AppserverHandle {
 		this.#transcriptSearch = options.transcriptSearchAuthority;
 		this.#projectRootForProject = options.projectRootForProject;
 		this.#projectRevealer = options.projectRevealer;
+		this.#claimLocklessSessions = options.claimLocklessSessions === true;
 		this.#runtimeAdapters = options.runtimeAdapters;
 		this.#workspaceAuthority = options.workspaceAuthority;
 		this.#workspaceTargetPathForProject = options.workspaceTargetPathForProject;
@@ -887,7 +896,8 @@ export class LocalAppserver implements AppserverHandle {
 			? new TranscriptImageReader({ root: options.transcriptImageRoot })
 			: undefined;
 		this.#lockStatus = options.lockStatus ?? (() => "missing");
-		this.#factory = options.childFactory ?? new BunRpcChildFactory(options.rpcChildInvocation, this.#imageUploads.root);
+		this.#factory = options.childFactory ??
+			new BunRpcChildFactory(options.rpcChildInvocation, this.#imageUploads.root, options.rpcChildEnvironment);
 		this.#ringSize = options.ringSize ?? 256;
 		if (options.lockStatus && !options.lockCheck)
 			this.#lockCheck = () => {
@@ -910,6 +920,8 @@ export class LocalAppserver implements AppserverHandle {
 			throw new Error("usageReadTimeoutMs must be between 1 and 60000");
 		this.#ompVersion = options.ompVersion ?? "local";
 		this.#ompBuild = options.ompBuild ?? "local";
+		this.#rpcDialect = options.rpcDialect ?? "fork";
+		this.#baseOperationCapabilities = new OfficialOmpCapabilityAdapter(this.#ompVersion).operations();
 		this.#appserverVersion = options.appserverVersion ?? "0.1.0";
 		this.#appserverBuild = options.appserverBuild ?? "local";
 		this.#supportedFeatures = new Set(appserverSupportedFeatures(options));
@@ -953,10 +965,65 @@ export class LocalAppserver implements AppserverHandle {
 		if (this.#operations?.hasCommand(command)) return true;
 		return (
 			this.#handlers.has(command) ||
-			DIRECT_SESSION_RPC_COMMANDS.has(command) ||
+			(DIRECT_SESSION_RPC_COMMANDS.has(command) && this.#directRpcCommandSupported(command)) ||
 			command === SESSION_CANCEL_COMMAND ||
 			command === AGENT_CANCEL_COMMAND
 		);
+	}
+
+	#directRpcCommandSupported(command: string): boolean {
+		return (
+			this.#rpcDialect === "fork" ||
+			!["session.retry", "session.pause", "session.resume", "session.fast.set"].includes(command)
+		);
+	}
+
+	#directRpcCommand(command: CommandFrame): Record<string, unknown> | undefined {
+		if (!this.#directRpcCommandSupported(command.command)) return undefined;
+		const type =
+			command.command === "session.retry"
+				? "retry"
+				: command.command === "session.pause"
+					? "pause"
+					: command.command === "session.resume"
+						? "resume"
+						: command.command === "session.compact"
+							? "compact"
+							: command.command === "session.rename"
+								? "set_session_name"
+								: command.command === "session.model.set"
+									? "set_model"
+									: command.command === "session.thinking.set"
+										? "set_thinking_level"
+										: "set_fast";
+		if (command.command === "session.compact") return { type, customInstructions: command.args.instructions };
+		if (command.command === "session.rename") return { type, name: command.args.name };
+		if (command.command === "session.model.set") {
+			if (this.#rpcDialect === "official-17.0.6") {
+				if (
+					command.args.persistence !== "session" ||
+					typeof command.args.selector !== "string" ||
+					command.args.role !== undefined
+				)
+					return undefined;
+				const separator = command.args.selector.indexOf("/");
+				if (separator <= 0 || separator === command.args.selector.length - 1) return undefined;
+				return {
+					type,
+					provider: command.args.selector.slice(0, separator),
+					modelId: command.args.selector.slice(separator + 1),
+				};
+			}
+			return {
+				type,
+				selector: command.args.selector,
+				role: command.args.role,
+				persist: command.args.persistence === "settings",
+			};
+		}
+		if (command.command === "session.thinking.set") return { type, level: command.args.level };
+		if (command.command === "session.fast.set") return { type, enabled: command.args.enabled };
+		return { type };
 	}
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -1073,9 +1140,11 @@ export class LocalAppserver implements AppserverHandle {
 				const listener =
 					this.#remoteListener ??
 					new BunRemoteListener(
-						this.#remoteEndpoint.serveProxy === true
-							? createServeProxyPlan(this.#remoteEndpoint)
-							: createListenerPlan(this.#remoteEndpoint),
+						this.#remoteEndpoint.internalPeerNodeId
+							? createInternalListenerPlan(this.#remoteEndpoint)
+							: this.#remoteEndpoint.serveProxy === true
+								? createServeProxyPlan(this.#remoteEndpoint)
+								: createListenerPlan(this.#remoteEndpoint),
 						{
 							connected: connection => this.#remoteConnected(connection),
 							message: (connection, message) => this.#remoteMessage(connection, message),
@@ -1857,40 +1926,18 @@ export class LocalAppserver implements AppserverHandle {
 					outcome = { frame: response(this.hostId, command, true, { accepted: true }) };
 				}
 			} else if (DIRECT_SESSION_RPC_COMMANDS.has(command.command)) {
+				const rpcCommand = this.#directRpcCommand(command);
+				if (!rpcCommand) {
+					outcome = {
+						frame: response(this.hostId, command, false, undefined, {
+							code: "unsupported",
+							message: "command is unavailable in the official OMP RPC runtime",
+						}),
+					};
+					return this.finish(command, outcome, idempotency);
+				}
 				const supervisor = await this.ensureSupervisor(command.sessionId!);
-				const type =
-					command.command === "session.retry"
-						? "retry"
-						: command.command === "session.pause"
-							? "pause"
-							: command.command === "session.resume"
-								? "resume"
-								: command.command === "session.compact"
-									? "compact"
-									: command.command === "session.rename"
-										? "set_session_name"
-										: command.command === "session.model.set"
-											? "set_model"
-											: command.command === "session.thinking.set"
-												? "set_thinking_level"
-												: "set_fast";
-				const args =
-					command.command === "session.compact"
-						? { customInstructions: command.args.instructions }
-						: command.command === "session.rename"
-							? { name: command.args.name }
-							: command.command === "session.model.set"
-								? {
-										selector: command.args.selector,
-										role: command.args.role,
-										persist: command.args.persistence === "settings",
-									}
-								: command.command === "session.thinking.set"
-									? { level: command.args.level }
-									: command.command === "session.fast.set"
-										? { enabled: command.args.enabled }
-										: {};
-				const result = await supervisor.call({ type, ...args }, command.requestId, controller.signal);
+				const result = await supervisor.call(rpcCommand, command.requestId, controller.signal);
 				if (!result.success)
 					outcome = {
 						frame: response(this.hostId, command, false, undefined, {
@@ -2072,7 +2119,41 @@ export class LocalAppserver implements AppserverHandle {
 					abortSignal: controller.signal,
 				};
 				const result = await this.#operations.dispatch(command, context);
-				outcome = { frame: response(this.hostId, command, true, result) };
+				if (command.command === "catalog.get") {
+					const catalog = result as typeof result & {
+						readonly revision: string;
+						readonly operations?: readonly OperationCapability[];
+					};
+					let runtimeOperations = this.#baseOperationCapabilities;
+					const attachedSessions = this.#attached.get(ws);
+					if (attachedSessions?.size === 1) {
+						const attachedSessionId = attachedSessions.values().next().value;
+						const supervisor = attachedSessionId ? this.#supervisors.get(attachedSessionId) : undefined;
+						if (supervisor)
+							runtimeOperations = await supervisor.refreshOperationCapabilities(
+								`catalog:${command.requestId}`,
+								controller.signal,
+							);
+					}
+					const operationsById = new Map<string, OperationCapability>();
+					for (const capability of catalog.operations ?? [])
+						operationsById.set(capability.operationId, capability);
+					for (const capability of runtimeOperations) operationsById.set(capability.operationId, capability);
+					const operations = [...operationsById.values()];
+					if (operations.length > MAX_ARRAY_ITEMS)
+						throw Object.assign(new Error("catalog operation limit exceeded"), { code: "BOUNDS" });
+					const revisionHash = createHash("sha256")
+						.update(catalog.revision)
+						.update(JSON.stringify(operations))
+						.digest("hex");
+					outcome = {
+						frame: response(this.hostId, command, true, {
+							...catalog,
+							revision: wireRevision(`capabilities-${revisionHash}`),
+							operations,
+						}),
+					};
+				} else outcome = { frame: response(this.hostId, command, true, result) };
 			} else
 				outcome = {
 					frame: response(this.hostId, command, false, undefined, {
@@ -2092,6 +2173,7 @@ export class LocalAppserver implements AppserverHandle {
 			const externalRuntimeError = error instanceof ExternalRuntimeCommandError ? error : undefined;
 			const transcriptSearchError = error instanceof TranscriptSearchError ? error : undefined;
 			const transcriptPageError = error instanceof TranscriptPageError ? error : undefined;
+			const officialOmpOperationError = error instanceof OfficialOmpOperationError ? error : undefined;
 			const operation =
 				this.#operations &&
 				ws &&
@@ -2104,43 +2186,61 @@ export class LocalAppserver implements AppserverHandle {
 					"session.list",
 					"host.list",
 				].includes(command.command);
-			const code = transcriptPageError
-				? transcriptPageError.code
-				: transcriptSearchError
-				? transcriptSearchError.code
-				: externalRuntimeError
-					? "unsupported"
-					: imageError
-						? imageError.code
-						: command.command === "session.ui.respond"
-							? "ui_request_invalid"
-							: operation &&
-									error &&
-									typeof error === "object" &&
-									"code" in error &&
-									typeof error.code === "string"
-								? error.code
-								: "outcome_unknown";
+			const code = officialOmpOperationError
+				? officialOmpOperationError.code
+				: transcriptPageError
+					? transcriptPageError.code
+					: transcriptSearchError
+						? transcriptSearchError.code
+						: externalRuntimeError
+							? "unsupported"
+							: imageError
+								? imageError.code
+								: command.command === "session.ui.respond"
+									? "ui_request_invalid"
+									: operation &&
+											error &&
+											typeof error === "object" &&
+											"code" in error &&
+											typeof error.code === "string"
+										? error.code
+										: "outcome_unknown";
 			outcome = {
 				frame: response(this.hostId, command, false, undefined, {
 					code,
-					message: transcriptPageError
-						? transcriptPageError.code === "transcript_cursor_stale"
-							? "transcript page cursor is stale"
-							: transcriptPageError.code === "transcript_cursor_invalid"
-								? "transcript page cursor is invalid"
-								: "transcript paging is unavailable"
-						: transcriptSearchError
-						? transcriptSearchError.code === "transcript_anchor_not_found"
-							? "transcript entry no longer exists"
-							: transcriptSearchError.code === "transcript_cursor_stale"
-								? "transcript search cursor is stale"
-								: "transcript search cursor is invalid"
-						: (externalRuntimeError?.message ??
-							imageError?.message ??
-							(operation ? "operation failed" : "command failed")),
+					message: officialOmpOperationError
+						? officialOmpOperationError.message
+						: transcriptPageError
+							? transcriptPageError.code === "transcript_cursor_stale"
+								? "transcript page cursor is stale"
+								: transcriptPageError.code === "transcript_cursor_invalid"
+									? "transcript page cursor is invalid"
+									: "transcript paging is unavailable"
+							: transcriptSearchError
+								? transcriptSearchError.code === "transcript_anchor_not_found"
+									? "transcript entry no longer exists"
+									: transcriptSearchError.code === "transcript_cursor_stale"
+										? "transcript search cursor is stale"
+										: "transcript search cursor is invalid"
+								: (externalRuntimeError?.message ??
+									imageError?.message ??
+									(operation ? "operation failed" : "command failed")),
+					...(officialOmpOperationError
+						? {
+								details: {
+									operationId: officialOmpOperationError.operationId,
+									execution: officialOmpOperationError.execution,
+								},
+							}
+						: {}),
 				}),
-				unknown: !operation && !imageError && !externalRuntimeError && !transcriptSearchError && !transcriptPageError,
+				unknown:
+					!officialOmpOperationError &&
+					!operation &&
+					!imageError &&
+					!externalRuntimeError &&
+					!transcriptSearchError &&
+					!transcriptPageError,
 			};
 		} finally {
 			if (ws) this.#abortControllers.get(ws)?.delete(controller);
@@ -3459,6 +3559,8 @@ export class LocalAppserver implements AppserverHandle {
 				},
 			},
 			this.#factory.argv(record.path),
+			undefined,
+			this.#ompVersion,
 		);
 		this.#supervisors.set(sessionId, supervisor);
 		try {
@@ -3484,7 +3586,10 @@ export class LocalAppserver implements AppserverHandle {
 				return;
 			}
 			if (typeof raw !== "string") throw new Error("binary websocket frames are not supported");
-			const frame = decodeClientFrame(parseBounded(raw));
+			const input = parseBounded(raw);
+			const frame = ws.remote && this.#remotePolicy?.decodeClientFrame
+				? this.#remotePolicy.decodeClientFrame(input)
+				: decodeClientFrame(input);
 			if (frame.type === "command" && frame.command === "session.attach") attachingSessionId = frame.sessionId;
 			if (frame.type === "hello") {
 				if (this.#hello.has(ws)) throw new Error("hello already received");
@@ -4260,7 +4365,8 @@ export class LocalAppserver implements AppserverHandle {
 		}
 		let observer = this.#observers.get(sessionId);
 		if (!observer) {
-			const lockless = status === "missing" && !projection.value.ref.liveState?.sessionControl;
+			const lockless =
+				!this.#claimLocklessSessions && status === "missing" && !projection.value.ref.liveState?.sessionControl;
 			observer = new SessionTranscriptObserver(record.path, this.hostId);
 			this.#observers.set(sessionId, observer);
 			if (lockless) this.#locklessObservers.add(observer);
@@ -4310,7 +4416,26 @@ export class LocalAppserver implements AppserverHandle {
 			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
 			return;
 		}
-		const final = await observer.poll();
+		let final = await observer.poll();
+		let loaded = await supervisor.reconcileTranscript();
+		for (
+			let attempt = 0;
+			attempt < 4 &&
+			(!final.stable ||
+				final.transcript !== "live" ||
+				final.unresolvedPendingCount !== 0 ||
+				final.watermark.entryCount !== loaded?.entryCount ||
+				final.watermark.lastEntryId !== loaded.lastEntryId);
+			attempt += 1
+		) {
+			if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
+				await this.discardPromotionSupervisor(sessionId, supervisor);
+				return;
+			}
+			await Bun.sleep(10);
+			final = await observer.poll();
+			loaded = await supervisor.reconcileTranscript();
+		}
 		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
 			await this.discardPromotionSupervisor(sessionId, supervisor);
 			return;
@@ -4321,7 +4446,6 @@ export class LocalAppserver implements AppserverHandle {
 			return;
 		}
 		await this.applyObserverPoll(sessionId, projection, final);
-		const loaded = supervisor.loadedWatermark();
 		if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
 			await this.discardPromotionSupervisor(sessionId, supervisor);
 			return;
@@ -4413,7 +4537,12 @@ export class LocalAppserver implements AppserverHandle {
 	private async broadcastIndex(frame: ServerFrame): Promise<void> {
 		const sends: Array<Promise<boolean>> = [];
 		for (const client of this.#clients) {
-			if (!this.#hello.has(client) || !this.#clientCapabilities.get(client)?.has("sessions.read")) continue;
+			if (
+				!this.#hello.has(client) ||
+				!this.#clientCapabilities.get(client)?.has("sessions.read") ||
+				!this.#clientFeatures.get(client)?.has("session.delta")
+			)
+				continue;
 			sends.push(this.#sendFrame(client, frame));
 		}
 		await Promise.all(sends);

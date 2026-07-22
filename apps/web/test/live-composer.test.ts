@@ -29,6 +29,7 @@ import {
   type DurableEntry,
   type DurableEntryFrame,
   type LiveEventFrame,
+  type OperationCapability,
   type SessionSnapshotFrame,
   type SessionsFrame,
 } from "@t4-code/protocol";
@@ -139,18 +140,34 @@ function durableEntryFrame(seq: number, value: DurableEntry): DurableEntryFrame 
   };
 }
 
-function commandItem(name: string, capabilities?: readonly string[]): CatalogItem {
+function commandItem(
+  name: string,
+  capabilities?: readonly string[],
+  slashCommand = false,
+): CatalogItem {
   return {
     id: catalogId(`cmd-${name}`),
     kind: "command",
     name,
     description: `${name} command`,
     ...(capabilities === undefined ? {} : { capabilities: [...capabilities] }),
+    ...(slashCommand ? { metadata: { slashCommand: true } } : {}),
   };
 }
 
-function catalogFrame(rev: string, items: CatalogItem[]): CatalogFrame {
-  return { v: V, type: "catalog", hostId: hostId(HOST), revision: revision(rev), items };
+function catalogFrame(
+  rev: string,
+  items: CatalogItem[],
+  operations?: OperationCapability[],
+): CatalogFrame {
+  return {
+    v: V,
+    type: "catalog",
+    hostId: hostId(HOST),
+    revision: revision(rev),
+    items,
+    ...(operations === undefined ? {} : { operations }),
+  };
 }
 
 function pendingPromptSessionsFrame(
@@ -647,7 +664,10 @@ describe("stop affordance and slash catalog", () => {
     // empty (not the browser built-ins).
     expect(runtime.getSnapshot().slashCommands).toEqual([]);
 
-    shell.emitFrame({ targetId: "local", frame: catalogFrame("rev-1", [commandItem("compact")]) });
+    shell.emitFrame({
+      targetId: "local",
+      frame: catalogFrame("rev-1", [commandItem("compact", undefined, true)]),
+    });
     expect(runtime.getSnapshot().slashCommands?.map((command) => command.name)).toEqual([
       "/compact",
     ]);
@@ -655,8 +675,8 @@ describe("stop affordance and slash catalog", () => {
     shell.emitFrame({
       targetId: "local",
       frame: catalogFrame("rev-2", [
-        commandItem("review"),
-        commandItem("terminal", ["terminal.io"]),
+        commandItem("review", undefined, true),
+        commandItem("terminal", ["terminal.io"], true),
       ]),
     });
     const commands = runtime.getSnapshot().slashCommands ?? [];
@@ -667,6 +687,80 @@ describe("stop affordance and slash catalog", () => {
       "Needs terminal access on this host",
     );
     expect(commands.find((command) => command.name === "/review")?.disabledReason).toBeNull();
+  });
+
+  it("uses official OMP operation capabilities instead of mistaking typed commands for slash commands", async () => {
+    const { shell, runtime } = await startedRuntime();
+    shell.emitFrame({
+      targetId: "local",
+      frame: catalogFrame(
+        "official-operations",
+        [commandItem("session.cancel")],
+        [
+          {
+            operationId: "session.prompt" as OperationCapability["operationId"],
+            label: "Prompt",
+            execution: "typed",
+            supported: true,
+          },
+          {
+            operationId: "slash.compact" as OperationCapability["operationId"],
+            label: "/compact",
+            description: "Compact the active conversation",
+            execution: "headless",
+            supported: true,
+            metadata: { aliases: ["compress"], inlineHint: "[focus]" },
+          },
+          {
+            operationId: "slash.plan" as OperationCapability["operationId"],
+            label: "/plan",
+            description: "Toggle plan mode",
+            execution: "terminal-only",
+            supported: false,
+            disabledReason: {
+              code: "terminal_only",
+              message: "/plan requires the OMP terminal interface.",
+            },
+          },
+        ],
+      ),
+    });
+
+    const commands = runtime.getSnapshot().slashCommands ?? [];
+    expect(commands.map((command) => command.name)).toEqual(["/compact", "/plan"]);
+    expect(commands[0]?.aliases).toEqual(["/compress"]);
+    expect(commands[0]?.argsHint).toBe("[focus]");
+    expect(commands[0]?.disabledReason).toBeNull();
+    expect(commands[1]?.disabledReason).toBe("/plan requires the OMP terminal interface.");
+  });
+
+  it("treats an explicit empty operation list as authoritative", async () => {
+    const { shell, runtime } = await startedRuntime();
+    shell.emitFrame({
+      targetId: "local",
+      frame: catalogFrame("empty-operations", [commandItem("/legacy")], []),
+    });
+
+    expect(runtime.getSnapshot().slashCommands).toEqual([]);
+  });
+
+  it("disables operation-derived commands for read-only clients", async () => {
+    const { shell, runtime } = await startedRuntime([]);
+    shell.emitFrame({
+      targetId: "local",
+      frame: catalogFrame("read-only-operations", [], [
+        {
+          operationId: "slash.compact" as OperationCapability["operationId"],
+          label: "/compact",
+          execution: "headless",
+          supported: true,
+        },
+      ]),
+    });
+
+    expect(runtime.getSnapshot().slashCommands?.[0]?.disabledReason).toBe(
+      "Not granted on this host",
+    );
   });
 });
 
@@ -1436,8 +1530,8 @@ describe("session lifecycle", () => {
       targetId: "local",
       frame: catalogFrame("rev-2", [
         commandItem("session.cancel"),
-        commandItem("compact"),
-        commandItem("retry"),
+        commandItem("compact", undefined, true),
+        commandItem("retry", undefined, true),
       ]),
     });
     shell.emitFrame({ targetId: "local", frame: indexed(1, "active") });

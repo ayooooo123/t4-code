@@ -1,0 +1,1233 @@
+<!doctype html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=yes"
+    />
+    <title>T4 final-product architecture</title>
+    <style>
+      html {
+        color: #1a1a1a;
+        background-color: #fdfdfd;
+      }
+      body {
+        margin: 0 auto;
+        max-width: 72rem;
+        padding: 3rem clamp(1rem, 5vw, 4rem);
+        font-family:
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        line-height: 1.55;
+        hyphens: none;
+        overflow-wrap: normal;
+        text-rendering: optimizeLegibility;
+        font-kerning: normal;
+      }
+      @media (max-width: 600px) {
+        body {
+          font-size: 0.9em;
+          padding: 12px;
+        }
+        h1 {
+          font-size: 1.8em;
+        }
+      }
+      @media print {
+        html {
+          background-color: white;
+        }
+        body {
+          background-color: transparent;
+          color: black;
+          font-size: 12pt;
+        }
+        p,
+        h2,
+        h3 {
+          orphans: 3;
+          widows: 3;
+        }
+        h2,
+        h3,
+        h4 {
+          page-break-after: avoid;
+        }
+      }
+      p {
+        margin: 1em 0;
+      }
+      a {
+        color: #1a1a1a;
+      }
+      a:visited {
+        color: #1a1a1a;
+      }
+      img {
+        max-width: 100%;
+      }
+      svg {
+        height: auto;
+        max-width: 100%;
+      }
+      h1,
+      h2,
+      h3,
+      h4,
+      h5,
+      h6 {
+        margin-top: 1.4em;
+      }
+      h5,
+      h6 {
+        font-size: 1em;
+        font-style: italic;
+      }
+      h6 {
+        font-weight: normal;
+      }
+      ol,
+      ul {
+        padding-left: 1.7em;
+        margin-top: 1em;
+      }
+      li > ol,
+      li > ul {
+        margin-top: 0;
+      }
+      blockquote {
+        margin: 1em 0 1em 1.7em;
+        padding-left: 1em;
+        border-left: 2px solid #e6e6e6;
+        color: #606060;
+      }
+      code {
+        font-family: Menlo, Monaco, Consolas, "Lucida Console", monospace;
+        font-size: 85%;
+        margin: 0;
+        hyphens: manual;
+      }
+      pre {
+        margin: 1em 0;
+        overflow: auto;
+      }
+      pre code {
+        padding: 0;
+        overflow: visible;
+        overflow-wrap: normal;
+      }
+      .sourceCode {
+        background-color: transparent;
+        overflow: visible;
+      }
+      hr {
+        border: none;
+        border-top: 1px solid #1a1a1a;
+        height: 1px;
+        margin: 1em 0;
+      }
+      table {
+        margin: 1em 0;
+        border-collapse: collapse;
+        width: 100%;
+        overflow-x: auto;
+        display: block;
+        font-variant-numeric: lining-nums tabular-nums;
+      }
+      table caption {
+        margin-bottom: 0.75em;
+      }
+      tbody {
+        margin-top: 0.5em;
+        border-top: 1px solid #1a1a1a;
+        border-bottom: 1px solid #1a1a1a;
+      }
+      th,
+      td {
+        padding: 0.5rem 0.75rem;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        border-top: 1px solid #1a1a1a;
+      }
+      @media (min-width: 700px) {
+        th:first-child,
+        td:first-child {
+          width: 18%;
+          min-width: 10rem;
+        }
+      }
+      header {
+        margin-bottom: 4em;
+        text-align: center;
+      }
+      #TOC li {
+        list-style: none;
+      }
+      #TOC ul {
+        padding-left: 1.3em;
+      }
+      #TOC > ul {
+        padding-left: 0;
+      }
+      #TOC a:not(:hover) {
+        text-decoration: none;
+      }
+      code {
+        white-space: pre-wrap;
+      }
+      span.smallcaps {
+        font-variant: small-caps;
+      }
+      div.columns {
+        display: flex;
+        gap: min(4vw, 1.5em);
+      }
+      div.column {
+        flex: auto;
+        overflow-x: auto;
+      }
+      div.hanging-indent {
+        margin-left: 1.5em;
+        text-indent: -1.5em;
+      }
+      /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+      ul.task-list[class] {
+        list-style: none;
+      }
+      ul.task-list li input[type="checkbox"] {
+        font-size: inherit;
+        width: 0.8em;
+        margin: 0 0.8em 0.2em -1.6em;
+        vertical-align: middle;
+      }
+      .display.math {
+        display: block;
+        text-align: center;
+        margin: 0.5rem auto;
+      }
+    </style>
+  </head>
+  <body>
+    <header id="title-block-header">
+      <h1 class="title">T4 final-product architecture</h1>
+      <p>Conventional Kubernetes Operator and separately deployable T4 API v1</p>
+    </header>
+    <nav id="TOC" role="doc-toc" aria-label="Table of contents">
+      <ul>
+        <li><a href="#status">Status and decision</a></li>
+        <li><a href="#scope-and-terms">Scope and terms</a></li>
+        <li><a href="#implementation-baseline">Implementation baseline</a></li>
+        <li><a href="#architectural-invariants">Architectural invariants</a></li>
+        <li><a href="#topology">Topology and module boundaries</a></li>
+        <li><a href="#reconciliation">Kubernetes reconciliation contract</a></li>
+        <li><a href="#crd-lifecycle">CRD lifecycle</a></li>
+        <li><a href="#api-contract">T4 API v1 and gateway contract</a></li>
+        <li><a href="#durable-ledger">Durable intent, event, and command ledger</a></li>
+        <li><a href="#runtime-provider">Runtime provider and OMP boundary</a></li>
+        <li><a href="#client-flows">Terzo and ACP compatibility flows</a></li>
+        <li><a href="#workspace-recovery">Workspace, recovery, and backup</a></li>
+        <li><a href="#security">Security boundaries</a></li>
+        <li><a href="#distribution">Distribution and lifecycle</a></li>
+        <li><a href="#observability">Observability and truthful capabilities</a></li>
+        <li><a href="#implementation-ledger">Implementation line items</a></li>
+        <li><a href="#release-proof">Release proof and open decisions</a></li>
+      </ul>
+    </nav>
+
+    <main>
+      <h2 id="status">Status and decision</h2>
+      <p>
+        This hand-maintained document supersedes the prior
+        <em>T4 Code local and managed architecture</em> and is the canonical
+        architecture decision for the managed T4 product. It defines a
+        conventional Kubernetes Operator and a separately deployable,
+        horizontally scalable, versioned T4 API. It is a target contract, not a
+        claim that every described component is already implemented. The
+        implementation baseline and the new work are called out explicitly
+        below.
+      </p>
+      <p>
+        The product boundary is authenticated HTTPS <strong>T4 API v1</strong>.
+        External clients do not call the Kubernetes controller, do not receive
+        Kubernetes credentials, do not mutate custom resources, and do not speak
+        a private runtime protocol. PostgreSQL is authoritative for accepted
+        intent and product events. Kubernetes custom resources are a durable
+        projection of that committed intent. The controller reconciles that
+        projection into Kubernetes resources; it never serves product clients or
+        stores product events.
+      </p>
+
+      <h2 id="scope-and-terms">Scope and terms</h2>
+      <table>
+        <thead>
+          <tr><th>Term</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>T4 API</td>
+            <td>
+              The authenticated HTTPS product service implementing T4 API v1
+              from executable OpenAPI. It owns request validation, authorization,
+              idempotency, intent and event persistence, watches, and public
+              capability discovery.
+            </td>
+          </tr>
+          <tr>
+            <td>Gateway</td>
+            <td>
+              The deployable edge/API module. It terminates or receives verified
+              identity, applies scope policy, commits intent to PostgreSQL, then
+              projects committed intent into namespaced T4 custom resources.
+            </td>
+          </tr>
+          <tr>
+            <td>Controller</td>
+            <td>
+              The Kubernetes reconciliation process. It watches T4 custom
+              resources and owned children, converges desired state, and reports
+              bounded infrastructure status through Kubernetes status.
+            </td>
+          </tr>
+          <tr>
+            <td>Runtime provider</td>
+            <td>
+              The typed internal boundary that starts, supervises, fences, and
+              communicates with a pinned supported OMP runtime. Product modules
+              do not depend on OMP wire details directly.
+            </td>
+          </tr>
+          <tr>
+            <td>Terzo</td>
+            <td>
+              The T4 client. Terzo consumes the generated public SDK and never
+              imports controller packages or Kubernetes resource clients.
+            </td>
+          </tr>
+          <tr>
+            <td>ACP adapter</td>
+            <td>
+              An optional local stdio compatibility process for standard editor
+              clients. It speaks Agent Client Protocol 1.2.1 using JSON-RPC 2.0
+              NDJSON on local stdio and translates to T4 API v1 over HTTPS. ACP is
+              not the remote network API.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="implementation-baseline">Implementation baseline</h2>
+      <h3 id="merged-foundations">Already-merged foundations</h3>
+      <p>
+        The following are present foundations and must be evolved rather than
+        described as future inventions:
+      </p>
+      <ul>
+        <li>
+          Namespaced <code>cluster.t4.dev/v1alpha1</code>
+          <code>T4ClusterHost</code>, <code>T4Workspace</code>, and
+          <code>T4Session</code> custom resources with structural schemas.
+        </li>
+        <li>
+          Status conditions and <code>observedGeneration</code>, deletion
+          finalizers, owner references, leader election, bounded requeues, and
+          namespace-scoped controller RBAC.
+        </li>
+        <li>
+          Helm packaging, controller and server images, gateway foundations,
+          network policies, health endpoints, metrics, and observability
+          foundations.
+        </li>
+        <li>
+          Durable-command concepts, owner epochs and fencing, bounded protocol
+          frames, cursor recovery, disposable runtimes, and shared-filesystem
+          eligibility checks.
+        </li>
+      </ul>
+      <h3 id="new-work">New work required by this decision</h3>
+      <ul>
+        <li>
+          Executable T4 API v1 OpenAPI, generated public SDKs, conformance
+          fixtures, version and capability discovery, and stable error schemas.
+        </li>
+        <li>
+          PostgreSQL migrations for durable intent, idempotency, ordered events,
+          commands, cursors, and a projection/outbox worker. Existing in-memory
+          idempotency is not sufficient for the final product.
+        </li>
+        <li>
+          A clean controller-only contract, the typed OMP runtime provider,
+          Terzo migration to the public SDK, and the optional local ACP adapter.
+        </li>
+        <li>
+          Signed multi-architecture OCI artifacts, SBOM and provenance,
+          compatibility preflight, supported migration and rollback procedures,
+          and physical remote-client and HA evidence.
+        </li>
+      </ul>
+
+      <h2 id="architectural-invariants">Architectural invariants</h2>
+      <ol>
+        <li>
+          <strong>PostgreSQL authority.</strong> A product mutation is accepted
+          only when its intent and idempotency record commit in PostgreSQL.
+          Kubernetes is a durable desired-state projection, not the product event
+          ledger.
+        </li>
+        <li>
+          <strong>Operator-only reconciliation.</strong> The controller has no
+          public listener. It reconciles custom resources and Kubernetes children
+          and writes status; it does not authenticate product users, serve
+          watches, or retain product commands or events.
+        </li>
+        <li>
+          <strong>Commit before projection.</strong> The gateway may create or
+          patch a custom resource only after the corresponding database
+          transaction commits. A projection can be retried from the durable
+          outbox without accepting the intent again.
+        </li>
+        <li>
+          <strong>Stable ownership.</strong> Every runtime owner carries a
+          monotonically increasing owner epoch. Dispatch includes that epoch;
+          stale owners are fenced before replacement owners may act.
+        </li>
+        <li>
+          <strong>Disposable runtime.</strong> Runtime pods and local child
+          processes are replaceable compute. Durable intent, events, cursors, and
+          workspace data survive their loss.
+        </li>
+        <li>
+          <strong>Reconnectable observation.</strong> Watches use opaque durable
+          cursors. Reconnect resumes after the last acknowledged cursor; cancel is
+          explicit and bounded; expired cursors return a typed resync requirement.
+        </li>
+        <li>
+          <strong>Shared-filesystem safety.</strong> A managed runtime starts only
+          when the selected workspace claim is bound and satisfies the reviewed
+          ReadWriteMany contract. Labels do not make an unsafe backend safe.
+        </li>
+        <li>
+          <strong>Truthful capabilities.</strong> Discovery distinguishes
+          supported, enabled, authorized, and currently available behavior. An
+          unavailable dependency removes or disables a capability; it never
+          causes a successful placeholder response.
+        </li>
+        <li>
+          <strong>Bounded work.</strong> Request bodies, frames, queues, retries,
+          watches, log payloads, and child-process output are bounded. Backoff is
+          capped and jittered; terminal conditions do not busy-loop.
+        </li>
+        <li>
+          <strong>No implicit exactly-once claim.</strong> Database acceptance is
+          idempotent. Runtime side effects use command identifiers, state
+          transitions, owner fencing, and reconciliation to prevent known
+          duplicate dispatch; uncertain crash windows remain visible and are
+          recovered according to the command contract.
+        </li>
+      </ol>
+
+      <h2 id="topology">Topology and module boundaries</h2>
+      <pre aria-label="Managed topology"><code>Terzo ───────────────┐
+standard editor ─┐     │  authenticated HTTPS T4 API v1
+                 ▼     ▼
+          local ACP adapter (optional)       identity provider
+                 │                              │
+                 └──────────────┬───────────────┘
+                                ▼
+                     T4 API / Gateway replicas
+                     ├─ OpenAPI + SDK contract
+                     ├─ authn/authz + idempotency
+                     ├─ intent/event/watch service
+                     └─ projection/outbox worker
+                                │
+                  ┌─────────────┴──────────────┐
+                  ▼                            ▼
+             PostgreSQL                 Kubernetes API
+        authoritative product       cluster.t4.dev/v1alpha1
+         ledger and cursors          desired-state projection
+                                               │ watch
+                                               ▼
+                                      T4 Controller replicas
+                                      (one elected leader)
+                                               │ reconcile
+                                      ┌────────┴─────────┐
+                                      ▼                  ▼
+                              PVC/Service/Pod      status/conditions
+                                      │
+                                      ▼
+                               runtime provider
+                                      │ pinned local RPC/ACP seam
+                                      ▼
+                                  official OMP</code></pre>
+      <p>
+        T4 API replicas and controller replicas are independently deployable,
+        scalable, and upgradeable within the compatibility matrix. They may share
+        a release bundle, but they are separate Deployments, ServiceAccounts,
+        network policies, health checks, and failure domains. PostgreSQL remains
+        available if an API replica or controller leader is replaced. No edge
+        route targets the controller.
+      </p>
+      <h3 id="module-responsibilities">Responsibility matrix</h3>
+      <table>
+        <thead>
+          <tr><th>Module</th><th>Owns</th><th>Must not own</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>T4 API / Gateway</td>
+            <td>
+              Public versioning, OpenAPI, authentication, authorization,
+              idempotency, PostgreSQL transactions, ordered events, cursors,
+              watches, cancellation, and CR projection after commit.
+            </td>
+            <td>Pod convergence, child owner references, or direct OMP details.</td>
+          </tr>
+          <tr>
+            <td>Controller</td>
+            <td>
+              CR and owned-resource watches, finalization, desired child
+              resources, status conditions, observed generation, and bounded
+              reconciliation.
+            </td>
+            <td>
+              External authentication, public HTTP, product event storage,
+              idempotency, command history, or client cursors.
+            </td>
+          </tr>
+          <tr>
+            <td>Runtime provider / host</td>
+            <td>
+              Pinned OMP lifecycle, typed operations, bounded transport,
+              heartbeat, epoch validation, command execution, and normalized
+              runtime events.
+            </td>
+            <td>Public API schemas, user authorization, or CRD conversion.</td>
+          </tr>
+          <tr>
+            <td>Terzo / ACP adapter</td>
+            <td>
+              Public SDK use, local presentation, reconnect, cursor storage, and
+              explicit user cancellation.
+            </td>
+            <td>Kubernetes credentials, controller imports, or runtime secrets.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="reconciliation">Kubernetes reconciliation contract</h2>
+      <p>
+        Reconciliation follows ordinary Kubernetes level-based semantics. It is
+        idempotent and derives work from current desired and observed state, not
+        from an assumption that every watch event is delivered exactly once.
+      </p>
+      <ol>
+        <li>
+          Watches on a primary T4 resource and its owned secondary resources
+          enqueue a namespaced key. The active leader fetches the latest object;
+          a missing object completes without error.
+        </li>
+        <li>
+          The reconciler validates the structural spec and referenced host,
+          runtime profile, storage eligibility, and policy. Invalid or terminal
+          inputs produce a stable condition and do not use rapid retries.
+        </li>
+        <li>
+          For a live object, the controller adds the documented finalizer before
+          creating dependent state. It computes desired children and applies or
+          patches them with deterministic names, labels, field ownership, and
+          controller owner references where lifecycle ownership is intended.
+        </li>
+        <li>
+          For deletion, the controller performs retention-aware cleanup. A
+          <code>T4Session</code> finalizer waits for its Pod and Service to be
+          absent. A <code>T4Workspace</code> with delete retention waits for its
+          PVC to disappear; retain retention removes the owning reference and
+          records retention before finalizer removal.
+        </li>
+        <li>
+          Status is patched separately from spec. Conditions have stable type,
+          status, reason, and concise message fields. The controller advances
+          <code>status.observedGeneration</code> only after evaluating that
+          generation; readiness is never inferred from generation alone.
+        </li>
+        <li>
+          Optimistic conflicts and transient API failures retry through the work
+          queue. Dependency polling uses bounded, capped, jittered requeues.
+          Successful convergence relies on watches rather than periodic churn.
+        </li>
+      </ol>
+      <p>
+        The controller may read projection identifiers placed on a CR by the
+        gateway and report Kubernetes status correlated to that projection. It
+        must not reach into the product ledger to accept commands or manufacture
+        product events. The API converts correlated Kubernetes status into
+        public events under its own transaction and schema rules.
+      </p>
+
+      <h2 id="crd-lifecycle">CRD group, version, storage, and conversion lifecycle</h2>
+      <p>
+        <code>cluster.t4.dev/v1alpha1</code> remains the current served and storage
+        API for the namespaced <code>T4ClusterHost</code>,
+        <code>T4Workspace</code>, and <code>T4Session</code> resources. Current
+        changes are additive and structural: new fields are optional or have
+        safe schema defaults, unknown fields are not used as an extension
+        mechanism, and existing persisted objects must continue to validate.
+      </p>
+      <ul>
+        <li>
+          Helm installs workloads but is not trusted to upgrade CRDs. Release
+          automation applies reviewed CRD manifests server-side before workload
+          rollout and waits for each CRD to be Established. A validation failure
+          stops the upgrade; automation never force-replaces a CRD or deletes a
+          stored version.
+        </li>
+        <li>
+          A <code>v1beta1</code> proposal requires separate schema, compatibility,
+          defaulting, conversion, round-trip, and downgrade review. Until that
+          review passes, <code>v1alpha1</code> remains both served and storage.
+        </li>
+        <li>
+          When conversion is approved, deploy and prove a highly available
+          conversion webhook before making the new version served. Conversion
+          must preserve hub data and round-trip every fixture between the old and
+          new versions without semantic loss.
+        </li>
+        <li>
+          Change the storage version only after all supported controllers and
+          gateways can read both versions. Run a storage migration, verify
+          <code>status.storedVersions</code> and object counts, and retain the old
+          served version through the documented rollback window.
+        </li>
+        <li>
+          Remove an old served or stored version only in a later incompatible
+          lifecycle step after backups, migration evidence, compatibility-window
+          expiry, and an explicit operator action. Rollback never requires an
+          older binary to read a schema it does not support.
+        </li>
+      </ul>
+
+      <h2 id="api-contract">T4 API v1 and gateway contract</h2>
+      <p>
+        The remote contract is an executable OpenAPI document served and versioned
+        with T4 API v1. The checked-in specification is the source for generated
+        SDKs, request/response validators, examples, fixtures, and compatibility
+        checks. Hand-written client DTOs are prohibited where generated public
+        types exist.
+      </p>
+      <h3 id="api-surface">Required v1 surface</h3>
+      <ul>
+        <li>
+          Version and capability discovery, including server build, API versions,
+          feature identifiers, bounds, enablement, authorization, availability,
+          and deprecation metadata.
+        </li>
+        <li>
+          Workspace and session intent creation, retrieval, listing, mutation,
+          deletion, and cancellation with scoped principals and stable resource
+          identifiers.
+        </li>
+        <li>
+          Command submission with a required idempotency key and typed accepted,
+          rejected, conflict, unavailable, and indeterminate states.
+        </li>
+        <li>
+          Snapshot reads and ordered watch streams with opaque cursors,
+          reconnect-after-cursor, heartbeat, explicit cancellation, bounded
+          batches and frames, and typed cursor expiry requiring resync.
+        </li>
+        <li>
+          Stable errors carrying a machine code, safe message, request ID, retry
+          classification, and field violations without exposing internals.
+        </li>
+      </ul>
+      <p>
+        Every mutation authenticates a principal, authorizes tenant, namespace,
+        resource, and action scope, validates advertised bounds, and records an
+        audit correlation ID. The same principal and idempotency key with the same
+        canonical request returns the original result. Reuse with a different
+        request is a typed conflict. Keys are isolated by principal and operation
+        scope and expire only according to a documented retention policy.
+      </p>
+      <p>
+        API and controller compatibility is explicit. Startup and readiness fail
+        closed when database schema, CRD served/storage versions, or runtime
+        provider versions are outside the supported matrix. Public capability
+        discovery exposes only behavior that the current compatible deployment
+        can actually complete.
+      </p>
+
+      <h2 id="durable-ledger">Durable intent, event, and command ledger</h2>
+      <h3 id="acceptance-order">Mutation acceptance ordering</h3>
+      <ol>
+        <li>Authenticate, authorize, bound, and canonically validate the request.</li>
+        <li>
+          Begin a PostgreSQL transaction and acquire the required aggregate or
+          command serialization lock.
+        </li>
+        <li>
+          Insert or resolve the unique scoped idempotency record. A matching
+          committed record returns its stored response; a mismatched fingerprint
+          fails with conflict.
+        </li>
+        <li>
+          Append immutable accepted intent and product event rows, allocate the
+          aggregate sequence and durable cursor, update the materialized current
+          state, and insert a projection/outbox row in the same transaction.
+        </li>
+        <li>Commit PostgreSQL before reporting acceptance.</li>
+        <li>
+          After commit, a retryable worker creates or patches the corresponding
+          custom resource with stable intent and projection identifiers. It then
+          records projection progress without rewriting accepted history.
+        </li>
+      </ol>
+      <p>
+        Per-aggregate sequence numbers and a globally comparable opaque cursor
+        order committed events. A watch transaction establishes a snapshot
+        boundary and cursor so that events cannot be silently lost between list
+        and watch. Clients acknowledge only cursors they have applied. Event
+        retention may compact old payloads only after retaining a snapshot and a
+        deterministic expired-cursor response.
+      </p>
+
+      <h3 id="command-state">Command state and ownership</h3>
+      <p>
+        A command has a durable identifier, idempotency scope, target session,
+        owner epoch, request fingerprint, timestamps, and an explicit state such
+        as accepted, projected, dispatching, running, succeeded, failed,
+        cancelled, or indeterminate. Transitions are conditional and append an
+        event. A worker may dispatch only after acquiring the session ownership
+        lease and recording the current epoch. Runtime acknowledgements must echo
+        command ID and epoch; stale epochs are rejected.
+      </p>
+      <p>
+        Cancellation is intent, not deletion of history. The ledger records the
+        request, the provider attempts bounded cancellation, and the final event
+        truthfully distinguishes cancelled-before-start, cancellation-confirmed,
+        already-completed, and cancellation-uncertain outcomes.
+      </p>
+
+      <h3 id="crash-windows">Crash-window behavior</h3>
+      <table>
+        <thead>
+          <tr><th>Window</th><th>Required recovery</th><th>Observable proof</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Before database commit</td>
+            <td>No intent is accepted and no CR may be mutated.</td>
+            <td>Retry with the same key can create exactly one accepted record.</td>
+          </tr>
+          <tr>
+            <td>After commit, before HTTP response</td>
+            <td>
+              The idempotency record returns the committed result; projection
+              proceeds from the durable outbox.
+            </td>
+            <td>Client retry returns the original resource and cursor.</td>
+          </tr>
+          <tr>
+            <td>After commit, before CR projection</td>
+            <td>A new worker safely retries the stable create or patch.</td>
+            <td>One logical projection exists and reaches correlated status.</td>
+          </tr>
+          <tr>
+            <td>After dispatch record, before runtime acknowledgement</td>
+            <td>
+              Recovery queries the provider by command ID when supported; it
+              never silently reports success or knowingly dispatches through a
+              stale epoch. Unresolvable outcomes become indeterminate.
+            </td>
+            <td>The event stream exposes the recovery or indeterminate state.</td>
+          </tr>
+          <tr>
+            <td>After runtime completion, before outcome commit</td>
+            <td>
+              Recovery obtains the durable provider result when available and
+              conditionally commits one terminal transition; otherwise it reports
+              indeterminate rather than inventing an outcome.
+            </td>
+            <td>At most one terminal ledger transition is committed.</td>
+          </tr>
+          <tr>
+            <td>Owner loss during execution</td>
+            <td>
+              Lease expiry advances the owner epoch, fences and terminates the old
+              runtime, then permits a replacement to recover durable session state.
+            </td>
+            <td>Old-epoch heartbeats, events, and outcomes are rejected.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="runtime-provider">Runtime provider and OMP boundary</h2>
+      <p>
+        OMP is behind one T4-owned typed runtime-provider interface. The provider
+        pins a tested official OMP release and one explicitly supported local
+        transport: the supported OMP RPC seam or ACP 1.2.1 where that operation
+        is available and verified. Transport selection is an implementation
+        detail and is never exposed as the remote product protocol.
+      </p>
+      <ul>
+        <li>
+          Launch uses an explicit executable, arguments, environment allowlist,
+          working directory, protocol version, maximum frame size, startup
+          deadline, and shutdown deadline. There is no unbounded process probing.
+        </li>
+        <li>
+          The provider maps sessions, prompts, questions, approvals, steering,
+          cancellation, commands, files, terminals, and runtime events into typed
+          T4 operations only when the pinned OMP seam proves them.
+        </li>
+        <li>
+          Capability discovery combines the pinned compatibility manifest with
+          live bounded discovery. Manifest-only behavior remains unavailable
+          until an executable probe passes; unknown operations fail closed.
+        </li>
+        <li>
+          The provider enforces command IDs and owner epochs on every operation,
+          bounds stdout and stderr, handles malformed frames as typed failures,
+          and never treats process exit as proof of command success.
+        </li>
+        <li>
+          Runtime hosts use a stable workspace mount, contain no authoritative
+          product state, and can be destroyed after events and outcomes are
+          durably acknowledged.
+        </li>
+      </ul>
+
+      <h2 id="client-flows">Terzo and ACP compatibility flows</h2>
+      <h3 id="terzo-flow">Terzo remote flow</h3>
+      <ol>
+        <li>Terzo authenticates and selects a T4 API endpoint.</li>
+        <li>
+          It calls version and capability discovery through the generated SDK and
+          rejects incompatible major versions or required unavailable features.
+        </li>
+        <li>
+          It creates or mutates intent with a persisted idempotency key. The API
+          commits intent before a CR projection and returns the accepted resource
+          and cursor.
+        </li>
+        <li>
+          Terzo obtains a snapshot and watches after its cursor. On disconnect it
+          reconnects with the last applied cursor; on cursor expiry it performs a
+          typed resync. User cancellation is another idempotent API mutation.
+        </li>
+      </ol>
+      <pre aria-label="Terzo flow"><code>Terzo → generated SDK → HTTPS T4 API v1 → PostgreSQL commit
+                                      ↓ after commit
+                                CR projection → controller → runtime provider → OMP
+Terzo ← cursor watch ← ordered product events ← gateway normalization</code></pre>
+
+      <h3 id="acp-flow">Optional local ACP compatibility flow</h3>
+      <ol>
+        <li>
+          A standard editor launches the T4 ACP adapter as a local child and uses
+          ACP 1.2.1 JSON-RPC 2.0 NDJSON over that child's stdio.
+        </li>
+        <li>
+          The adapter holds a user-scoped T4 API credential using platform secure
+          storage, discovers remote capabilities, and translates only supported
+          ACP operations into generated SDK calls.
+        </li>
+        <li>
+          The adapter maps remote ordered events back to ACP notifications,
+          persists or receives a resume cursor without exposing it as an ACP
+          guarantee, and maps cancellation to T4 cancellation intent.
+        </li>
+        <li>
+          Unsupported mappings return standard typed ACP errors. The adapter does
+          not emulate success, expose Kubernetes, forward raw OMP frames, or open
+          a remote ACP socket.
+        </li>
+      </ol>
+      <pre aria-label="ACP adapter flow"><code>standard editor ⇄ local stdio ACP ⇄ T4 ACP adapter ⇄ HTTPS T4 API v1
+                                                      (same ledger and runtime path as Terzo)</code></pre>
+
+      <h2 id="workspace-recovery">Workspace, recovery, and backup</h2>
+      <h3 id="shared-filesystem">Shared filesystem</h3>
+      <p>
+        Managed execution nodes mount the selected project claim at a stable
+        configured path. A workspace becomes runtime-eligible only after the PVC
+        is Bound and the selected StorageClass is explicitly reviewed for the
+        required ReadWriteMany semantics. The controller requests ReadWriteMany
+        and fails closed for absent, ambiguous, or ineligible classes. Concurrent
+        work uses isolated Git worktrees or an equivalently reviewed workspace
+        strategy; shared writable access does not permit concurrent mutation of
+        one worktree.
+      </p>
+      <h3 id="session-recovery">Session recovery</h3>
+      <ol>
+        <li>The failed or unreachable runtime's lease expires or is revoked.</li>
+        <li>The durable owner epoch advances in a conditional transaction.</li>
+        <li>Old credentials and epoch traffic are rejected and the old runtime is terminated.</li>
+        <li>
+          A replacement runtime mounts the same eligible workspace and restores
+          only acknowledged durable session/provider state.
+        </li>
+        <li>
+          Commands in uncertain windows follow the crash-window table; clients
+          resume from their durable cursors and see the recovery transition.
+        </li>
+      </ol>
+      <h3 id="backup-restore">Backup and restore</h3>
+      <ul>
+        <li>
+          PostgreSQL backups include schema migrations, intents, idempotency,
+          events, commands, cursors, ownership, and projection state. Point-in-time
+          recovery configuration and restore credentials are tested, not merely
+          documented.
+        </li>
+        <li>
+          Workspace and object-store backups use provider snapshots or a quiesced
+          procedure with an explicit consistency boundary correlated to a database
+          recovery point. Kubernetes manifests alone are not a product backup.
+        </li>
+        <li>
+          Restore starts into isolated networking, restores and verifies
+          PostgreSQL first, restores workspace/object data to the matching point,
+          applies compatible CRDs, deploys compatible API and controller images,
+          then replays outstanding projections.
+        </li>
+        <li>
+          Restore rotates runtime and service credentials, advances owner epochs,
+          and reconciles stale projected resources before accepting mutations.
+          Evidence includes resource counts, cursor continuity, checksums or
+          provider verification, and one recovered end-to-end session.
+        </li>
+      </ul>
+
+      <h2 id="security">Security boundaries</h2>
+      <ul>
+        <li>
+          The only external product boundary is authenticated HTTPS T4 API v1,
+          Tailnet-only or equivalently private by default. TLS termination,
+          forwarded identity, origin, and proxy trust are explicit and bounded.
+        </li>
+        <li>
+          Human, device, service, projection-worker, controller, and runtime
+          principals are distinct. Authorization is deny-by-default and scoped by
+          tenant, namespace, resource, verb, and capability. User credentials are
+          never mounted into controller or runtime pods.
+        </li>
+        <li>
+          API and controller use separate least-privilege ServiceAccounts. The API
+          can perform only reviewed CR reads and projections; the controller can
+          reconcile only reviewed T4 and child resources. Neither receives
+          cluster-admin.
+        </li>
+        <li>
+          Runtime-to-service calls use short-lived, audience-bound workload
+          identity or mutually authenticated transport. Epoch and session scope
+          are checked in addition to identity. Secrets are referenced, not copied
+          into CR specs, status, events, logs, or public errors.
+        </li>
+        <li>
+          Default-deny NetworkPolicies allow only required DNS, Kubernetes API,
+          database, ingress, observability, runtime, and dependency paths. The
+          controller has no ingress from public clients.
+        </li>
+        <li>
+          The local ACP adapter communicates with its parent through inherited
+          stdio, does not listen publicly, validates frame bounds, redacts tokens,
+          and stores long-lived user secrets only through platform secure storage.
+        </li>
+        <li>
+          Audit events cover authentication decisions, scoped mutations,
+          idempotency conflicts, projection, privileged runtime actions,
+          cancellation, migration, restore, and administrative policy changes.
+          Payloads and logs are redacted and retention is explicit.
+        </li>
+        <li>
+          OCI signatures, SBOMs, provenance, pinned digests, admission policy,
+          and preflight verification form the supply-chain boundary. Capability
+          flags do not bypass authentication or authorization.
+        </li>
+      </ul>
+
+      <h2 id="distribution">Distribution, migration, and lifecycle</h2>
+      <p>
+        Distribution follows the existing Helm and image conventions. The final
+        release adds signed multi-architecture OCI images and charts, per-artifact
+        SBOMs, build provenance, immutable digests, a compatibility manifest, and
+        operator-facing preflight and rollback instructions. These are required
+        work, not current claims.
+      </p>
+      <h3 id="upgrade-order">Upgrade order</h3>
+      <ol>
+        <li>
+          Back up PostgreSQL and workspace/object data; record deployed versions,
+          digests, CRD stored versions, and database migration level.
+        </li>
+        <li>
+          Preflight Kubernetes, storage, PostgreSQL, ingress, identity, CRD,
+          conversion-webhook, API/controller/runtime, architecture, and free-space
+          compatibility. Verify signatures and provenance before pulling into the
+          trusted runtime.
+        </li>
+        <li>
+          Apply additive CRD changes outside Helm and wait for establishment. Do
+          not change storage version unless the reviewed conversion lifecycle is
+          being executed.
+        </li>
+        <li>
+          Run backward-compatible, expand-first PostgreSQL migrations. New API
+          replicas remain unready until the migration and CRD compatibility checks
+          pass.
+        </li>
+        <li>
+          Roll out API replicas, projection workers, controller replicas, then
+          runtime images using disruption budgets and readiness. Enable new public
+          capabilities only after the full path is healthy.
+        </li>
+        <li>
+          Prove an idempotent mutation, projection, reconciliation, runtime event,
+          cursor reconnect, and cancellation before declaring success. Contracting
+          database or CRD migrations occur only in a later release after the
+          rollback window.
+        </li>
+      </ol>
+      <h3 id="rollback">Rollback rules</h3>
+      <p>
+        Rollback pins the prior signed image and chart digests and is supported
+        only while database and CRD changes remain backward-readable. Traffic is
+        drained before API rollback; projection workers are paused if their schema
+        is incompatible. CRDs are never force-replaced or blindly downgraded.
+        Failed conversion or storage migration stops forward rollout and restores
+        from the verified backup when in-place compatibility cannot be proven.
+        Feature capability remains disabled until all components again agree.
+      </p>
+
+      <h2 id="observability">Observability and truthful capabilities</h2>
+      <p>
+        API, projection worker, controller, and runtime provider expose separate
+        health, readiness, bounded Prometheus metrics, structured logs, and
+        OpenTelemetry traces with request, intent, projection, resource, command,
+        and cursor correlation identifiers. High-cardinality user, prompt, path,
+        and command text are not metric labels.
+      </p>
+      <ul>
+        <li>
+          API readiness covers PostgreSQL migration compatibility, CRD discovery,
+          required identity configuration, and projection-worker health; it does
+          not claim every optional capability is available.
+        </li>
+        <li>
+          Controller readiness covers Kubernetes access, informer synchronization,
+          leader-election participation, and compatible served CRDs. Leader status
+          is observable separately from process health.
+        </li>
+        <li>
+          Required metrics include accepted and rejected intents, idempotency
+          replay/conflict, transaction latency, outbox age and failures, watch lag
+          and resync, reconcile result and duration, finalizer age, condition age,
+          owner-epoch changes, stale-epoch rejection, runtime restarts, command
+          state age, backup age, and restore verification.
+        </li>
+        <li>
+          Alerts are actionable and bounded: stuck outbox, unavailable API quorum,
+          controller leader absence, reconcile error budget, finalizer stall,
+          command indeterminate growth, database recovery risk, cursor retention
+          pressure, and backup verification failure.
+        </li>
+        <li>
+          Capability discovery derives from compatible versions, configured
+          policy, principal scope, dependency health, and verified runtime probes.
+          Build-time support alone is not reported as runtime availability.
+        </li>
+      </ul>
+
+      <h2 id="implementation-ledger">Numbered implementation line items</h2>
+      <p>
+        Each line item is independently reviewable and lands only after its proof
+        gate is attached to the review. Dependencies are strict and ordered; a
+        later item may be developed behind disabled flags but cannot be accepted
+        as complete before its dependencies.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>ID and deliverable</th>
+            <th>Depends on</th>
+            <th>Review boundary</th>
+            <th>Observable proof gate</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>OP-01 — Architecture decision</strong></td>
+            <td>None</td>
+            <td>
+              Canonical HTML fixes the public API, operator boundary, PostgreSQL
+              authority, CR projection, OMP provider, compatibility flows, and
+              lifecycle. No product implementation is implied.
+            </td>
+            <td>
+              Self-contained HTML validation; link/anchor check; forbidden-term
+              scan; reviewer sign-off on topology, invariants, dependency order,
+              migration, rollback, and proof language.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-02 — CRD lifecycle</strong></td>
+            <td>OP-01</td>
+            <td>
+              Additive structural schemas and fixtures for current
+              <code>cluster.t4.dev/v1alpha1</code>; explicit served/storage rules,
+              pre-upgrade apply, status/finalizer compatibility, and reviewed
+              future conversion procedure.
+            </td>
+            <td>
+              Fresh-install and upgrade fixture validation; persisted old objects
+              round-trip; CRDs become Established; stored versions remain expected;
+              failed schema preflight leaves existing workloads and objects intact.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-03 — OpenAPI, SDK, and fixtures</strong></td>
+            <td>OP-01</td>
+            <td>
+              Executable T4 API v1 OpenAPI, generated SDK used by a fixture client,
+              stable errors, idempotency and cursor schemas, capability discovery,
+              bounds, and compatibility checks.
+            </td>
+            <td>
+              OpenAPI validation and generation-drift check; generated client
+              passes version, mutation, error, watch/reconnect/cancel, bounds, and
+              incompatible-version fixtures against the conformance service.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-04 — Controller contract</strong></td>
+            <td>OP-02</td>
+            <td>
+              Remove external product responsibilities; retain conventional
+              reconcile, finalizers, owner references, conditions,
+              observedGeneration, leader election, least-privilege RBAC, and
+              bounded retries for all three CRDs.
+            </td>
+            <td>
+              Reconciliation scenarios prove create/update/delete, ownership,
+              retention, conflict retry, terminal condition, leader replacement,
+              and no public controller route or product-ledger dependency.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-05 — Durable gateway and ledger</strong></td>
+            <td>OP-02, OP-03, OP-04</td>
+            <td>
+              PostgreSQL migrations and transaction code for scoped idempotency,
+              intent, events, commands, cursors, outbox/projection, authorization,
+              and CR mutation strictly after commit.
+            </td>
+            <td>
+              PostgreSQL integration evidence injects every acceptance and
+              projection crash window; same-key retries return one result;
+              mismatched reuse conflicts; reconnect has no gap; API restart loses
+              no accepted intent; projection converges exactly once logically.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-06 — Typed runtime provider</strong></td>
+            <td>OP-03, OP-05</td>
+            <td>
+              One provider interface and pinned official OMP compatibility
+              manifest using only proved bounded local RPC or ACP seams, with
+              owner epoch, command ID, supervision, and normalized events.
+            </td>
+            <td>
+              Stock pinned OMP passes discovery, operation, malformed/oversized
+              frame, cancellation, child-exit, recovery-query, stale-epoch, and
+              uncertain-dispatch fixtures; unsupported capabilities fail closed.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-07 — Terzo and ACP adapter</strong></td>
+            <td>OP-03, OP-05, OP-06</td>
+            <td>
+              Terzo uses only the generated public SDK. Optional local ACP 1.2.1
+              stdio adapter maps standard operations to the same T4 API without a
+              remote ACP listener or raw runtime forwarding.
+            </td>
+            <td>
+              A physical Terzo client and one standard ACP editor client each
+              discover, create, observe, reconnect, cancel, and receive a runtime
+              result through the same remote API; network capture shows HTTPS only.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-08 — Distribution, security, and lifecycle</strong></td>
+            <td>OP-02, OP-03, OP-04, OP-05, OP-06, OP-07</td>
+            <td>
+              Existing Helm/image conventions plus signed multi-arch OCI, SBOM,
+              provenance, digest pinning, scoped identities and network policies,
+              compatibility preflight, expand-first migration, and rollback.
+            </td>
+            <td>
+              Signature/provenance/SBOM verification on every architecture;
+              least-privilege and network-policy denial evidence; fresh install,
+              supported upgrade, failed preflight, and rollback retain data and a
+              working prior capability set.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-09 — Observability and recovery</strong></td>
+            <td>OP-05, OP-06, OP-08</td>
+            <td>
+              Correlated metrics/logs/traces, alerts, owner recovery, all command
+              crash windows, cursor retention/resync, PostgreSQL and workspace
+              backup, isolated restore, and runbooks.
+            </td>
+            <td>
+              Fault matrix kills API, projector, controller leader, runtime, node,
+              and database connections at named windows; alerts fire; stale owners
+              are fenced; restore proves cursor continuity, projections, workspace
+              integrity, and one recovered session.
+            </td>
+          </tr>
+          <tr>
+            <td><strong>OP-10 — Physical remote-client and HA proof</strong></td>
+            <td>OP-07, OP-08, OP-09</td>
+            <td>
+              Release-candidate system on separate client and multi-node failure
+              domains with real PostgreSQL, eligible RWX storage, ingress,
+              identity, controller leader election, and pinned OMP runtimes.
+            </td>
+            <td>
+              From a physical remote client: authenticate, discover, create a
+              workspace/session, run and cancel commands, disconnect/reconnect by
+              cursor, replace runtime and controller leader, lose an API replica,
+              restore from backup, and complete without lost committed intent,
+              stale-owner acceptance, or direct controller/runtime traffic.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="release-proof">Release proof and open decisions</h2>
+      <p>
+        Compilation, a healthy dashboard, mock transport, or an in-process client
+        is not release proof. A release candidate must satisfy OP-10 using signed
+        artifacts and real failure boundaries. Evidence records exact versions,
+        digests, topology, timestamps, injected fault, expected invariant,
+        observed events and cursors, metrics, logs, and recovery result.
+      </p>
+      <p>
+        The following remain decisions requiring executable proof rather than
+        promises: which pinned official OMP operations use its RPC seam versus ACP;
+        the initial cursor and idempotency retention windows; the first supported
+        PostgreSQL, Kubernetes, ingress, identity, and RWX-provider matrix; and the
+        exact conditions for proposing <code>v1beta1</code>. These choices may
+        narrow advertised capability or supported platforms, but they may not
+        weaken commit-before-projection, fencing, security, or recovery invariants.
+      </p>
+    </main>
+  </body>
+</html>
