@@ -498,6 +498,18 @@ export class RpcChildSupervisor {
 		// The owner must retain this handle until `exited` settles. Clearing it
 		// here would let lifecycle retries lose track of a signal-resistant child.
 	}
+	/**
+	 * Force the child to exit after the owner declares the runtime crashed, so a
+	 * wedged child cannot linger holding its session lock and pin the session
+	 * read-only forever. Marks the supervisor closed, rejects pending calls, then
+	 * escalates SIGTERM -> SIGKILL. Idempotent and safe to call after stop()/fail().
+	 */
+	terminate(): void {
+		this.#closed = true;
+		for (const pending of this.#pending.values()) pending.reject(new Error("rpc child terminated"));
+		this.#pending.clear();
+		this.terminateAfterReaderFailure();
+	}
 	loadedWatermark(): RpcLoadedTranscriptWatermark | undefined {
 		return this.#ready ? this.#transcript.watermark() : undefined;
 	}

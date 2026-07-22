@@ -168,6 +168,13 @@ const DIRECT_SESSION_RPC_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 const SESSION_CANCEL_COMMAND = "session.cancel";
 const AGENT_CANCEL_COMMAND = "agent.cancel";
+// A supervised child heartbeats its session lock out-of-band from RPC traffic, so a
+// healthy-but-busy child keeps its lock "live". A wedged child stops heartbeating and
+// OMP then reports the lock "suspect"/"stale". Poll owned sessions on this cadence and
+// recycle the supervisor once the lock has been non-live for the full grace, so a hung
+// runtime becomes restartable instead of pinning the session read-only forever.
+const SUPERVISOR_LIVENESS_POLL_MS = 2_000;
+const SUPERVISOR_LIVENESS_GRACE_POLLS = 5;
 const OBSERVER_READ_COMMANDS = new Set([
 	"session.attach",
 	"session.image.read",
@@ -754,6 +761,8 @@ export class LocalAppserver implements AppserverHandle {
 	#lockCheck: LockCheckHook;
 	#ringSize: number;
 	#lifecycleQuiesceTimeoutMs: number;
+	#supervisorLivenessPollMs: number;
+	#supervisorLivenessGracePolls: number;
 	#usageReadTimeoutMs: number;
 	#handlers = new AppserverCommandHandlers();
 	#challenges = new Map<string, { command: CommandFrame; ws: AppWs; expiresAt: number; hash: string }>();
@@ -778,6 +787,9 @@ export class LocalAppserver implements AppserverHandle {
 	#observerTimers = new Map<SessionId, ReturnType<typeof setInterval>>();
 	#observerRefreshes = new Map<SessionId, { promise: Promise<void>; rerun: boolean }>();
 	#promotionFailures = new Map<SessionId, string>();
+	#supervisorLiveness = new Map<SessionId, ReturnType<typeof setInterval>>();
+	#supervisorSuspectStreak = new Map<SessionId, number>();
+	#supervisorLivenessProbe = new Set<SessionId>();
 	#locklessObservers = new WeakSet<SessionTranscriptObserver>();
 	#locklessObserverBaselines = new WeakSet<SessionTranscriptObserver>();
 	#sessionRefresh?: Promise<void>;
@@ -906,6 +918,8 @@ export class LocalAppserver implements AppserverHandle {
 		else this.#lockCheck = options.lockCheck ?? (() => undefined);
 		this.#lifecycleQuiesceTimeoutMs = options.lifecycleQuiesceTimeoutMs ?? 2_000;
 		this.#usageReadTimeoutMs = options.usageReadTimeoutMs ?? DEFAULT_USAGE_READ_TIMEOUT_MS;
+		this.#supervisorLivenessPollMs = options.supervisorLivenessPollMs ?? SUPERVISOR_LIVENESS_POLL_MS;
+		this.#supervisorLivenessGracePolls = options.supervisorLivenessGracePolls ?? SUPERVISOR_LIVENESS_GRACE_POLLS;
 		if (
 			!Number.isSafeInteger(this.#lifecycleQuiesceTimeoutMs) ||
 			this.#lifecycleQuiesceTimeoutMs <= 0 ||
@@ -918,6 +932,18 @@ export class LocalAppserver implements AppserverHandle {
 			this.#usageReadTimeoutMs > 60_000
 		)
 			throw new Error("usageReadTimeoutMs must be between 1 and 60000");
+		if (
+			!Number.isSafeInteger(this.#supervisorLivenessPollMs) ||
+			this.#supervisorLivenessPollMs <= 0 ||
+			this.#supervisorLivenessPollMs > 60_000
+		)
+			throw new Error("supervisorLivenessPollMs must be between 1 and 60000");
+		if (
+			!Number.isSafeInteger(this.#supervisorLivenessGracePolls) ||
+			this.#supervisorLivenessGracePolls <= 0 ||
+			this.#supervisorLivenessGracePolls > 1_000
+		)
+			throw new Error("supervisorLivenessGracePolls must be between 1 and 1000");
 		this.#ompVersion = options.ompVersion ?? "local";
 		this.#ompBuild = options.ompBuild ?? "local";
 		this.#rpcDialect = options.rpcDialect ?? "fork";
@@ -1219,6 +1245,10 @@ export class LocalAppserver implements AppserverHandle {
 			}
 			for (const timer of this.#observerTimers.values()) clearInterval(timer);
 			this.#observerTimers.clear();
+			for (const timer of this.#supervisorLiveness.values()) clearInterval(timer);
+			this.#supervisorLiveness.clear();
+			this.#supervisorSuspectStreak.clear();
+			this.#supervisorLivenessProbe.clear();
 			this.#observers.clear();
 			this.#observerRefreshes.clear();
 			for (const supervisor of this.#supervisors.values()) supervisor.stop();
@@ -2931,6 +2961,7 @@ export class LocalAppserver implements AppserverHandle {
 		const release = () => {
 			if (this.#supervisors.get(sessionId) !== supervisor) return;
 			this.#supervisors.delete(sessionId);
+			this.stopSupervisorLiveness(sessionId);
 			if (this.#stopping || this.#closedSessions.has(sessionId)) return;
 			this.#transcripts.delete(sessionId);
 			this.disposeSubagentState(sessionId);
@@ -2945,6 +2976,7 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private markSupervisorCrashed(sessionId: SessionId, supervisor: RpcChildSupervisor): void {
 		if (this.#supervisors.get(sessionId) !== supervisor) return;
+		this.stopSupervisorLiveness(sessionId);
 		this.advanceStateRefreshGeneration(sessionId);
 		this.#releaseAllMessageLifecycles(sessionId, "failed");
 		const at = this.#clock.now().toISOString();
@@ -2964,6 +2996,9 @@ export class LocalAppserver implements AppserverHandle {
 		this.#stateRefreshGenerations.delete(sessionId);
 		this.#transcripts.delete(sessionId);
 		this.disposeSubagentState(sessionId);
+		// A wedged child never exits on its own; force it so `release` can settle,
+		// the session turns restartable, and the stale lock is released.
+		supervisor.terminate();
 		this.releaseSupervisorAfterExit(sessionId, supervisor);
 	}
 	private disposeSubagentState(sessionId: SessionId): void {
@@ -3567,6 +3602,7 @@ export class LocalAppserver implements AppserverHandle {
 			await supervisor.start();
 			if (this.#supervisors.get(sessionId) !== supervisor) throw new Error("rpc child exited during startup");
 			this.releaseSupervisorAfterExit(sessionId, supervisor);
+			this.startSupervisorLiveness(sessionId);
 			return supervisor;
 		} catch (error) {
 			if (this.#supervisors.get(sessionId) === supervisor) this.#supervisors.delete(sessionId);
@@ -4467,6 +4503,50 @@ export class LocalAppserver implements AppserverHandle {
 		const control = projection.setSessionControl();
 		if (control) await this.broadcastIndex(control);
 		this.cleanupObserverState(sessionId);
+	}
+	private startSupervisorLiveness(sessionId: SessionId): void {
+		if (this.#supervisorLiveness.has(sessionId)) return;
+		this.#supervisorSuspectStreak.set(sessionId, 0);
+		const timer = setInterval(() => {
+			void this.checkSupervisorLiveness(sessionId);
+		}, this.#supervisorLivenessPollMs);
+		this.#supervisorLiveness.set(sessionId, timer);
+	}
+	private stopSupervisorLiveness(sessionId: SessionId): void {
+		clearInterval(this.#supervisorLiveness.get(sessionId));
+		this.#supervisorLiveness.delete(sessionId);
+		this.#supervisorSuspectStreak.delete(sessionId);
+		this.#supervisorLivenessProbe.delete(sessionId);
+	}
+	private async checkSupervisorLiveness(sessionId: SessionId): Promise<void> {
+		// One bounded probe at a time; a wedged authority call must not pile up.
+		if (this.#supervisorLivenessProbe.has(sessionId)) return;
+		const supervisor = this.#supervisors.get(sessionId);
+		const record = this.#records.get(sessionId);
+		if (!supervisor || !record) {
+			this.stopSupervisorLiveness(sessionId);
+			return;
+		}
+		this.#supervisorLivenessProbe.add(sessionId);
+		const probe = Promise.resolve(this.#lockStatus(record)).catch((): SessionLockStatus => "malformed");
+		// Release the in-flight guard only when the authority actually answers, so a
+		// hung query can never let the next tick launch a second and pile up traffic.
+		void probe.finally(() => this.#supervisorLivenessProbe.delete(sessionId));
+		const status = await probe;
+		// The supervisor may have been released while the probe was in flight.
+		if (this.#supervisors.get(sessionId) !== supervisor) return;
+		// "live" = child is heartbeating; "missing" = a legitimately lockless owned
+		// session. Either way the runtime is healthy, so reset the streak.
+		if (status === "live" || status === "missing") {
+			this.#supervisorSuspectStreak.set(sessionId, 0);
+			return;
+		}
+		const streak = (this.#supervisorSuspectStreak.get(sessionId) ?? 0) + 1;
+		this.#supervisorSuspectStreak.set(sessionId, streak);
+		if (streak < this.#supervisorLivenessGracePolls) return;
+		// Our own child stopped heartbeating for the full grace window: it is wedged.
+		// Recycle it so the session becomes restartable instead of stuck read-only.
+		this.markSupervisorCrashed(sessionId, supervisor);
 	}
 	private startExternalObserver(sessionId: SessionId): void {
 		if (this.#observerTimers.has(sessionId)) return;

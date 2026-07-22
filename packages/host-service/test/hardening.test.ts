@@ -1027,6 +1027,37 @@ describe("child supervision", () => {
 		expect(await child.exited).toBe(1);
 		expect(killSignals).toEqual(["SIGTERM", "SIGKILL"]);
 	});
+	test("terminate() reaps a wedged child that never failed its reader", async () => {
+		const exited = Promise.withResolvers<number>();
+		const killSignals: string[] = [];
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				yield `${JSON.stringify({ type: "ready" })}\n`;
+				// Wedge: stay alive with stdout open, never EOF, never error. The
+				// supervisor's reader can never detect this, so only an explicit
+				// terminate() can release the child and its session lock.
+				await new Promise<void>(() => {});
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: signal => {
+				killSignals.push(signal ?? "SIGTERM");
+				if (signal === "SIGKILL") exited.resolve(9);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: path => ["omp", "--mode", "rpc", "--session", path] },
+			record("s"),
+			{ entry: () => {}, event: () => {}, crashed: () => {} },
+			["omp", "--mode", "rpc"],
+			1,
+		);
+		await supervisor.start();
+		supervisor.terminate();
+		expect(await child.exited).toBe(9);
+		expect(killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
 	test("unknown string-typed child frames do not crash the supervisor", async () => {
 		const gate = Promise.withResolvers<void>();
 		const exited = Promise.withResolvers<number>();

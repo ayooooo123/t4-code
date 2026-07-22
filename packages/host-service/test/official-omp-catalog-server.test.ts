@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostId, projectId, sessionId, type ServerFrame } from "@t4-code/host-wire";
 import { createAppserver } from "../src/server.ts";
-import type { ChildHandle, RpcChildFactory, SessionRecord } from "../src/types.ts";
+import type { ChildHandle, RpcChildFactory, SessionLockStatus, SessionRecord } from "../src/types.ts";
 import { RawUdsWebSocket } from "./raw-uds-client.ts";
 
 async function responseFor(
@@ -351,6 +351,91 @@ test("attached catalog refresh and terminal-only rejection stay on the runtime b
     expect(factory.children[0]?.writes.find((command) => command.type === "set_model")).not.toHaveProperty(
       "selector",
     );
+  } finally {
+    client.destroy();
+    await client.closed();
+    await appserver.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recycles a supervised session whose lock heartbeat goes suspect", async () => {
+  const root = await mkdtemp(join(tmpdir(), "t4-supervisor-liveness-"));
+  const socketPath = join(root, "run", "app.sock");
+  const host = hostId("supervisor-liveness-host");
+  const session: SessionRecord = {
+    sessionId: sessionId("supervisor-liveness-session"),
+    path: join(root, "session.jsonl"),
+    cwd: root,
+    projectId: projectId("supervisor-liveness-project"),
+    title: "Wedged session",
+    updatedAt: "2026-07-20T00:00:00.000Z",
+    status: "idle",
+    entries: [],
+  };
+  const factory = new CapabilityRpcFactory();
+  // The lock is healthy while the child heartbeats; flip it to "suspect" to model a
+  // wedged child whose heartbeat has stopped even though its process is still alive.
+  let lock: SessionLockStatus = "missing";
+  const appserver = createAppserver({
+    hostId: host,
+    socketPath,
+    ompVersion: "17.0.6",
+    discovery: { list: async () => [session] },
+    childFactory: factory,
+    rpcDialect: "official-17.0.6",
+    lockCheck: () => {},
+    lockStatus: () => lock,
+    supervisorLivenessPollMs: 5,
+    supervisorLivenessGracePolls: 3,
+    operationsAuthority: {
+      catalogGet: async () => ({ revision: "authority-revision", items: [] }),
+    },
+  });
+  await appserver.start();
+  const client = await RawUdsWebSocket.connect(socketPath);
+  try {
+    client.sendJson({
+      v: "omp-app/1",
+      type: "hello",
+      protocol: { min: "omp-app/1", max: "omp-app/1" },
+      client: { name: "liveness-test", version: "1", build: "test", platform: "linux" },
+      requestedFeatures: [],
+      capabilities: { client: ["sessions.read", "sessions.prompt", "sessions.control", "sessions.manage"] },
+      savedCursors: [],
+    });
+    expect(await client.nextServer()).toMatchObject({ type: "welcome" });
+    expect((await client.nextServer()).type).toBe("sessions");
+    const command = (requestId: string, name: string, ordinal: number): void => {
+      client.sendJson({
+        v: "omp-app/1",
+        type: "command",
+        requestId,
+        commandId: `liveness-command-${ordinal}`,
+        hostId: host,
+        sessionId: session.sessionId,
+        command: name,
+        args: {},
+      });
+    };
+    // Own the session: state.get spawns a writer supervisor and starts its watchdog.
+    command("own", "session.state.get", 1);
+    expect(await responseFor(client, "own")).toMatchObject({ ok: true });
+    expect(factory.children).toHaveLength(1);
+    const wedged = factory.children[0];
+    if (!wedged) throw new Error("supervisor child missing");
+
+    // The child stops heartbeating; OMP now reports the lock suspect.
+    lock = "suspect";
+    // Awaiting the child's own exit signal; the test runner's timeout guards a hang if
+    // the watchdog never fires. The 5ms poll interval belongs to the code under test.
+    await wedged.exited;
+
+    // Recovery: the released session is restartable, so a fresh command owns it again.
+    lock = "missing";
+    command("reown", "session.state.get", 2);
+    expect(await responseFor(client, "reown")).toMatchObject({ ok: true });
+    expect(factory.children.length).toBeGreaterThanOrEqual(2);
   } finally {
     client.destroy();
     await client.closed();

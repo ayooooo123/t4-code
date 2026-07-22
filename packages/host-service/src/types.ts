@@ -269,6 +269,10 @@ export interface AppserverOptions {
 	ringSize?: number;
 	/** Maximum time lifecycle mutations wait for terminal and child shutdown. */
 	lifecycleQuiesceTimeoutMs?: number;
+	/** How often to poll a supervised session's lock heartbeat for liveness. */
+	supervisorLivenessPollMs?: number;
+	/** Consecutive non-live polls before a wedged owned session is recycled. */
+	supervisorLivenessGracePolls?: number;
 	now?: () => Date;
 	remoteEndpoint?: RemoteListenerConfig;
 	remotePolicy?: RemoteConnectionPolicy;
