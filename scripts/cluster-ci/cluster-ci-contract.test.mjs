@@ -52,6 +52,7 @@ function validProof() {
     controller: "t4-cluster-operator",
     "cluster-server": "t4-cluster-server",
     "session-runtime": "t4-session-runtime",
+    "model-gateway": "t4-model-gateway",
   };
   return {
     schemaVersion: "t4-cluster-proof/1",
@@ -279,6 +280,11 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
     steps["legacy-authority-build"].environment.RUSTFLAGS,
     "-C link-arg=-fuse-ld=lld",
   );
+  assert.equal(
+    steps["legacy-authority-build"].environment.CARGO_TARGET_DIR,
+    "/tmp/t4-legacy-authority-target",
+  );
+  assert.equal(steps["legacy-authority-build"].environment.CARGO_INCREMENTAL, "0");
   assert.match(legacyInstaller, /apt-get install[^\n]*\blld\b/u);
   assert.match(legacyInstaller, /command -v ld\.lld >\/dev\/null/u);
   assert.equal(
@@ -296,6 +302,7 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
     "(cd .continuity/omp && bun install --frozen-lockfile)",
     "(cd .continuity/omp && bun run build:native)",
   ]);
+  assert.deepEqual(steps["legacy-bridge-continuity"].depends_on, ["legacy-authority-build"]);
   assert.ok(steps["legacy-bridge-continuity"].commands.includes("pnpm test:legacy-bridge-continuity"));
   assert.equal(steps["legacy-bridge-continuity"].environment.T4_OMP_SOURCE_DIR, ".continuity/omp");
   assert.ok(
@@ -326,6 +333,14 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.match(steps["cluster-server-tests"].image, /oven\/bun:[^@]+@sha256:[0-9a-f]{64}$/u);
   assert.ok(
     steps["cluster-server-tests"].commands.includes("(cd packages/cluster-server && bun --bun run test)"),
+  );
+  assert.ok(
+    steps["cluster-server-tests"].commands.includes("(cd packages/model-gateway && bun --bun run test)"),
+  );
+  assert.ok(
+    steps["cluster-server-tests"].commands.includes(
+      "bun test cluster/images/session-runtime/assert-omp-credentials-absent.test.ts",
+    ),
   );
   assert.match(steps["cluster-wire-tests"].image, /library\/node:[^@]+@sha256:[0-9a-f]{64}$/u);
   assert.deepEqual(steps["cluster-wire-tests"].depends_on, ["cluster-server-tests", "bun-runtime"]);
@@ -369,6 +384,7 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
   assert.match(steps["build-controller"].commands[0], /t4-cluster-operator/u);
   assert.match(steps["build-cluster-server"].commands[0], /t4-cluster-server/u);
   assert.match(steps["build-session-runtime"].commands[0], /t4-session-runtime/u);
+  assert.match(steps["build-session-runtime"].commands[1], /t4-model-gateway/u);
 
   const busyboxEntrypoint = [
     "/busybox/sh",
@@ -390,6 +406,9 @@ test("Woodpecker keeps upstream gates and serializes bounded cluster publication
       /^sh scripts\/cluster-ci\/capture-image-evidence\.sh provenance /u,
     );
   }
+  assert.match(steps["sbom-session-runtime"].commands[1], /sbom model-gateway t4-model-gateway/u);
+  assert.match(steps["vulnerability-session-runtime"].commands[1], /vulnerability model-gateway t4-model-gateway/u);
+  assert.match(steps["provenance-session-runtime"].commands[1], /provenance model-gateway t4-model-gateway/u);
 
   for (const [name, step] of Object.entries(steps)) {
     assert.match(step.image, /@sha256:[0-9a-f]{64}$/u, `${name} image must be immutable`);
@@ -506,6 +525,8 @@ test("proof schema is strict and enumerates every bounded evidence domain", asyn
   assert.deepEqual(schema.$defs.scenario.properties.id.enum, PROOF_SCENARIOS);
   assert.deepEqual(schema.$defs.observation.properties.system.enum, OBSERVATION_SYSTEMS);
   assert.deepEqual(schema.$defs.image.properties.component.enum, IMAGE_COMPONENTS);
+  assert.equal(schema.properties.images.minItems, IMAGE_COMPONENTS.length);
+  assert.equal(schema.properties.images.maxItems, IMAGE_COMPONENTS.length);
   assert.equal(schema.$defs.source.properties.repository.const, CANONICAL_BUILD_SOURCE_REPOSITORY);
   assert.equal(
     schema.$defs.source.properties.woodpecker.properties.repository.const,
