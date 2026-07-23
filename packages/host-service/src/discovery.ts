@@ -1556,6 +1556,14 @@ export class FileSessionDiscovery implements SessionDiscovery {
 		for (const [identity, cached] of this.index)
 			if (resolve(cached.record.path) === target) this.index.delete(identity);
 	}
+	// list() is an inventory: never expose transcript entries. load() caches the
+	// fully-parsed record (with entries) under the same key, so a cached hit here
+	// would otherwise return a full transcript and let session.list grow unbounded.
+	private listRecord(record: SessionRecord): SessionRecord {
+		return this.lazyEntries && record.entriesLoaded !== false
+			? { ...record, entries: [], entriesLoaded: false }
+			: record;
+	}
 	async list(): Promise<SessionRecord[]> {
 		let files: string[];
 		try {
@@ -1564,7 +1572,7 @@ export class FileSessionDiscovery implements SessionDiscovery {
 		} catch {
 			this.rootMisses += 1;
 			if (this.rootMisses >= 2) this.index.clear();
-			const retained = this.rootMisses === 1 ? [...this.index.values()].map(value => value.record) : [];
+			const retained = this.rootMisses === 1 ? [...this.index.values()].map(value => this.listRecord(value.record)) : [];
 			retained.sort(compareSessionRecords);
 			return retained;
 		}
@@ -1596,16 +1604,16 @@ export class FileSessionDiscovery implements SessionDiscovery {
 					record = { ...record, path };
 				}
 				this.index.set(identity, { signature, record, misses: 0 });
-				found.push(record);
+				found.push(this.listRecord(record));
 			} catch {
 				const retained = this.retainMiss(identity);
-				if (retained) found.push(retained);
+				if (retained) found.push(this.listRecord(retained));
 			}
 		}
 		for (const [identity] of this.index) {
 			if (seen.has(identity)) continue;
 			const retained = this.retainMiss(identity);
-			if (retained) found.push(retained);
+			if (retained) found.push(this.listRecord(retained));
 		}
 		found.sort(compareSessionRecords);
 		return found;

@@ -1110,7 +1110,11 @@ export class LocalAppserver implements AppserverHandle {
 				fetch: (request, server) => this.fetch(request, server),
 				websocket: {
 					maxPayloadLength: 1024 * 1024,
-					backpressureLimit: 1024 * 1024,
+					// Attaching a session streams its bounded transcript snapshot (~512 KiB each);
+					// opening several at once bursts a few MiB before the client drains. A 1 MiB
+					// limit tripped closeOnBackpressureLimit mid-attach (1006) → reconnect storm that
+					// never let takeover finish. Give attach bursts headroom; the cap still bounds memory.
+					backpressureLimit: 16 * 1024 * 1024,
 					closeOnBackpressureLimit: true,
 					open: ws => {
 						if (this.#draining || this.#stopping) {
@@ -4000,14 +4004,16 @@ export class LocalAppserver implements AppserverHandle {
 		try {
 			await this.refreshSessions();
 		} catch {
+			// A transient inventory-refresh failure (e.g. a single oversized bridge
+			// response) must not tear down the whole client connection — that forces
+			// every session read-only and triggers a reconnect storm. Report it and
+			// keep serving the last-known inventory instead of closing.
 			await this.#sendFrame(ws, {
 				v: "omp-app/1",
 				type: "error",
 				code: "session_inventory_unavailable",
 				message: "session history is unavailable",
 			});
-			ws.close(1011, "session history unavailable");
-			return;
 		}
 		if (this.#stopping || !this.#hello.has(ws)) return;
 		await this.#sendFrame(ws, this.sessionsFrame());
@@ -4429,7 +4435,11 @@ export class LocalAppserver implements AppserverHandle {
 		if (lockless) return;
 		if (!this.hasAttachedClient(sessionId)) return;
 		if (!pollRecordMatches || !poll.stable || poll.transcript !== "live") return;
-		if (poll.unresolvedPendingCount !== 0) return;
+		// A session interrupted mid-tool-call (crash-orphaned) has unresolved pending
+		// entries that will never self-resolve. Taking it over is safe once the on-disk
+		// transcript is stable and the spawned child's loaded view matches it exactly
+		// (checked below); the user resolves the pending turn by continuing. Do not
+		// block takeover on a non-zero pending count here.
 		let promotionLockStatus: SessionLockStatus;
 		try {
 			promotionLockStatus = await this.#lockStatus(record);
@@ -4459,7 +4469,6 @@ export class LocalAppserver implements AppserverHandle {
 			attempt < 4 &&
 			(!final.stable ||
 				final.transcript !== "live" ||
-				final.unresolvedPendingCount !== 0 ||
 				final.watermark.entryCount !== loaded?.entryCount ||
 				final.watermark.lastEntryId !== loaded.lastEntryId);
 			attempt += 1
@@ -4490,7 +4499,6 @@ export class LocalAppserver implements AppserverHandle {
 			final.record?.sessionId === sessionId &&
 			final.stable &&
 			final.transcript === "live" &&
-			final.unresolvedPendingCount === 0 &&
 			loaded !== undefined &&
 			loaded.entryCount === final.watermark.entryCount &&
 			loaded.lastEntryId === final.watermark.lastEntryId;

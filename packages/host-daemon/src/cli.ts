@@ -351,7 +351,12 @@ export async function runHostDaemon(
       projectRootForProject,
       lockCheck,
       lockStatus,
-      ...(config.authorityMode === "official" ? { claimLocklessSessions: true } : {}),
+      // Local desktop daemon (official, or non-remote bridge): claim lockless
+      // (no-lock) sessions so omp-CLI sessions become writable in T4. A live owner
+      // holds a "live" lock and is never lockless, and startSupervisor still acquires
+      // the write-lock at spawn, so this cannot displace an active owner. Remote/shared
+      // bridge authority keeps the conservative "unclear ownership stays read-only".
+      ...(config.authorityMode === "official" || !config.remote ? { claimLocklessSessions: true } : {}),
       ...(transcriptImageRoot ? { transcriptImageRoot } : {}),
       rpcChildInvocation: { executable: config.ompExecutable, prefixArgv: [] },
       rpcChildEnvironment: { OMP_PROFILE: config.profileId },

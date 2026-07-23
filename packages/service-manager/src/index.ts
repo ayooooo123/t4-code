@@ -96,6 +96,12 @@ function stateFromResult(result: ServiceRunnerResult, platform: Platform): Servi
   if (
     output.includes("state = exited") ||
     output.includes("state=exited") ||
+    // launchd reports a loaded-but-dead LaunchAgent as "state = not running" and
+    // `launchctl print` still exits 0. Without matching it here the fall-through at
+    // the end of this branch misreads a cleanly-exited daemon (exit code 0) as
+    // "running", so service repair returns early and never restarts a down host.
+    output.includes("state = not running") ||
+    output.includes("state=not running") ||
     output.includes("could not find") ||
     output.includes("no such process")
   )

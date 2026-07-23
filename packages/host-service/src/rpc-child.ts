@@ -61,6 +61,7 @@ function rawUserMessage(
  */
 class DurableJsonlReconciler {
 	#offset = 0;
+	#skippingOversizedLine = false;
 	#entryCount = 0;
 	#lastEntryId: string | null = null;
 	readonly #projectedEntryIds = new Set<string>();
@@ -152,21 +153,36 @@ class DurableJsonlReconciler {
 				const result = await handle.read(bytes, 0, length, position);
 				if (result.bytesRead === 0) throw new Error("session transcript changed during reconciliation");
 				position += result.bytesRead;
-				const buffered = pending.byteLength === 0
-					? bytes.subarray(0, result.bytesRead)
-					: Buffer.concat([pending, bytes.subarray(0, result.bytesRead)]);
+				const chunk = bytes.subarray(0, result.bytesRead);
+				const buffered = pending.byteLength === 0 ? chunk : Buffer.concat([pending, chunk]);
 				let start = 0;
+				// Finish discarding an oversized line whose terminating newline had not yet
+				// arrived. Oversized records are omitted (never counted), mirroring the
+				// discovery observer, so the promotion watermark stays consistent.
+				if (this.#skippingOversizedLine) {
+					const nl = buffered.indexOf(0x0a, 0);
+					if (nl < 0) {
+						pending = Buffer.alloc(0);
+						continue;
+					}
+					this.#skippingOversizedLine = false;
+					start = nl + 1;
+				}
 				let newline = buffered.indexOf(0x0a, start);
 				while (newline >= 0) {
 					const line = buffered.subarray(start, newline);
-					if (line.byteLength > MAX_LINE_BYTES) throw new Error("session transcript line exceeds 1 MiB");
-					if (line.byteLength > 0)
-						this.#observeLine(new TextDecoder("utf-8", { fatal: true }).decode(line), publish);
+					// Omit oversized complete lines rather than crashing the supervisor.
+					if (line.byteLength > 0 && line.byteLength <= MAX_LINE_BYTES) this.#observeLine(line, publish);
 					start = newline + 1;
 					newline = buffered.indexOf(0x0a, start);
 				}
 				pending = Buffer.from(buffered.subarray(start));
-				if (pending.byteLength > MAX_LINE_BYTES) throw new Error("session transcript line exceeds 1 MiB");
+				if (pending.byteLength > MAX_LINE_BYTES) {
+					// The partial line already exceeds the limit; drop it and skip bytes
+					// until its terminating newline arrives.
+					this.#skippingOversizedLine = true;
+					pending = Buffer.alloc(0);
+				}
 			}
 		} finally {
 			await handle.close();
@@ -174,12 +190,21 @@ class DurableJsonlReconciler {
 		this.#offset = position - pending.byteLength;
 	}
 
-	#observeLine(line: string, publish: boolean): void {
+	#observeLine(line: Uint8Array, publish: boolean): void {
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(line);
+		} catch {
+			return;
+		}
 		let value: unknown;
 		try {
-			value = parseBounded(line);
+			// Lenient parse mirrors the discovery observer's watermark counting: an
+			// entry with escaped control characters in tool output parses and counts
+			// here exactly as it does there, so the two watermarks cannot diverge.
+			value = JSON.parse(text);
 		} catch {
-			throw new Error("malformed session transcript");
+			return;
 		}
 		const id = durableEntryId(value);
 		if (!id) return;
@@ -541,29 +566,16 @@ export class RpcChildSupervisor {
 					throw new Error("rpc frame must be an object");
 				const frame = value as Record<string, unknown>;
 				if (frame.type === "ready") {
-					const watermark = frame.transcriptWatermark;
-					if (watermark && typeof watermark === "object" && !Array.isArray(watermark)) {
-						const candidate = watermark as Record<string, unknown>;
-						const lastEntryId = candidate.lastEntryId;
-						const entryCount = candidate.entryCount;
-						if (
-							((typeof lastEntryId === "string" && lastEntryId.length <= 256) || lastEntryId === null) &&
-							typeof entryCount === "number" &&
-							Number.isSafeInteger(entryCount) &&
-							entryCount >= 0
-						)
-							this.#loadedWatermark = { lastEntryId, entryCount };
-					}
 					if (this.#ready) throw new Error("duplicate rpc ready");
 					await this.#transcript.initialize();
-					const reconciled = this.#transcript.watermark();
-					if (
-						this.#loadedWatermark &&
-						(this.#loadedWatermark.entryCount !== reconciled.entryCount ||
-							this.#loadedWatermark.lastEntryId !== reconciled.lastEntryId)
-					)
-						throw new Error("rpc ready watermark does not match durable transcript");
-					this.#loadedWatermark = reconciled;
+					// OMP's ready watermark counts every raw record; the host projects with
+					// omitted-record semantics (oversized/control-char rows are dropped from
+					// both the projection and the promotion watermark), so a divergence from
+					// OMP's own count is the expected consequence of that difference, not
+					// transcript corruption. Adopt the host's reconciled watermark and let the
+					// promotion gate (reconciler vs discovery observer, identical semantics)
+					// enforce real consistency.
+					this.#loadedWatermark = this.#transcript.watermark();
 					this.#ready = true;
 					ready.resolve();
 					continue;

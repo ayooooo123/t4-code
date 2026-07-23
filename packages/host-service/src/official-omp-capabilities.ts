@@ -106,32 +106,51 @@ function slashName(value: unknown, path: string): string {
   return name;
 }
 
+function stripControlChars(value: string): string {
+  let out = "";
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code > 0x1f && code !== 0x7f) out += character;
+  }
+  return out;
+}
+
 function decodeHeadlessCommands(value: unknown): readonly HeadlessCommand[] {
   const items = boundedArray(value, "available_commands_update.commands", MAX_AVAILABLE_COMMANDS);
   const commands: HeadlessCommand[] = [];
   const names = new Set<string>();
   for (let index = 0; index < items.length; index++) {
     const path = `available_commands_update.commands[${index}]`;
-    const item = boundedMap(items[index], path, 16);
-    const name = slashName(item.name, `${path}.name`);
-    if (names.has(name)) throw new Error(`duplicate available command: ${name}`);
-    names.add(name);
-    const aliases = boundedArray(item.aliases ?? [], `${path}.aliases`, MAX_COMMAND_ALIASES).map(
-      (alias, aliasIndex) => slashName(alias, `${path}.aliases[${aliasIndex}]`),
-    );
-    const description =
-      item.description === undefined
-        ? undefined
-        : controlFree(item.description, `${path}.description`, MAX_COMMAND_DESCRIPTION_BYTES);
-    const input = item.input === undefined ? undefined : boundedMap(item.input, `${path}.input`, 4);
-    const inputHint =
-      input?.hint === undefined
-        ? undefined
-        : controlFree(input.hint, `${path}.input.hint`, MAX_COMMAND_INPUT_HINT_BYTES);
-    const source = controlFree(item.source, `${path}.source`, MAX_COMMAND_SOURCE_BYTES);
-    commands.push(
-      Object.freeze({ name, aliases: Object.freeze(aliases), description, inputHint, source }),
-    );
+    try {
+      const item = boundedMap(items[index], path, 16);
+      const name = slashName(item.name, `${path}.name`);
+      if (names.has(name)) continue;
+      const aliases = boundedArray(item.aliases ?? [], `${path}.aliases`, MAX_COMMAND_ALIASES).map(
+        (alias, aliasIndex) => slashName(alias, `${path}.aliases[${aliasIndex}]`),
+      );
+      // Descriptions and input hints are display-only metadata; a control character
+      // in them (common in user-authored commands) must neither reject the command
+      // nor crash the session. Strip control characters rather than failing.
+      const rawDescription =
+        item.description === undefined ? undefined : stripControlChars(String(item.description));
+      const description = rawDescription
+        ? controlFree(rawDescription, `${path}.description`, MAX_COMMAND_DESCRIPTION_BYTES)
+        : undefined;
+      const input = item.input === undefined ? undefined : boundedMap(item.input, `${path}.input`, 4);
+      const rawHint = input?.hint === undefined ? undefined : stripControlChars(String(input.hint));
+      const inputHint = rawHint
+        ? controlFree(rawHint, `${path}.input.hint`, MAX_COMMAND_INPUT_HINT_BYTES)
+        : undefined;
+      const source = controlFree(item.source, `${path}.source`, MAX_COMMAND_SOURCE_BYTES);
+      names.add(name);
+      commands.push(
+        Object.freeze({ name, aliases: Object.freeze(aliases), description, inputHint, source }),
+      );
+    } catch {
+      // A single advertised command with invalid metadata must not abort capability
+      // negotiation or crash the session; drop just that command.
+      continue;
+    }
   }
   return Object.freeze(commands);
 }
