@@ -25,6 +25,8 @@ import {
   type DesktopUpdateState,
   type PairLinkEvent,
   type PairLinksDrainResult,
+  type PeerShareStartResult,
+  type PeerShareStatusResult,
   type PairRequest,
   type PairResult,
   type PhoneSetupState,
@@ -41,6 +43,10 @@ import {
   type TerminalInputRequest,
   type TerminalResizeRequest,
   type TerminalResult,
+  type WorkspaceProjectCreateResult,
+  type WorkspaceRootChooseResult,
+  type WorkspaceRootSelectRequest,
+  type WorkspaceRootsResult,
   type SpeechRequest,
   type SpeechResult,
   type ProjectionCacheLoadResult,
@@ -73,6 +79,14 @@ export interface OmpShellBridge {
   readonly serviceStop: () => Promise<ServiceActionResult>;
   readonly serviceRestart: () => Promise<ServiceActionResult>;
   readonly serviceUninstall: () => Promise<ServiceActionResult>;
+  readonly peerShareStart: () => Promise<PeerShareStartResult>;
+  readonly peerShareStatus: () => Promise<PeerShareStatusResult>;
+  readonly peerShareStop: () => Promise<PeerShareStatusResult>;
+  readonly peerShareRegenerate: () => Promise<PeerShareStartResult>;
+  readonly workspaceRootsList: () => Promise<WorkspaceRootsResult>;
+  readonly workspaceRootSelect: (request: WorkspaceRootSelectRequest) => Promise<void>;
+  readonly workspaceRootChoose: () => Promise<WorkspaceRootChooseResult>;
+  readonly workspaceProjectCreate: (request: { readonly name: string }) => Promise<WorkspaceProjectCreateResult>;
   readonly loadProjectionCache: () => Promise<ProjectionCacheLoadResult>;
   readonly saveProjectionCache: (request: ProjectionCacheSaveRequest) => Promise<ProjectionCacheSaveResult>;
   readonly getUpdateState: () => Promise<DesktopUpdateState>;
@@ -104,7 +118,7 @@ export interface OmpShellBridge {
   readonly onOpenUpdateSettings: (listener: (event: DesktopUpdateOpenEvent) => void) => () => void;
 }
 
-function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:speech:speak" | "omp:speech:stop" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove" | "omp:profiles:list" | "omp:profiles:add" | "omp:profiles:update" | "omp:profiles:remove" | "omp:profiles:status" | "omp:profiles:start" | "omp:profiles:stop" | "omp:profiles:restart" | "app:update:get-state" | "app:update:check" | "app:update:download" | "app:update:restart" | "app:update:renderer-ready" | "app:phone-setup:inspect" | "app:phone-setup:configure", R>(channel: C, payload: unknown): Promise<R> {
+function invoke<C extends "omp:bootstrap" | "omp:connect" | "omp:disconnect" | "omp:command" | "omp:confirm" | "omp:terminal:input" | "omp:terminal:resize" | "omp:terminal:close" | "omp:pair" | "omp:pair-links:drain" | "omp:speech:speak" | "omp:speech:stop" | "omp:service:inspect" | "omp:service:install" | "omp:service:start" | "omp:service:stop" | "omp:service:restart" | "omp:service:uninstall" | "omp:peer-share:start" | "omp:peer-share:status" | "omp:peer-share:stop" | "omp:peer-share:regenerate" | "omp:workspace:roots:list" | "omp:workspace:root:select" | "omp:workspace:root:choose" | "omp:workspace:project:create" | "omp:targets:list" | "omp:targets:add" | "omp:targets:remove" | "omp:profiles:list" | "omp:profiles:add" | "omp:profiles:update" | "omp:profiles:remove" | "omp:profiles:status" | "omp:profiles:start" | "omp:profiles:stop" | "omp:profiles:restart" | "app:update:get-state" | "app:update:check" | "app:update:download" | "app:update:restart" | "app:update:renderer-ready" | "app:phone-setup:inspect" | "app:phone-setup:configure", R>(channel: C, payload: unknown): Promise<R> {
   return ipcRenderer.invoke(channel, { channel, payload }) as Promise<R>;
 }
 
@@ -190,6 +204,14 @@ const bridge: OmpShellBridge = {
   serviceStop: () => invoke("omp:service:stop", {}),
   serviceRestart: () => invoke("omp:service:restart", {}),
   serviceUninstall: () => invoke("omp:service:uninstall", {}),
+  peerShareStart: () => invoke("omp:peer-share:start", {}),
+  peerShareStatus: () => invoke("omp:peer-share:status", {}),
+  peerShareStop: () => invoke("omp:peer-share:stop", {}),
+  peerShareRegenerate: () => invoke("omp:peer-share:regenerate", {}),
+  workspaceRootsList: () => invoke("omp:workspace:roots:list", {}),
+  workspaceRootSelect: (request) => invoke("omp:workspace:root:select", request),
+  workspaceRootChoose: () => invoke("omp:workspace:root:choose", {}),
+  workspaceProjectCreate: (request) => invoke("omp:workspace:project:create", request),
   getUpdateState: () => invoke<"app:update:get-state", unknown>("app:update:get-state", {}).then(decodeDesktopUpdateState),
   checkForUpdate: () => invoke<"app:update:check", unknown>("app:update:check", {}).then(decodeDesktopUpdateState),
   downloadUpdate: () => invoke<"app:update:download", unknown>("app:update:download", {}).then(decodeDesktopUpdateState),

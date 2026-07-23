@@ -15,7 +15,11 @@ void prepareNativeMobileBackend().then(async (boot) => {
   if (boot.kind === "setup") {
     root.render(
       <StrictMode>
-        <MobileConnectionScreen {...(boot.message === undefined ? {} : { startupMessage: boot.message })} />
+        <MobileConnectionScreen
+          mode={boot.mode}
+          {...(boot.mode === "repair" ? { repairAction: boot.repairAction } : {})}
+          {...(boot.message === undefined ? {} : { startupMessage: boot.message })}
+        />
       </StrictMode>,
     );
     return;

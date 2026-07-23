@@ -28,3 +28,7 @@ test-results/
 /output/playwright/
 *.log
 .todos/
+
+# Rebuilt from pinned HyperDHT, libsodium, and libuv source by the Android build.
+/apps/mobile/android/.hyperdht/
+/apps/mobile/android/app/src/main/jniLibs/

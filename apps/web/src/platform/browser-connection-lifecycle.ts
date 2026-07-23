@@ -17,6 +17,8 @@ export interface BrowserConnectionLifecycleOptions {
   readonly schedule?: (callback: () => void) => void;
 }
 
+export type BrowserConnectionWakeSource = "browser" | "native-resume";
+
 /**
  * Coalesce the browser and native signals that mean a suspended connection
  * should be checked now. Hidden documents do not consume reconnect budget;
@@ -24,7 +26,7 @@ export interface BrowserConnectionLifecycleOptions {
  * update document.visibilityState reliably.
  */
 export function bindBrowserConnectionWake(
-  wake: () => void,
+  wake: (source: BrowserConnectionWakeSource) => void,
   options: BrowserConnectionLifecycleOptions = {},
 ): Unsubscribe {
   const windowTarget =
@@ -60,7 +62,9 @@ export function bindBrowserConnectionWake(
       queued = false;
       const allowHidden = nativeResumeQueued;
       nativeResumeQueued = false;
-      if (!disposed && (allowHidden || visible())) wake();
+      if (!disposed && (allowHidden || visible())) {
+        wake(allowHidden ? "native-resume" : "browser");
+      }
     });
   };
   const onVisibility = (): void => {

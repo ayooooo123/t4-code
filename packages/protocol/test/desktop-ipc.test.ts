@@ -94,6 +94,35 @@ describe("desktop IPC boundary", () => {
       payload: { intent: { hostId: "h", command: "host.list", args: {} } },
     });
   });
+  it("accepts only empty payloads for desktop peer-share controls", () => {
+    expect(decodeDesktopInvokeRequest({ channel: "omp:peer-share:start", payload: {} })).toEqual({
+      channel: "omp:peer-share:start",
+      payload: {},
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:peer-share:status", payload: {} })).toEqual({
+      channel: "omp:peer-share:status",
+      payload: {},
+    });
+    expect(() => decodeDesktopInvokeRequest({
+      channel: "omp:peer-share:regenerate",
+      payload: { invite: "must-not-cross-ipc" },
+    })).toThrow();
+  });
+  it("strictly decodes desktop workspace controls", () => {
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:roots:list", payload: {} })).toEqual({
+      channel: "omp:workspace:roots:list",
+      payload: {},
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:root:select", payload: { rootId: "root-1" } })).toEqual({
+      channel: "omp:workspace:root:select",
+      payload: { rootId: "root-1" },
+    });
+    expect(decodeDesktopInvokeRequest({ channel: "omp:workspace:project:create", payload: { name: "My project" } })).toEqual({
+      channel: "omp:workspace:project:create",
+      payload: { name: "My project" },
+    });
+    expect(() => decodeDesktopInvokeRequest({ channel: "omp:workspace:project:create", payload: { name: "My project", path: "/tmp" } })).toThrow();
+  });
   it("strictly decodes named local targets and profile lifecycle requests", () => {
     expect(decodeDesktopInvokeRequest({
       channel: "omp:connect",

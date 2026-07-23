@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, dialog } from "electron";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { CursorStore } from "@t4-code/client";
@@ -18,6 +18,8 @@ import {
   ElectronRemoteTargetStore,
   ElectronCredentialCiphertextStore,
   ElectronLocalProfileStore,
+  ElectronPeerPairingStore,
+  ElectronWorkspaceRootsStore,
   ElectronProjectionCacheStore,
   electronSafeStorage,
   loadDeviceIdentity,
@@ -25,6 +27,7 @@ import {
 } from "./stores.ts";
 import { VersionedRemoteTargetRegistry, DeviceCredentialStore } from "./remote-runtime/index.ts";
 import { LocalTargetManager, type TargetManagerOptions } from "./target-manager.ts";
+import { PeerShareHost } from "./peer-share.ts";
 import {
   createAppserverServiceManager,
   discoverOmpExecutable,
@@ -34,6 +37,7 @@ import {
   repairAppserverService,
   NodeServiceFileSystem,
 } from "./service.ts";
+import { WorkspaceRootsService } from "./workspace-roots.ts";
 import { createDesktopSpeechService, type DesktopSpeechService } from "./speech.ts";
 import { createElectronUpdateController } from "./electron-update-controller.ts";
 import { installApplicationMenu, type ApplicationMenuOptions } from "./menu.ts";
@@ -86,6 +90,8 @@ export interface DesktopLifecycleOptions {
     options: Parameters<typeof createAppserverServiceManager>[0],
   ) => ServiceManager;
   readonly createTargetManager?: (options: TargetManagerOptions) => LocalTargetManager;
+  readonly createPeerShare?: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  readonly createWorkspaceRoots?: () => WorkspaceRootsService;
   readonly createSpeechService?: (options: {
     readonly discoverExecutable: () => Promise<string | undefined>;
   }) => DesktopSpeechService;
@@ -124,6 +130,10 @@ export class DesktopLifecycle {
   }) => DesktopSpeechService;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
   private readonly targetManagerFactory: (options: TargetManagerOptions) => LocalTargetManager;
+  private readonly peerShareFactory: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
+  private readonly workspaceRootsFactory: () => WorkspaceRootsService;
+  private peerShare: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> | undefined;
+  private workspaceRoots: WorkspaceRootsService | undefined;
   private readonly updateControllerFactory: () => DesktopUpdateController;
   private readonly menuInstaller: (options: ApplicationMenuOptions) => void;
   private mainWindow: BrowserWindow | undefined;
@@ -213,6 +223,8 @@ export class DesktopLifecycle {
     this.serviceFactory = options.createServiceManager ?? createAppserverServiceManager;
     this.targetManagerFactory =
       options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
+    this.peerShareFactory = options.createPeerShare ?? ((workspaceRoots) => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore(), workspaceRoots }));
+    this.workspaceRootsFactory = options.createWorkspaceRoots ?? (() => new WorkspaceRootsService({ store: new ElectronWorkspaceRootsStore() }));
     this.speechServiceFactory =
       options.createSpeechService ?? ((speechOptions) => createDesktopSpeechService(speechOptions));
     this.updateControllerFactory = options.createUpdateController ?? createElectronUpdateController;
@@ -261,6 +273,11 @@ export class DesktopLifecycle {
     await this.electronApp.whenReady();
     this.projectionCache = this.projectionCacheFactory();
     if (process.platform === "darwin") this.electronApp.setAsDefaultProtocolClient("t4-code");
+    // Pairing uses a network listener and must never prevent the desktop UI
+    // from opening. The IPC bridge can await this same host on demand.
+    this.workspaceRoots = this.workspaceRootsFactory();
+    const peerShare = this.peerShareFactory(this.workspaceRoots);
+    this.peerShare = peerShare;
     this.updateController = this.updateControllerFactory();
     if (this.electronApp.isPackaged) {
       this.phoneSetup = new PhoneSetupService({
@@ -308,6 +325,9 @@ export class DesktopLifecycle {
     );
     await this.acquireServiceManager();
     if (this.stopping) return;
+    void peerShare.start().catch(() => {
+      // Pairing is optional. A later explicit share request retries startup.
+    });
     await this.profileRuntime.startAutomaticProfiles((profileId, error) => {
       this.ipc?.emitRuntimeError(runtimeError(error, `local:${profileId}`));
     });
@@ -354,6 +374,7 @@ export class DesktopLifecycle {
     const recoveries = [...this.serviceRecoveryPromises.values()];
     await Promise.all([
       manager?.close() ?? Promise.resolve(),
+      this.peerShare?.stop() ?? Promise.resolve(),
       recovery?.then(
         () => undefined,
         () => undefined,
@@ -694,6 +715,15 @@ export class DesktopLifecycle {
       ...(this.profileRuntime === undefined ? {} : { profileRuntime: this.profileRuntime }),
       ...(this.projectionCache === undefined ? {} : { projectionCache: this.projectionCache }),
       drainPairLinks: () => this.pendingPairs.drain(),
+      ...(this.peerShare === undefined ? {} : { peerShare: this.peerShare }),
+      ...(this.workspaceRoots === undefined ? {} : { workspaceRoots: this.workspaceRoots }),
+      chooseWorkspaceRoot: async () => {
+        const choice = await dialog.showOpenDialog(handle.window, {
+          title: "Choose workspace folder",
+          properties: ["openDirectory", "createDirectory"],
+        });
+        return choice.canceled ? null : (choice.filePaths[0] ?? null);
+      },
       drainPendingUpdateOpen: () => this.markUpdateRendererReady(),
       ...(this.updateController === undefined ? {} : { updateController: this.updateController }),
       ...(this.phoneSetup === undefined ? {} : { phoneSetup: this.phoneSetup }),

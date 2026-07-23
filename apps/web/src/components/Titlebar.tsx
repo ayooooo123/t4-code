@@ -13,6 +13,8 @@ import { rendererPlatform, useWorkspace, workspaceStore } from "../state/store-i
 import { resolveTheme } from "../theme/theme.ts";
 import { HostedAppAction } from "./HostedAppAction.tsx";
 import { MobileConnectionAction } from "./MobileConnectionAction.tsx";
+import { PeerShareAction } from "./PeerShareAction.tsx";
+import { MobileWorkspaceAction } from "./MobileWorkspaceAction.tsx";
 import type { RailTogglePresentation } from "./rail-toggle.ts";
 
 function ThemeToggle() {
@@ -168,6 +170,8 @@ export function Titlebar({
       </Tooltip>
       <HostedAppAction />
       <MobileConnectionAction />
+      <PeerShareAction />
+      <MobileWorkspaceAction />
       <Tooltip>
         <TooltipTrigger
           render={

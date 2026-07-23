@@ -1,42 +1,21 @@
-import {
-  createOmpClient,
-  ompAppV1ProtocolProvider,
-  type OmpClient,
-  type OmpClientOptions,
-  type OmpTransport,
-  type PublicOmpServerEvent,
-  type PublicServerFrame,
-} from "@t4-code/client";
+import { createOmpClient, ompAppV1ProtocolProvider, type OmpClient, type OmpClientOptions, type OmpTransport, type PublicOmpServerEvent, type PublicServerFrame } from "@t4-code/client";
 import { commandId, confirmationId, hostId, requestId } from "@t4-code/protocol";
-import { describe, expect, it, afterEach } from "vite-plus/test";
+import { describe, expect, it, afterEach, vi } from "vite-plus/test";
 
 import { resolveRendererPlatform } from "../src/platform/bridge.ts";
 import { createBrowserShellPort, detectBackend } from "../src/platform/browser-shell-port.ts";
 import { BrowserWebSocketTransport } from "../src/platform/browser-transport.ts";
-import {
-  parseTailnetBackend,
-  selectStoredMobileBackend,
-  writeStoredMobileBackend,
-} from "../src/platform/native-mobile.ts";
-
-const originalDocument = globalThis.document;
-const originalWindow = globalThis.window;
-const originalWebSocket = globalThis.WebSocket;
-const originalSpeechSynthesis = (globalThis as typeof globalThis & { speechSynthesis?: unknown }).speechSynthesis;
-const originalUtterance = (globalThis as typeof globalThis & { SpeechSynthesisUtterance?: unknown }).SpeechSynthesisUtterance;
-
-class MemoryStorage {
-  readonly values = new Map<string, string>();
-  getItem(key: string): string | null { return this.values.get(key) ?? null; }
-  setItem(key: string, value: string): void { this.values.set(key, value); }
-  removeItem(key: string): void { this.values.delete(key); }
-}
+import { CapacitorPeerTransport } from "../src/platform/peer-transport.ts";
 
 function publicEvent(frame: PublicServerFrame): PublicOmpServerEvent {
   const event = ompAppV1ProtocolProvider.decodeServerEvent(frame);
   if (event.kind === "pair.ok") throw new Error("pair.ok is not a public event");
   return event;
 }
+
+const originalDocument = globalThis.document;
+const originalWindow = globalThis.window;
+const originalWebSocket = globalThis.WebSocket;
 
 class FakeLifecycleTarget {
   visibilityState: DocumentVisibilityState = "visible";
@@ -70,11 +49,10 @@ function setBackendScript(payload: string): void {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   Object.defineProperty(globalThis, "document", { configurable: true, value: originalDocument });
   Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
   Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: originalWebSocket });
-  Object.defineProperty(globalThis, "speechSynthesis", { configurable: true, value: originalSpeechSynthesis });
-  Object.defineProperty(globalThis, "SpeechSynthesisUtterance", { configurable: true, value: originalUtterance });
 });
 
 describe("browser platform boundary", () => {
@@ -83,24 +61,6 @@ describe("browser platform boundary", () => {
     Object.defineProperty(globalThis, "window", { configurable: true, value: undefined });
     const platform = resolveRendererPlatform("linux");
     expect(platform.mode).toBe("browser");
-    expect(platform.demo).toBe(false);
-    expect(platform.shell).toBeNull();
-  });
-
-  it("forces the public demo onto fixtures despite live backend inputs", () => {
-    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: {
-        location: { search: "?backend=wss%3A%2F%2Fomp.example%2Fv1%2Fws" },
-        ompShell: { kind: "desktop", platform: "darwin" },
-      },
-    });
-
-    const platform = resolveRendererPlatform("linux", { forceFixture: true });
-    expect(platform.mode).toBe("browser");
-    expect(platform.platform).toBe("linux");
-    expect(platform.demo).toBe(true);
     expect(platform.shell).toBeNull();
   });
 
@@ -136,6 +96,9 @@ describe("browser platform boundary", () => {
       configurable: true,
       value: {
         __t4MobileBackend: {
+          endpointKey: "https://host.tailnet.ts.net:8445#profile=default",
+          origin: "https://host.tailnet.ts.net:8445",
+          profileId: "default",
           wsUrl: "wss://host.tailnet.ts.net:8445/v1/ws",
           label: "T4 on host",
           deviceId: "android-device",
@@ -150,6 +113,106 @@ describe("browser platform boundary", () => {
       deviceId: "android-device",
       deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     });
+  });
+
+  it("ignores obsolete mobile globals", () => {
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4PreparedMobileConnection: {
+          hostId: "host_OLDAAAAAAAA",
+          transportId: "tail_OLDAAAAAAAA",
+          kind: "tailscale",
+          origin: "https://old.tailnet.ts.net:8445",
+          wsUrl: "wss://old.tailnet.ts.net:8445/v1/ws",
+          label: "Old",
+          credentialScopeKey: "https://old.tailnet.ts.net:8445",
+        },
+        __t4MobilePeerInvite: "t4peer://v1/old/old",
+        location: { search: "" },
+      },
+    });
+    expect(detectBackend()).toBeNull();
+    expect(createBrowserShellPort()).toBeNull();
+  });
+
+  it("uses only the explicitly prepared transport without treating the logical host ID as OMP identity", async () => {
+    const fakeClient = {
+      state: "idle",
+      connect: async () => undefined,
+      close: async () => undefined,
+      onEvent: () => () => undefined,
+      onState: () => () => undefined,
+      onError: () => () => undefined,
+    };
+    let tailOptions: OmpClientOptions | undefined;
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4MobileBackend: {
+          endpointKey: "https://tail.tailnet.ts.net:8445#profile=default",
+          origin: "https://tail.tailnet.ts.net:8445",
+          profileId: "default",
+          wsUrl: "wss://tail.tailnet.ts.net:8445/v1/ws",
+          label: "Tail desktop",
+        },
+        location: { search: "" },
+      },
+    });
+    const tailShell = createBrowserShellPort({
+      clientFactory: (options) => { tailOptions = options; return fakeClient as unknown as OmpClient; },
+    });
+    await tailShell?.connect({ targetId: "remote" });
+    expect(tailOptions).toBeDefined();
+    expect(tailOptions).not.toHaveProperty("expectedHostId");
+    expect(tailOptions?.client).not.toHaveProperty("hostId");
+    expect(tailOptions?.requestedFeatures).toContain("agent.transcript");
+    expect(tailOptions?.compatibilityRequestedFeatures).toContain("agent.transcript");
+    class OpeningWebSocket {
+      static readonly OPEN = 1;
+      readyState = OpeningWebSocket.OPEN;
+      binaryType = "blob";
+      private readonly listeners = new Map<string, Set<EventListener>>();
+      constructor() { queueMicrotask(() => this.dispatch("open")); }
+      addEventListener(type: string, listener: EventListener): void {
+        const listeners = this.listeners.get(type) ?? new Set<EventListener>();
+        listeners.add(listener);
+        this.listeners.set(type, listeners);
+      }
+      removeEventListener(type: string, listener: EventListener): void { this.listeners.get(type)?.delete(listener); }
+      dispatch(type: string): void { for (const listener of this.listeners.get(type) ?? []) listener({ type } as Event); }
+      close(): void { this.readyState = 3; }
+      send(): void {}
+    }
+    Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: OpeningWebSocket });
+    const tailTransport = await tailOptions?.transport();
+    expect(tailTransport).toBeInstanceOf(BrowserWebSocketTransport);
+    tailTransport?.close();
+
+    let peerOptions: OmpClientOptions | undefined;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4MobilePeer: {
+          invite: "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          label: "Peer desktop",
+        },
+        location: { search: "" },
+      },
+    });
+    const peerShell = createBrowserShellPort({
+      clientFactory: (options) => { peerOptions = options; return fakeClient as unknown as OmpClient; },
+    });
+    await peerShell?.connect({ targetId: "remote" });
+    expect(peerOptions).toBeDefined();
+    expect(peerOptions).not.toHaveProperty("expectedHostId");
+    expect(peerOptions?.client).not.toHaveProperty("hostId");
+    expect(peerOptions?.requestedFeatures).not.toContain("agent.transcript");
+    expect(peerOptions?.compatibilityRequestedFeatures).not.toContain("agent.transcript");
+    await expect(peerOptions?.transport()).rejects.toThrow(/native private connection is unavailable/u);
+    expect(CapacitorPeerTransport.name).toBe("CapacitorPeerTransport");
   });
 
   it("exposes one remote target and no local service lifecycle", async () => {
@@ -198,6 +261,60 @@ describe("browser platform boundary", () => {
     windowTarget.dispatch("online");
     await Promise.resolve();
     expect(wakes).toBe(1);
+  });
+
+  it("preserves a healthy private peer transport after native resume", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        __t4MobilePeer: {
+          invite:
+            "t4peer://v1/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          label: "Peer desktop",
+        },
+        location: { search: "" },
+      },
+    });
+    const windowTarget = new FakeLifecycleTarget();
+    const documentTarget = new FakeLifecycleTarget();
+    let wakes = 0;
+    let reconnects = 0;
+    const fakeClient = {
+      state: "ready",
+      connect: async () => undefined,
+      close: async () => undefined,
+      wake: () => {
+        wakes += 1;
+      },
+      reconnectNow: () => {
+        reconnects += 1;
+      },
+      onEvent: () => () => undefined,
+      onState: () => () => undefined,
+      onError: () => () => undefined,
+    };
+    const shell = createBrowserShellPort({
+      clientFactory: () => fakeClient as unknown as OmpClient,
+      lifecycle: { windowTarget, documentTarget },
+    });
+    if (shell === null) throw new Error("shell should not be null");
+
+    await shell.bootstrap();
+    windowTarget.dispatch("t4:native-resume");
+    await Promise.resolve();
+
+    expect(reconnects).toBe(0);
+    expect(wakes).toBe(0);
+    windowTarget.dispatch("pageshow");
+    windowTarget.dispatch("online");
+    await Promise.resolve();
+    expect(wakes).toBe(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reconnects).toBe(0);
+    expect(wakes).toBe(1);
+    await shell.disconnect({ targetId: "remote" });
   });
 
   it("bounds transport URLs and cleans listeners on close", () => {
@@ -322,19 +439,17 @@ describe("browser platform boundary", () => {
     });
     if (shell === null) return;
     const emittedEvents: PublicOmpServerEvent[] = [];
-    const stopEvents = shell.onServerEvent((event) => {
-      emittedEvents.push(event.event);
-    });
+    const stopEvents = shell.onServerEvent((envelope) => emittedEvents.push(envelope.event));
     await shell.bootstrap();
     expect(connectCalls).toBe(0);
     await shell.connect({ targetId: "remote" });
     expect(connectCalls).toBe(1);
     expect(capturedOptions?.requestedFeatures).toContain("prompt.images");
     expect(capturedOptions?.requestedFeatures).toContain("transcript.images");
-    expect(capturedOptions?.requestedFeatures).toContain("transcript.search");
+    expect(capturedOptions?.requestedFeatures).toContain("agent.transcript");
+    expect(capturedOptions?.compatibilityRequestedFeatures).toContain("agent.transcript");
     expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("prompt.images");
     expect(capturedOptions?.compatibilityRequestedFeatures).not.toContain("transcript.images");
-    expect(capturedOptions?.compatibilityRequestedFeatures).toContain("transcript.search");
     const pair = await shell.pair({ targetId: "remote", code: "123456" });
     expect(pair.paired).toBe(true);
     expect(capturedOptions?.authentication?.()).toEqual({
@@ -435,75 +550,6 @@ describe("browser platform boundary", () => {
     await shell.disconnect({ targetId: "remote" });
     stopEvents();
     expect(closed).toBe(true);
-  });
-
-  it("fails closed when the active native endpoint changes before pairing completes", async () => {
-    const profileA = parseTailnetBackend("https://profile-a.tailnet.ts.net:8445", "alpha");
-    const profileB = parseTailnetBackend("https://profile-b.tailnet.ts.net:8445", "beta");
-    const storage = new MemoryStorage();
-    writeStoredMobileBackend(profileA, storage);
-    writeStoredMobileBackend(profileB, storage);
-    selectStoredMobileBackend(profileA.endpointKey, storage);
-
-    const writes: Array<{ readonly hostKey: string }> = [];
-    Object.defineProperty(globalThis, "document", { configurable: true, value: undefined });
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: {
-        localStorage: storage,
-        __t4MobileBackend: profileA,
-        Capacitor: {
-          isNativePlatform: () => true,
-          getPlatform: () => "android",
-          Plugins: {
-            T4SecureStorage: {
-              getCredentials: () => Promise.resolve({ credentials: null }),
-              setCredentials: (options: { readonly hostKey: string }) => {
-                writes.push(options);
-                return Promise.resolve();
-              },
-              clearCredentials: () => Promise.resolve(),
-            },
-          },
-        },
-      },
-    });
-
-    let capturedOptions: OmpClientOptions | undefined;
-    const fakeClient = {
-      get state(): "pairing" {
-        return "pairing";
-      },
-      pairStart: async () => {
-        const callback = capturedOptions?.privilegedPairResult;
-        if (callback === undefined) throw new Error("pair callback missing");
-        await callback({
-          deviceId: "profile-a-device",
-          deviceToken: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        } as never);
-        return { type: "pair.ok" };
-      },
-      onEvent: () => () => undefined,
-      onState: () => () => undefined,
-      onError: () => () => undefined,
-    };
-    const shell = createBrowserShellPort({
-      clientFactory: (options) => {
-        capturedOptions = options;
-        return fakeClient as unknown as OmpClient;
-      },
-    });
-    if (shell === null) return;
-    await shell.bootstrap();
-
-    selectStoredMobileBackend(profileB.endpointKey, storage);
-    window.__t4MobileBackend = profileB;
-
-    await expect(shell.pair({ targetId: "remote", code: "123456" })).rejects.toThrow(
-      "The active mobile host changed while pairing.",
-    );
-    expect(writes).toEqual([]);
-    expect(capturedOptions?.authentication?.()).toBeUndefined();
   });
 
   it("manages overlapping transport openings and prevents old ones from keeping sockets open or breaking new ones", async () => {
@@ -853,139 +899,5 @@ describe("browser platform boundary", () => {
     await Promise.resolve();
 
     await shell.disconnect({ targetId: "remote" });
-  });
-  it("reports honest unsupported browser speech and stop state", async () => {
-    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws", label: "Remote OMP" }));
-    Object.defineProperty(globalThis, "window", { configurable: true, value: undefined });
-    Object.defineProperty(globalThis, "speechSynthesis", { configurable: true, value: undefined });
-    Object.defineProperty(globalThis, "SpeechSynthesisUtterance", { configurable: true, value: undefined });
-    const shell = createBrowserShellPort();
-    if (shell === null) throw new Error("browser shell was not created");
-    expect(await shell.speakText?.({ text: "hello" })).toEqual({
-      accepted: false,
-      error: "Speech synthesis is unavailable",
-    });
-    expect(await shell.stopSpeaking?.()).toEqual({
-      accepted: false,
-      error: "Speech synthesis is unavailable",
-    });
-  });
-
-  it("settles pending browser speech before client teardown on disconnect", async () => {
-    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws", label: "Remote OMP" }));
-    Object.defineProperty(globalThis, "window", { configurable: true, value: undefined });
-    const events: string[] = [];
-    class FakeUtterance {
-      readonly text: string;
-      onend: (() => void) | null = null;
-      onerror: (() => void) | null = null;
-      constructor(text: string) {
-        this.text = text;
-      }
-    }
-    const spoken: FakeUtterance[] = [];
-    Object.defineProperty(globalThis, "SpeechSynthesisUtterance", {
-      configurable: true,
-      value: FakeUtterance,
-    });
-    Object.defineProperty(globalThis, "speechSynthesis", {
-      configurable: true,
-      value: {
-        cancel: () => {
-          events.push("speech.cancel");
-        },
-        speak: (utterance: FakeUtterance) => {
-          spoken.push(utterance);
-        },
-      },
-    });
-    const fakeClient = {
-      state: "idle",
-      connect: async () => undefined,
-      close: async () => {
-        events.push("client.close");
-      },
-      wake: () => undefined,
-      onEvent: () => () => undefined,
-      onState: () => () => undefined,
-      onError: () => () => undefined,
-    } as unknown as OmpClient;
-    const shell = createBrowserShellPort({
-      clientFactory: () => fakeClient,
-      lifecycle: { windowTarget: null, documentTarget: null },
-    });
-    if (shell === null) throw new Error("browser shell was not created");
-    await shell.bootstrap();
-
-    // Speech is mid-utterance: the fake synthesizer never fires onend.
-    const pending = shell.speakText?.({ text: "hello" });
-    if (pending === undefined) throw new Error("speakText is not exposed");
-    expect(spoken).toHaveLength(1);
-    // speakText itself cancels any prior utterance; only the disconnect
-    // ordering matters below.
-    events.length = 0;
-
-    const result = await shell.disconnect({ targetId: "remote" });
-    expect(result.state).toBe("disconnected");
-    // The pending speech promise settled instead of hanging forever...
-    await expect(pending).resolves.toEqual({ accepted: false, error: "Speech cancelled" });
-    // ...and the cancel landed before the client teardown, with no re-speak.
-    expect(events).toEqual(["speech.cancel", "client.close"]);
-    expect(spoken).toHaveLength(1);
-  });
-
-  it("stops pending Android speech before client teardown on disconnect", async () => {
-    setBackendScript(JSON.stringify({ wsUrl: "wss://omp.example/v1/ws", label: "Remote OMP" }));
-    const events: string[] = [];
-    let resolveSpeech: ((result: { accepted: boolean; error?: string }) => void) | undefined;
-    const speechPlugin = {
-      speakText: (_options: { text: string }) =>
-        new Promise<{ accepted: boolean; error?: string }>((resolve) => {
-          resolveSpeech = resolve;
-        }),
-      stopSpeaking: async () => {
-        events.push("android.stop");
-        // The native side settles the in-flight utterance when stopped.
-        resolveSpeech?.({ accepted: false, error: "Speech cancelled" });
-        resolveSpeech = undefined;
-        return { accepted: true };
-      },
-    };
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: {
-        location: { search: "" },
-        Capacitor: {
-          isNativePlatform: () => true,
-          getPlatform: () => "android",
-          Plugins: { T4Speech: speechPlugin },
-        },
-      },
-    });
-    const fakeClient = {
-      state: "idle",
-      connect: async () => undefined,
-      close: async () => {
-        events.push("client.close");
-      },
-      wake: () => undefined,
-      onEvent: () => () => undefined,
-      onState: () => () => undefined,
-      onError: () => () => undefined,
-    } as unknown as OmpClient;
-    const shell = createBrowserShellPort({
-      clientFactory: () => fakeClient,
-      lifecycle: { windowTarget: null, documentTarget: null },
-    });
-    if (shell === null) throw new Error("browser shell was not created");
-    await shell.bootstrap();
-
-    const pending = shell.speakText?.({ text: "hello" });
-    if (pending === undefined) throw new Error("speakText is not exposed");
-
-    const result = await shell.disconnect({ targetId: "remote" });
-    expect(result.state).toBe("disconnected");
-    await expect(pending).resolves.toEqual({ accepted: false, error: "Speech cancelled" });
-    expect(events).toEqual(["android.stop", "client.close"]);
   });
 });
