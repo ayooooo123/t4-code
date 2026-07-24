@@ -954,7 +954,7 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 export function parseSessionTranscriptMetadata(input: string | Uint8Array, path: string): SessionRecord {
 	const bytes = typeof input === "string" ? encoder.encode(input).byteLength : input.byteLength;
 	if (bytes > MAX_METADATA_BYTES) throw new Error("metadata prefix exceeds limit");
-	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input);
+	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input, { stream: true });
 	let fixedTitle: string | undefined;
 	let header: Record<string, unknown> | undefined;
 	for (const line of text.split(/\r?\n/u)) {
