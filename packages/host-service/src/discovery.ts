@@ -958,7 +958,12 @@ function parseTranscript(input: string | Uint8Array, path: string, host: HostId)
 export function parseSessionTranscriptMetadata(input: string | Uint8Array, path: string): SessionRecord {
 	const bytes = typeof input === "string" ? encoder.encode(input).byteLength : input.byteLength;
 	if (bytes > MAX_METADATA_BYTES) throw new Error("metadata prefix exceeds limit");
-	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input);
+	// The metadata reader receives a fixed byte-window prefix (see HEADER_BYTES /
+	// MAX_METADATA_BYTES), which can bisect a multibyte character at the window
+	// boundary. `stream: true` buffers the incomplete trailing sequence instead
+	// of throwing, while still rejecting genuine interior invalid UTF-8. Do NOT
+	// copy this for whole-file decode: an incomplete/bad tail would be dropped.
+	const text = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input, { stream: true });
 	let fixedTitle: string | undefined;
 	let header: Record<string, unknown> | undefined;
 	for (const line of text.split(/\r?\n/u)) {

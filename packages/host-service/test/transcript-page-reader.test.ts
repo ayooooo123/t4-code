@@ -117,6 +117,26 @@ describe("bounded backward transcript pages", () => {
 		expect(page.hasMore).toBe(false);
 	});
 
+	test("pages a transcript whose 128 KiB header window splits a multibyte character", async () => {
+		// HEADER_BYTES is 128 KiB. Position a 2-byte "é" so its first byte lands on
+		// the last in-window byte (131071); the fixed-size prefix therefore ends
+		// mid-character. A fatal, non-streaming decode of that window throws
+		// ERR_ENCODING_INVALID_ENCODED_DATA, which used to kill paging for a real
+		// session even though the file is valid UTF-8. The reader must tolerate it.
+		const head = header("boundary-session");
+		const jsonPrefix = `{"type":"message","id":"pad","parentId":null,"timestamp":"${new Date(Date.parse(stamp) + 1).toISOString()}","message":{"role":"assistant","content":"`;
+		const before = encoder.encode(head + jsonPrefix).byteLength;
+		const pad = 128 * 1024 - 1 - before; // next char's first byte sits at offset 131071
+		const line = `${jsonPrefix}${"x".repeat(pad)}${"é".repeat(300)}"}}\n`;
+		const fs = new MemoryPageFs(head + line + message("after", 2));
+		// Precondition: the raw 128 KiB window is not valid UTF-8 on its own.
+		expect(() => new TextDecoder("utf-8", { fatal: true }).decode(fs.content.subarray(0, 128 * 1024))).toThrow();
+		const reader = new TranscriptPageReader(host, fs, new Uint8Array(32).fill(3));
+		const page = await reader.page(record("boundary-session"), { limit: 5 });
+		expect(page.entries.length).toBeGreaterThan(0);
+		expect(decodeTranscriptPageResult(page)).toEqual(page);
+	});
+
 	test("freezes a paging walk while new lines append", async () => {
 		const fs = new MemoryPageFs(
 			header() + message("one", 1) + message("two", 2) + message("three", 3) + message("four", 4),
