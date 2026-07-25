@@ -61,6 +61,62 @@ class FakeFactory implements RpcChildFactory {
 		return ["omp", "--mode", "rpc", "--session", path];
 	}
 }
+class StateChild implements ChildHandle {
+	#pending: string[] = [`${JSON.stringify({ type: "ready" })}\n`];
+	#wake = Promise.withResolvers<void>();
+	#closed = false;
+	killed = false;
+	stdin = {
+		write: (data: string) => {
+			const frame = JSON.parse(data) as Record<string, unknown>;
+			const id = typeof frame.id === "string" ? frame.id : "";
+			const command = typeof frame.type === "string" ? frame.type : "unknown";
+			const payload = command === "get_state"
+				? {
+						isStreaming: false,
+						isCompacting: false,
+						isPaused: false,
+						messageCount: 0,
+						queuedMessageCount: 0,
+						steeringMode: "all",
+						followUpMode: "all",
+						interruptMode: "immediate",
+					}
+				: { accepted: true };
+			this.#pending.push(`${JSON.stringify({ type: "response", id, command, success: true, data: payload })}\n`);
+			this.#wake.resolve();
+			this.#wake = Promise.withResolvers<void>();
+		},
+	};
+	stdout: AsyncIterable<string> = this.stream();
+	#exit = Promise.withResolvers<number>();
+	exited = this.#exit.promise;
+	async *stream() {
+		for (;;) {
+			const next = this.#pending.shift();
+			if (next) yield next;
+			else if (this.#closed) return;
+			else await this.#wake.promise;
+		}
+	}
+	kill() {
+		this.killed = true;
+		this.#closed = true;
+		this.#wake.resolve();
+		this.#exit.resolve(0);
+	}
+}
+class StateFactory implements RpcChildFactory {
+	children: StateChild[] = [];
+	spawn() {
+		const child = new StateChild();
+		this.children.push(child);
+		return child;
+	}
+	argv(path: string) {
+		return ["omp", "--mode", "rpc", "--session", path];
+	}
+}
 class DeferredPromptChild implements ChildHandle {
 	#prompt = Promise.withResolvers<Record<string, unknown>>();
 	#state = Promise.withResolvers<Record<string, unknown>>();
@@ -956,6 +1012,92 @@ describe("appserver lifecycle", () => {
 			const ownership = new SessionOwnershipStore(sessionOwnershipPath);
 			await ownership.load();
 			expect(ownership.owns(sid, transcriptPath)).toBe(true);
+		} finally {
+			client.destroy();
+			await client.closed();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	test("keeps claimed official lockless sessions writable after attach", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-official-claim-lockless-"));
+		const socketPath = join(root, "run", "appserver.sock");
+		const transcriptPath = join(root, "official-session.jsonl");
+		const sid = sessionId("official-session");
+		const timestamp = "2026-07-22T00:00:00.000Z";
+		await writeFile(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", version: 3, id: sid, cwd: root, timestamp, title: "Official session" })}\n`,
+		);
+		const factory = new StateFactory();
+		const appserver = createAppserver({
+			hostId: host,
+			epoch: "official-claim-lockless-test",
+			socketPath,
+			discovery: new FileSessionDiscovery(root, realFs, host, true),
+			childFactory: factory,
+			lockStatus: () => "missing",
+			lockCheck: async () => {},
+			claimLocklessSessions: true,
+			rpcDialect: "official-17.0.9",
+		});
+		await appserver.start();
+		const client = await RawUdsWebSocket.connect(socketPath);
+		const responseFor = async (requestId: string) => {
+			for (;;) {
+				const frame = await client.nextServer();
+				if (frame.type === "response" && frame.requestId === requestId) return frame;
+			}
+		};
+		try {
+			client.sendJson({
+				v: "omp-app/1",
+				type: "hello",
+				protocol: { min: "omp-app/1", max: "omp-app/1" },
+				client: { name: "official-claim-lockless-test", version: "1", build: "test", platform: "linux" },
+				requestedFeatures: ["session.observer", "session.unverified"],
+				capabilities: { client: ["sessions.read", "sessions.control", "sessions.manage"] },
+				savedCursors: [],
+			});
+			expect(await client.nextServer()).toMatchObject({ type: "welcome" });
+			expect((await client.nextServer()).type).toBe("sessions");
+			client.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "attach-official",
+				commandId: "attach-official-command",
+				hostId: host,
+				sessionId: sid,
+				command: "session.attach",
+				args: {},
+			});
+			expect(await responseFor("attach-official")).toMatchObject({ ok: true });
+			client.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "state-official",
+				commandId: "state-official-command",
+				hostId: host,
+				sessionId: sid,
+				command: "session.state.get",
+				args: {},
+			});
+			expect(await responseFor("state-official")).toMatchObject({ ok: true });
+			const modelRevision = appserver.snapshot(sid)?.revision;
+			expect(modelRevision).toBeDefined();
+			client.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "model-official",
+				commandId: "model-official-command",
+				hostId: host,
+				sessionId: sid,
+				expectedRevision: modelRevision,
+				command: "session.model.set",
+				args: { selector: "gate0/deterministic", persistence: "session" },
+			});
+			expect(await responseFor("model-official")).toMatchObject({ ok: true });
+			expect(factory.children).toHaveLength(1);
 		} finally {
 			client.destroy();
 			await client.closed();

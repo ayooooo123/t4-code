@@ -4631,6 +4631,12 @@ export class LocalAppserver implements AppserverHandle {
 		} catch {
 			status = "malformed";
 		}
+		if (this.#claimLocklessSessions && status === "missing") {
+			const control = projection.setSessionControl();
+			if (control) await this.broadcastIndex(control);
+			this.cleanupObserverState(sessionId);
+			return;
+		}
 		if (status === "live" || status === "suspect" || status === "malformed") {
 			let observer = this.#observers.get(sessionId);
 			if (!observer) {
