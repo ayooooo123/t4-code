@@ -95,6 +95,7 @@ import {
 import { useWorkspaceRuntimeSnapshot } from "../state/shell-data.ts";
 import { useWorkspace, workspaceStore } from "../state/store-instance.ts";
 import { SessionListTabs } from "./SessionListTabs.tsx";
+import { WorkspaceRootsAction } from "./WorkspaceRootsAction.tsx";
 
 export function describeSessionState(session: WorkspaceSession): string {
   return presentSessionState(session).label;
@@ -1668,6 +1669,13 @@ export function Rail({
       ref={navRef}
       tabIndex={-1}
     >
+      <div className="px-1.5 pb-2">
+        <h2 className="font-medium text-foreground text-sm">Working folders</h2>
+        <p className="mt-0.5 text-muted-foreground text-xs leading-snug">
+          OMP groups sessions by the folder they were started in.
+        </p>
+        <WorkspaceRootsAction placement="rail" />
+      </div>
       <div className="px-1.5 pb-1.5">
         <div className="flex h-8 items-center gap-1">
           <h2 className="font-medium text-foreground text-xs">Sessions</h2>

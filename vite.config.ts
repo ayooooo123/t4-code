@@ -1,6 +1,6 @@
 import { defineConfig } from "vite-plus";
 
-const ignored = ["reference/**", "**/node_modules/**", "**/dist/**", "**/build/**", "**/out/**", "**/coverage/**", "**/release/**"];
+const ignored = ["reference/**", "third_party/**", "**/node_modules/**", "**/dist/**", "**/build/**", "**/out/**", "**/coverage/**", "**/release/**"];
 
 export default defineConfig({
   lint: {

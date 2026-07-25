@@ -106,12 +106,20 @@ function slashName(value: unknown, path: string): string {
   return name;
 }
 
+function stripControlChars(value: string): string {
+  let out = "";
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code > 0x1f && code !== 0x7f) out += character;
+  }
+  return out;
+}
+
 function inlineMetadata(value: unknown, path: string, maxBytes: number): string {
-  return controlFree(
-    typeof value === "string" ? value.replace(/[\t\n\r]+/gu, " ") : value,
-    path,
-    maxBytes,
+  const normalized = stripControlChars(
+    (typeof value === "string" ? value : String(value)).replace(/[\t\n\r]+/gu, " "),
   );
+  return controlFree(normalized, path, maxBytes);
 }
 
 function decodeHeadlessCommand(value: unknown, index: number): HeadlessCommand {
@@ -149,7 +157,7 @@ function decodeHeadlessCommands(value: unknown): readonly HeadlessCommand[] {
       rejected += 1;
       continue;
     }
-    if (names.has(command.name)) throw new Error(`duplicate available command: ${command.name}`);
+    if (names.has(command.name)) continue;
     names.add(command.name);
     commands.push(command);
   }

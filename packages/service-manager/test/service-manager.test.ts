@@ -316,6 +316,17 @@ describe("service-manager lifecycle", () => {
     expect((await manager.inspect()).service).toBe("running");
     expect(runner.calls.at(-1)).toEqual(["launchctl", "print", "gui/501/dev.oh-my-pi.appserver"]);
   });
+  it("treats a loaded-but-not-running LaunchAgent as stopped", async () => {
+    const fs = new MemoryFs();
+    const runner = new MemoryRunner();
+    const manager = new MacLaunchAgentManager(spec, { ...options(fs, runner), uid: 501 });
+    // launchd prints this for a cleanly-exited KeepAlive job while `launchctl print`
+    // still exits 0. It must read as "stopped" so service repair restarts the host.
+    runner.results = [
+      { exitCode: 0, stdout: "\tstate = not running\n\tlast exit code = 0\n", stderr: "" },
+    ];
+    expect((await manager.inspect()).service).toBe("stopped");
+  });
   it("reports missing/current/drifted and bounded service states", async () => {
     const fs = new MemoryFs();
     const runner = new MemoryRunner();

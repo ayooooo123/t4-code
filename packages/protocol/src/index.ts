@@ -14,6 +14,10 @@ export * from "@t4-code/host-wire";
 export * from "./app-update.ts";
 export * from "./pair-link.ts";
 export * from "./server-event.ts";
+export { decodePeerInvite, encodePeerInvite, peerInviteMetadata } from "./peer-invite.ts";
+export type { PeerInvite, PeerInviteMetadata } from "./peer-invite.ts";
+export { decodePeerWireFrame, encodePeerWireFrame, PeerWireDecoder } from "./peer-wire.ts";
+export type { PeerWireFrame } from "./peer-wire.ts";
 
 export type SessionControlCompatibility = "absent" | "known" | "unknown";
 

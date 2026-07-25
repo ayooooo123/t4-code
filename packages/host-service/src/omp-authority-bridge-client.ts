@@ -81,6 +81,11 @@ function contextPayload(context: OperationContext): Record<string, unknown> {
 	};
 }
 
+/**
+ * omp owns the session files and re-reads them by identity, so the host must never ship its loaded
+ * transcript back across the bridge: the {@link SessionRecord.entries} array is unbounded and a large
+ * one overflows the peer's request-param budget, crashing the bridge. Send identity/metadata only.
+ */
 function sessionReference(session: SessionRecord): SessionRecord {
 	return { ...session, entriesLoaded: false, entries: [] };
 }
@@ -201,6 +206,7 @@ export class OmpAuthorityBridgeClient {
 	#stderr = "";
 	#sessionInventoryComplete = true;
 	#sessionInventoryTotalCount = 0;
+	#closeGate = Promise.withResolvers<Error>();
 
 	constructor(
 		private readonly invocation: OmpAuthorityBridgeInvocation,
@@ -210,6 +216,15 @@ export class OmpAuthorityBridgeClient {
 	get identity(): Pick<OmpAuthorityBridgeReady, "ompVersion" | "ompBuild"> {
 		if (!this.#ready) throw new Error("OMP authority bridge is not ready");
 		return { ompVersion: this.#ready.ompVersion, ompBuild: this.#ready.ompBuild };
+	}
+
+	/**
+	 * Resolves with the failure error when the bridge dies unexpectedly (child exit, closed
+	 * stdout, ready timeout). A graceful {@link stop} never resolves it, so a supervisor can
+	 * await this to distinguish an intentional shutdown from a crashed bridge.
+	 */
+	get closed(): Promise<Error> {
+		return this.#closeGate.promise;
 	}
 
 	async start(): Promise<OmpAuthorityBridgeReady> {
@@ -406,7 +421,7 @@ export class OmpAuthorityBridgeClient {
 					pending.resolve(frame.result);
 				} else pending.reject(bridgeError(frame.error.code, frame.error.message));
 			}
-			this.#fail(new Error("OMP authority bridge closed stdout"));
+			this.#fail(new Error(`OMP authority bridge closed stdout${this.#stderr ? `: ${this.#stderr}` : ""}`));
 		} catch (error) {
 			this.#fail(error instanceof Error ? error : new Error(String(error)));
 		}
@@ -425,6 +440,7 @@ export class OmpAuthorityBridgeClient {
 		this.#rejectPending(error);
 		if (!this.#closed) {
 			this.#closed = true;
+			this.#closeGate.resolve(error);
 			this.#child?.kill("SIGTERM");
 		}
 	}

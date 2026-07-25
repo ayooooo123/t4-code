@@ -95,7 +95,7 @@ describe("safe-area insets", () => {
   });
 
   it("renders the mobile connection screen with structural insets on every edge", () => {
-    const markup = renderToStaticMarkup(<MobileConnectionScreen />);
+    const markup = renderToStaticMarkup(<MobileConnectionScreen mode="first-run" />);
     expect(markup).toContain("pt-(--app-safe-area-top)");
     expect(markup).toContain("pb-[calc(2.5rem+var(--app-safe-area-bottom))]");
     expect(markup).toContain("pr-[max(1.25rem,var(--app-safe-area-right))]");

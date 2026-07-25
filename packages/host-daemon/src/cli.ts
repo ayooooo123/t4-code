@@ -24,6 +24,9 @@ export const OFFICIAL_OMP_VERSION = "17.0.9";
 export const OFFICIAL_OMP_BUILD = "639bac596d94b5993349f3f6696176cb2bf9b5d3";
 const PROFILE = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const ORIGIN_LIMIT = 32;
+// After the bridge dies we ask the appserver to stop, but a dead bridge can wedge that teardown; cap
+// the wait so the process always exits and the service manager restarts a healthy host.
+const SHUTDOWN_GRACE_MS = 2_000;
 const VERSION_OUTPUT_BYTES = 4 * 1024;
 const VERSION_TIMEOUT_MS = 5_000;
 const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
@@ -351,6 +354,11 @@ export async function runHostDaemon(
       projectRootForProject,
       lockCheck,
       lockStatus,
+      // Local desktop daemon (official, or non-remote bridge): claim lockless
+      // (no-lock) sessions so omp-CLI sessions become writable in T4. A live owner
+      // holds a "live" lock and is never lockless, and startSupervisor still acquires
+      // the write-lock at spawn, so this cannot displace an active owner. Remote/shared
+      // bridge authority keeps the conservative "unclear ownership stays read-only".
       ...(config.authorityMode === "official" || !config.remote ? { claimLocklessSessions: true } : {}),
       ...(transcriptImageRoot ? { transcriptImageRoot } : {}),
       rpcChildInvocation: { executable: config.ompExecutable, prefixArgv: [] },
@@ -401,7 +409,23 @@ export async function runHostDaemon(
     onSignal("SIGTERM", stop);
     try {
       await appserver.start();
-      await stopped.promise;
+      const bridgeFailure = bridge
+        ? await Promise.race([
+            stopped.promise.then<Error | undefined>(() => undefined),
+            bridge.closed,
+          ])
+        : await stopped.promise.then<Error | undefined>(() => undefined);
+      if (bridgeFailure) {
+        process.stderr.write(
+          `t4-host: OMP authority bridge closed unexpectedly; exiting so the service restarts: ${bridgeFailure.message}\n`,
+        );
+        stop();
+        await Promise.race([
+          stopped.promise.catch(() => undefined),
+          new Promise<void>(resolve => setTimeout(resolve, SHUTDOWN_GRACE_MS)),
+        ]);
+        throw bridgeFailure;
+      }
     } finally {
       removeSignal("SIGINT", stop);
       removeSignal("SIGTERM", stop);
@@ -422,6 +446,10 @@ async function main(): Promise<void> {
     );
     process.exitCode = 1;
   }
+  // The appserver's listener and a half-dead bridge can leave open handles that keep this process
+  // alive after the daemon logic has finished. Exit explicitly so a crashed bridge always yields a
+  // clean restart instead of an unreachable, never-restarted host.
+  process.exit(process.exitCode ?? 0);
 }
 
 if (import.meta.main) await main();

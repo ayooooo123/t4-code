@@ -1,0 +1,3 @@
+[submodule "third_party/hyperdht-cpp"]
+	path = third_party/hyperdht-cpp
+	url = https://github.com/jjacke13/hyperdht-cpp.git

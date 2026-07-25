@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { MobileConnectionScreen } from "../src/components/MobileConnectionScreen.tsx";
 import {
   MOBILE_BACKEND_STORAGE_KEY,
+  MOBILE_PEER_BACKEND_STORAGE_KEY,
   parseTailnetBackend,
   persistNativeMobileCredentials,
   prepareNativeMobileBackend,
@@ -14,8 +15,10 @@ import {
   removeNativeMobileBackend,
   selectStoredMobileBackend,
   type StoredMobileBackendDirectory,
+  writeFirstRunPeerBackend,
   writeStoredMobileBackend,
 } from "../src/platform/native-mobile.ts";
+import { parsePeerBackend } from "../src/platform/mobile-connection-records.ts";
 
 const originalDocument = globalThis.document;
 const originalWindow = globalThis.window;
@@ -356,6 +359,8 @@ describe("native mobile connection", () => {
     await vi.advanceTimersByTimeAsync(3_000);
     await expect(boot).resolves.toEqual({
       kind: "setup",
+      mode: "repair",
+      repairAction: "unavailable",
       message: "Android secure storage did not answer. Close T4 Code and open it again.",
     });
     expect(reads).toBe(2);
@@ -383,8 +388,67 @@ describe("native mobile connection", () => {
 
     await expect(prepareNativeMobileBackend()).resolves.toEqual({
       kind: "setup",
+      mode: "repair",
+      repairAction: "tailnet",
       message: "Host storage is unavailable.",
     });
+  });
+
+  it("boots the stored private peer connection when no tailnet directory exists", async () => {
+    const storage = new MemoryStorage();
+    const invite = `t4peer://v1/${"A".repeat(43)}/${"A".repeat(43)}`;
+    const peer = parsePeerBackend(invite);
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(true);
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { documentElement: { dataset: {} } },
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: storage,
+        Capacitor: { isNativePlatform: () => true, getPlatform: () => "android" },
+      },
+    });
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({
+      kind: "ready",
+      peer: { invite: peer.invite, label: peer.label },
+    });
+    expect(window.__t4MobilePeer).toEqual({ invite: peer.invite, label: peer.label });
+    expect(window.__t4MobileBackend).toBeUndefined();
+  });
+
+  it("prefers the tailnet directory over a stale peer record and guards first-run peer writes", async () => {
+    const storage = new MemoryStorage();
+    const backend = parseTailnetBackend("https://bunker.tailnet.ts.net:8445");
+    writeStoredMobileBackend(backend, storage);
+    const invite = `t4peer://v1/${"A".repeat(43)}/${"A".repeat(43)}`;
+    const peer = parsePeerBackend(invite);
+    expect(writeFirstRunPeerBackend(peer, storage)).toBe(false);
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(peer));
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { documentElement: { dataset: {} } },
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        localStorage: storage,
+        Capacitor: {
+          isNativePlatform: () => true,
+          getPlatform: () => "android",
+          Plugins: {
+            T4SecureStorage: {
+              getCredentials: () => Promise.resolve({ credentials: null }),
+              setCredentials: () => Promise.resolve(),
+              clearCredentials: () => Promise.resolve(),
+            },
+          },
+        },
+      },
+    });
+    await expect(prepareNativeMobileBackend()).resolves.toEqual({ kind: "ready", backend });
+    expect(window.__t4MobilePeer).toBeUndefined();
   });
 
   it("stores and removes credentials for exactly the selected host", async () => {

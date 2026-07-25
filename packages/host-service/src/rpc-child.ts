@@ -147,10 +147,10 @@ function rawUserMessage(
  */
 class DurableJsonlReconciler {
 	#offset = 0;
+	#skippingOversizedLine = false;
 	#entryCount = 0;
 	#rawEntryCount = 0;
 	#lastEntryId: string | null = null;
-	#skippingOversizedLine = false;
 	#oversizedLineStart = 0;
 	readonly #projectedEntryIds = new Set<string>();
 	readonly #entryPositions = new Map<string, number>();
@@ -294,7 +294,7 @@ class DurableJsonlReconciler {
 					} else {
 						const line = pending.byteLength === 0 ? segment : Buffer.concat([pending, segment]);
 						if (line.byteLength > 0)
-							this.#observeLine(new TextDecoder("utf-8", { fatal: true }).decode(line), publish);
+							this.#observeLine(line, publish);
 						pending = Buffer.alloc(0);
 						pendingStart = chunkStart + newline + 1;
 					}
@@ -316,12 +316,21 @@ class DurableJsonlReconciler {
 		if (publish) this.transcriptRecordOmitted?.(this.#oversizedLineStart);
 	}
 
-	#observeLine(line: string, publish: boolean): void {
+	#observeLine(line: Uint8Array, publish: boolean): void {
+		let text: string;
+		try {
+			text = new TextDecoder("utf-8", { fatal: true }).decode(line);
+		} catch {
+			return;
+		}
 		let value: unknown;
 		try {
-			value = parseBounded(line);
+			// Lenient parse mirrors the discovery observer's watermark counting: an
+			// entry with escaped control characters in tool output parses and counts
+			// here exactly as it does there, so the two watermarks cannot diverge.
+			value = JSON.parse(text);
 		} catch {
-			throw new Error("malformed session transcript");
+			return;
 		}
 		const id = durableEntryId(value);
 		if (!id) return;
@@ -689,6 +698,18 @@ export class RpcChildSupervisor {
 		this.fail(new Error("rpc child stopped"));
 		// The owner must retain this handle until `exited` settles. Clearing it
 		// here would let lifecycle retries lose track of a signal-resistant child.
+	}
+	/**
+	 * Force the child to exit after the owner declares the runtime crashed, so a
+	 * wedged child cannot linger holding its session lock and pin the session
+	 * read-only forever. Marks the supervisor closed, rejects pending calls, then
+	 * escalates SIGTERM -> SIGKILL. Idempotent and safe to call after stop()/fail().
+	 */
+	terminate(): void {
+		this.#closed = true;
+		for (const pending of this.#pending.values()) pending.reject(new Error("rpc child terminated"));
+		this.#pending.clear();
+		this.terminateAfterReaderFailure();
 	}
 	loadedWatermark(): RpcLoadedTranscriptWatermark | undefined {
 		return this.#ready ? this.#transcript.watermark() : undefined;

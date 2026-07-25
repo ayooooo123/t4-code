@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, readlinkSync } from "node:fs";
 import { connect as netConnect } from "node:net";
 import { dirname, join, parse } from "node:path";
 import WebSocket from "ws";
-import type { OmpTransport } from "@t4-code/client";
+import { MAX_INBOUND_BYTES, type OmpTransport } from "@t4-code/client";
 import { localSocketPath } from "./socket-path.ts";
 
 const OMP_SOCKET_NAME = /^\.appserver-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.sock$/;
@@ -101,7 +101,7 @@ export class UnixWebSocketTransport implements OmpTransport {
     const socketPath = this.shouldValidate ? resolveUnixSocketPath(this.socketPath) : this.socketPath;
     const socket = new WebSocket("ws://omp.local/ws", {
       perMessageDeflate: false,
-      maxPayload: 1_048_576,
+      maxPayload: MAX_INBOUND_BYTES,
       handshakeTimeout: this.handshakeTimeoutMs + 100,
       createConnection: () => netConnect({ path: socketPath }),
     });
