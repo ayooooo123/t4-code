@@ -709,6 +709,139 @@ describe("child supervision", () => {
 		supervisor.stop();
 	});
 
+	test("accepts an append-only ready watermark race during official OMP startup", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-official-ready-watermark-race-"));
+		const path = join(root, "session.jsonl");
+		await writeFile(
+			path,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "session", timestamp: stamp, cwd: root }),
+				JSON.stringify({ type: "message", id: "loaded-before-ready", message: { role: "assistant", content: "loaded" } }),
+			].join("\n") + "\n",
+		);
+		const finish = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				await appendFile(
+					path,
+					`${JSON.stringify({ type: "custom", id: "startup-after-watermark", customType: "runtime_ready" })}\n`,
+				);
+				yield `${JSON.stringify({
+					type: "ready",
+					transcriptWatermark: { lastEntryId: "loaded-before-ready", entryCount: 1 },
+				})}\n`;
+				await finish.promise;
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				finish.resolve();
+				exited.resolve(0);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: sessionPath => ["omp", "--mode", "rpc", "--session", sessionPath] },
+			{ ...record("official-ready-watermark-race"), path, cwd: root },
+			{ entry: () => {}, event: () => {}, crashed: error => expect.unreachable(error.message) },
+		);
+		await supervisor.start();
+		expect(supervisor.loadedWatermark()).toEqual({
+			lastEntryId: "startup-after-watermark",
+			entryCount: 2,
+		});
+		supervisor.stop();
+	});
+
+	test("accepts ready watermark positions that include an omitted oversized transcript record", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-official-ready-watermark-oversized-"));
+		const path = join(root, "session.jsonl");
+		const oversized = JSON.stringify({
+			type: "message",
+			id: "oversized-before-ready",
+			message: { role: "assistant", content: "x".repeat(1024 * 1024 + 256) },
+		});
+		await writeFile(
+			path,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "session", timestamp: stamp, cwd: root }),
+				JSON.stringify({ type: "message", id: "before-oversized", message: { role: "assistant", content: "before" } }),
+				oversized,
+				JSON.stringify({ type: "message", id: "after-oversized", message: { role: "assistant", content: "after" } }),
+			].join("\n") + "\n",
+		);
+		const finish = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				yield `${JSON.stringify({
+					type: "ready",
+					transcriptWatermark: { lastEntryId: "after-oversized", entryCount: 3 },
+				})}\n`;
+				await finish.promise;
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				finish.resolve();
+				exited.resolve(0);
+			},
+		};
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: sessionPath => ["omp", "--mode", "rpc", "--session", sessionPath] },
+			{ ...record("official-ready-watermark-oversized"), path, cwd: root },
+			{ entry: () => {}, event: () => {}, crashed: error => expect.unreachable(error.message) },
+		);
+		await supervisor.start();
+		expect(supervisor.loadedWatermark()).toEqual({
+			lastEntryId: "after-oversized",
+			entryCount: 2,
+		});
+		supervisor.stop();
+	});
+
+	test("rejects ready watermark IDs that are present at a different position", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-official-ready-watermark-wrong-position-"));
+		const path = join(root, "session.jsonl");
+		await writeFile(
+			path,
+			[
+				JSON.stringify({ type: "session", version: 3, id: "session", timestamp: stamp, cwd: root }),
+				JSON.stringify({ type: "message", id: "first-ready-id", message: { role: "assistant", content: "first" } }),
+				JSON.stringify({ type: "message", id: "second-ready-id", message: { role: "assistant", content: "second" } }),
+			].join("\n") + "\n",
+		);
+		const finish = Promise.withResolvers<void>();
+		const exited = Promise.withResolvers<number>();
+		const child: ChildHandle = {
+			stdin: { write: () => {} },
+			stdout: (async function* () {
+				yield `${JSON.stringify({
+					type: "ready",
+					transcriptWatermark: { lastEntryId: "first-ready-id", entryCount: 2 },
+				})}\n`;
+				await finish.promise;
+			})(),
+			stderr: (async function* () {})(),
+			exited: exited.promise,
+			kill: () => {
+				finish.resolve();
+				exited.resolve(0);
+			},
+		};
+		const crashed = Promise.withResolvers<Error>();
+		const supervisor = new RpcChildSupervisor(
+			{ spawn: () => child, argv: sessionPath => ["omp", "--mode", "rpc", "--session", sessionPath] },
+			{ ...record("official-ready-watermark-wrong-position"), path, cwd: root },
+			{ entry: () => {}, event: () => {}, crashed: crashed.resolve },
+		);
+		await expect(supervisor.start()).rejects.toThrow("rpc ready watermark does not match durable transcript");
+		await expect(crashed.promise).resolves.toThrow("rpc ready watermark does not match durable transcript");
+		supervisor.stop();
+	});
+
 	test("discards local-only prompt correlation before the next durable user entry", async () => {
 		const root = await mkdtemp(join(tmpdir(), "t4-official-local-prompt-"));
 		const path = join(root, "session.jsonl");

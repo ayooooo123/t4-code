@@ -56,16 +56,19 @@ function decodeLedger(value: unknown): SessionOwnershipLedger | undefined {
 export class SessionOwnershipStore {
 	readonly path: string;
 	#sessions = new Map<SessionId, string>();
+	#missingAtLoad = false;
 	#tail = Promise.resolve();
 	constructor(filePath: string) {
 		this.path = filePath;
 	}
 	async load(): Promise<void> {
 		this.#sessions.clear();
+		this.#missingAtLoad = false;
 		let metadata: Awaited<ReturnType<typeof fs.lstat>>;
 		try {
 			metadata = await fs.lstat(this.path);
-		} catch {
+		} catch (error) {
+			this.#missingAtLoad = (error as NodeJS.ErrnoException).code === "ENOENT";
 			return;
 		}
 		if (!metadata.isFile() || (metadata.mode & 0o777) !== 0o600 || metadata.size > MAX_LEDGER_BYTES) return;
@@ -78,6 +81,9 @@ export class SessionOwnershipStore {
 		const ledger = decodeLedger(parsed);
 		if (!ledger) return;
 		this.#sessions = new Map(ledger.sessions.map(record => [record.sessionId, record.path]));
+	}
+	wasMissingAtLoad(): boolean {
+		return this.#missingAtLoad;
 	}
 	owns(id: SessionId, transcriptPath: string): boolean {
 		return this.#sessions.get(id) === transcriptPath;

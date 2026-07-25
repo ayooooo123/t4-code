@@ -892,6 +892,9 @@ export class LocalAppserver implements AppserverHandle {
 	#hostIdPath?: string;
 	#attentionOutcomes?: AttentionOutcomeStore;
 	#sessionOwnership?: SessionOwnershipStore;
+	#preLedgerMigrationOpen = false;
+	#preLedgerMigrationCaptured = false;
+	#preLedgerMigrationCandidates = new Set<SessionId>();
 	#ownerLock = false;
 	#ownerPaths?: OwnerPaths;
 	#ownerHandle?: FileHandle;
@@ -1110,6 +1113,9 @@ export class LocalAppserver implements AppserverHandle {
 		if (!this.#hostProvided) this.hostId = await loadPersistentHostId(this.#hostIdPath);
 		await this.#attentionOutcomes?.load();
 		await this.#sessionOwnership?.load();
+		this.#preLedgerMigrationOpen = this.#sessionOwnership?.wasMissingAtLoad() === true;
+		this.#preLedgerMigrationCaptured = false;
+		this.#preLedgerMigrationCandidates.clear();
 		try {
 			await this.#transcriptSearch?.initialize();
 			this.#records.clear();
@@ -3563,7 +3569,10 @@ export class LocalAppserver implements AppserverHandle {
 	): void {
 		void this.refreshState(sessionId, supervisor, requestId, preserveProjectedStatus).catch(() => undefined);
 	}
-	private async ensureSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+	private async ensureSupervisor(
+		sessionId: SessionId,
+		options: { readonly allowNonDurableReadyWatermark?: boolean; readonly verifySessionLockAfterStart?: boolean } = {},
+	): Promise<RpcChildSupervisor> {
 		if (this.#externalRuntimes.has(sessionId)) throw new ExternalRuntimeCommandError();
 		if (this.#draining) throw new Error("appserver is draining");
 		if (this.#stopping) throw new Error("appserver is stopping");
@@ -3574,7 +3583,7 @@ export class LocalAppserver implements AppserverHandle {
 		if (pending) return pending;
 		const existing = this.#supervisors.get(sessionId);
 		if (existing) return existing;
-		const start = Promise.resolve().then(() => this.startSupervisor(sessionId));
+		const start = Promise.resolve().then(() => this.startSupervisor(sessionId, options));
 		this.#startPromises.set(sessionId, start);
 		try {
 			return await start;
@@ -3582,7 +3591,10 @@ export class LocalAppserver implements AppserverHandle {
 			this.#startPromises.delete(sessionId);
 		}
 	}
-	private async startSupervisor(sessionId: SessionId): Promise<RpcChildSupervisor> {
+	private async startSupervisor(
+		sessionId: SessionId,
+		options: { readonly allowNonDurableReadyWatermark?: boolean; readonly verifySessionLockAfterStart?: boolean } = {},
+	): Promise<RpcChildSupervisor> {
 		const existing = this.#supervisors.get(sessionId);
 		if (existing) return existing;
 		if (this.#stopping || this.#closedSessions.has(sessionId)) throw new Error("session is closed");
@@ -3729,10 +3741,14 @@ export class LocalAppserver implements AppserverHandle {
 			this.#factory.argv(record.path),
 			undefined,
 			this.#ompVersion,
+			undefined,
+			options.allowNonDurableReadyWatermark === true,
 		);
 		this.#supervisors.set(sessionId, supervisor);
 		try {
 			await supervisor.start();
+			if (options.verifySessionLockAfterStart === true && (await this.#lockStatus(record)) !== "live")
+				throw new Error("rpc child did not claim the session lock");
 			if (this.#supervisors.get(sessionId) !== supervisor) throw new Error("rpc child exited during startup");
 			this.releaseSupervisorAfterExit(sessionId, supervisor);
 			return supervisor;
@@ -3958,6 +3974,9 @@ export class LocalAppserver implements AppserverHandle {
 				const attached = this.#attached.get(ws);
 				const projection = this.#projections.get(frame.sessionId);
 				if (!attached || !projection) throw new Error("attach output is incomplete");
+				// Mark the client attached before the ownership refresh so safe
+				// pre-ledger sessions can promote during the snapshot handoff.
+				attached.add(frame.sessionId);
 				// Re-check ownership for every delivery, including a cached
 				// idempotent attach replay. The snapshot sent below must already
 				// carry observer/reconciling control; a later timer is too late.
@@ -3972,7 +3991,6 @@ export class LocalAppserver implements AppserverHandle {
 					attached: true,
 					cursor: prepared.baseline,
 				});
-				attached.add(frame.sessionId);
 				this.startExternalObserver(frame.sessionId);
 				try {
 					outputFrames.push(...completeAttachOutput(prepared, projection, this.#subagents.get(frame.sessionId)));
@@ -4274,6 +4292,10 @@ export class LocalAppserver implements AppserverHandle {
 			if (discoveredIds.has(record.sessionId)) throw new Error(`duplicate session id: ${record.sessionId}`);
 			discoveredIds.add(record.sessionId);
 		}
+		if (this.#preLedgerMigrationOpen && !this.#preLedgerMigrationCaptured && inventoryComplete) {
+			this.#preLedgerMigrationCaptured = true;
+			for (const sessionId of discoveredIds) this.#preLedgerMigrationCandidates.add(sessionId);
+		}
 		for (const discoveredRecord of discovered) {
 			const previous = this.#records.get(discoveredRecord.sessionId);
 			let record: SessionRecord =
@@ -4568,7 +4590,6 @@ export class LocalAppserver implements AppserverHandle {
 			status = "malformed";
 		}
 		if (status === "live" || status === "suspect" || status === "malformed") {
-			this.#promotionFailures.delete(sessionId);
 			let observer = this.#observers.get(sessionId);
 			if (!observer) {
 				observer = new SessionTranscriptObserver(record.path, this.hostId);
@@ -4591,8 +4612,13 @@ export class LocalAppserver implements AppserverHandle {
 		let observer = this.#observers.get(sessionId);
 		if (!observer) {
 			const owned = this.#sessionOwnership?.owns(sessionId, record.path) === true;
+			const migrationCandidate = this.#preLedgerMigrationCandidates.has(sessionId) && !owned;
 			const lockless =
-				!this.#claimLocklessSessions && !owned && status === "missing" && !projection.value.ref.liveState?.sessionControl;
+				!this.#claimLocklessSessions &&
+				!owned &&
+				!migrationCandidate &&
+				status === "missing" &&
+				!projection.value.ref.liveState?.sessionControl;
 			observer = new SessionTranscriptObserver(record.path, this.hostId);
 			this.#observers.set(sessionId, observer);
 			if (lockless) this.#locklessObservers.add(observer);
@@ -4626,7 +4652,6 @@ export class LocalAppserver implements AppserverHandle {
 		if (lockless) return;
 		if (!this.hasAttachedClient(sessionId)) return;
 		if (!pollRecordMatches || !poll.stable || poll.transcript !== "live") return;
-		if (poll.unresolvedPendingCount !== 0) return;
 		let promotionLockStatus: SessionLockStatus;
 		try {
 			promotionLockStatus = await this.#lockStatus(record);
@@ -4640,7 +4665,10 @@ export class LocalAppserver implements AppserverHandle {
 		if (this.#supervisors.has(sessionId) || this.#startPromises.has(sessionId)) return;
 		try {
 			// startSupervisor performs the final write-lock gate immediately before spawn.
-			supervisor = await this.ensureSupervisor(sessionId);
+			supervisor = await this.ensureSupervisor(sessionId, {
+				allowNonDurableReadyWatermark: true,
+				verifySessionLockAfterStart: true,
+			});
 		} catch {
 			this.#promotionFailures.set(sessionId, this.promotionFingerprint(record, projection, poll));
 			return;
@@ -4656,9 +4684,8 @@ export class LocalAppserver implements AppserverHandle {
 			attempt < 4 &&
 			(!final.stable ||
 				final.transcript !== "live" ||
-				final.unresolvedPendingCount !== 0 ||
 				final.watermark.entryCount !== loaded?.entryCount ||
-				final.watermark.lastEntryId !== loaded.lastEntryId);
+				final.watermark.lastEntryId !== loaded?.lastEntryId);
 			attempt += 1
 		) {
 			if (!this.observerIsCurrent(sessionId, observer, record, projection)) {
@@ -4687,7 +4714,6 @@ export class LocalAppserver implements AppserverHandle {
 			final.record?.sessionId === sessionId &&
 			final.stable &&
 			final.transcript === "live" &&
-			final.unresolvedPendingCount === 0 &&
 			loaded !== undefined &&
 			loaded.entryCount === final.watermark.entryCount &&
 			loaded.lastEntryId === final.watermark.lastEntryId;

@@ -136,6 +136,56 @@ describe("T4 host daemon CLI", () => {
     expect(bridgeStops).toBe(1);
   });
 
+  test("claims lockless sessions for local bridge hosts only", async () => {
+    const captures: Record<string, unknown>[] = [];
+    const bridge = {
+      start: async () => {},
+      createAuthorities: () => ({
+        hostInfo: async () => ({}),
+        sessionAuthority: {},
+        discovery: {},
+        operationsAuthority: {},
+        projectRootForProject: async () => "/tmp",
+        projectRootForSession: async () => "/tmp",
+        lockCheck: async () => {},
+        lockStatus: async () => "missing",
+      }),
+      identity: { ompVersion: "17.0.5", ompBuild: "test" },
+      stop: async () => {},
+    };
+    const dependencies = {
+      createBridge: () => bridge as never,
+      createTranscriptSearch: () => ({ close: async () => {} }) as never,
+      createLocal: (options: unknown) => {
+        captures.push(options as unknown as Record<string, unknown>);
+        throw new Error("captured bridge options");
+      },
+      createRemote: (options: { readonly appserver?: unknown }) => {
+        captures.push(options.appserver as unknown as Record<string, unknown>);
+        throw new Error("captured bridge options");
+      },
+    };
+    await expect(
+      runHostDaemon(
+        { ompExecutable: "/opt/omp", profileId: "default", stateRoot: "/tmp/t4-local-bridge" },
+        dependencies,
+      ),
+    ).rejects.toThrow("captured bridge options");
+    await expect(
+      runHostDaemon(
+        {
+          ompExecutable: "/opt/omp",
+          profileId: "default",
+          stateRoot: "/tmp/t4-remote-bridge",
+          remote: { mode: "direct", address: "100.64.0.1", port: 8787, origins: [], trustedServeProxy: false },
+        },
+        dependencies,
+      ),
+    ).rejects.toThrow("captured bridge options");
+    expect(captures[0]?.claimLocklessSessions).toBe(true);
+    expect(captures[1]?.claimLocklessSessions).toBeUndefined();
+  });
+
   test("pins and reports the exact official OMP runtime before exposing official authority", async () => {
     let authorityCloses = 0;
     let captured: Record<string, unknown> | undefined;
@@ -164,7 +214,7 @@ describe("T4 host daemon CLI", () => {
           }),
           createOfficialAuthority: () => authority as never,
           createTranscriptSearch: () => ({ close: async () => {} }) as never,
-          createLocal: options => {
+          createLocal: (options: unknown) => {
             captured = options as unknown as Record<string, unknown>;
             throw new Error("captured official options");
           },

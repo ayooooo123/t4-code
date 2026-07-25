@@ -19,9 +19,24 @@ async function next(client: RawUdsWebSocket): Promise<ServerFrame> {
 	]);
 }
 
-async function responseFor(client: RawUdsWebSocket, requestId: string): Promise<ResultFrame> {
+function isGate0AssistantProjection(frame: ServerFrame, sessionId: string): boolean {
+	return (
+		frame.type === "entry" &&
+		frame.sessionId === sessionId &&
+		frame.entry.kind === "message" &&
+		frame.entry.data.role === "assistant" &&
+		frame.entry.data.text === "Gate 0 response 1"
+	);
+}
+
+async function responseFor(
+	client: RawUdsWebSocket,
+	requestId: string,
+	observed: ServerFrame[] = [],
+): Promise<ResultFrame> {
 	for (;;) {
 		const frame = await next(client);
+		observed.push(frame);
 		if (frame.type === "response" && frame.requestId === requestId) return frame;
 	}
 }
@@ -113,16 +128,31 @@ async function main(): Promise<void> {
 			protocol: { min: "omp-app/1", max: "omp-app/1" },
 			client: { name: "official-packaged-proof", version: "1", build: "proof", platform: process.platform },
 			requestedFeatures: [],
-			capabilities: { client: ["sessions.read", "sessions.prompt", "sessions.manage", "catalog.read"] },
+			capabilities: { client: ["sessions.read", "sessions.prompt", "sessions.control", "sessions.manage", "catalog.read"] },
 			savedCursors: [],
 		});
 		const welcome = await next(client);
 		if (welcome.type !== "welcome") throw new Error("packaged T4 host did not send Welcome");
 		const sessions = await next(client);
-		if (sessions.type !== "sessions" || !sessions.sessions.some(item => item.sessionId === session.sessionId))
-			throw new Error("packaged T4 host did not discover the official OMP session");
+		const discovered = sessions.type === "sessions"
+			? sessions.sessions.find(item => item.sessionId === session.sessionId)
+			: undefined;
+		if (!discovered) throw new Error("packaged T4 host did not discover the official OMP session");
+		let currentRevision = discovered.revision;
+		const observed: ServerFrame[] = [];
+		const refreshRevision = (): void => {
+			for (const frame of observed) {
+				if (frame.type === "session.delta" && frame.sessionId === session.sessionId)
+					currentRevision = frame.revision;
+			}
+		};
 		let command = 0;
-		const send = (requestId: string, name: string, args: Record<string, unknown>): void => {
+		const send = (
+			requestId: string,
+			name: string,
+			args: Record<string, unknown>,
+			expectedRevision?: string,
+		): void => {
 			command += 1;
 			client!.sendJson({
 				v: "omp-app/1",
@@ -132,36 +162,61 @@ async function main(): Promise<void> {
 				hostId: welcome.hostId,
 				sessionId: session.sessionId,
 				command: name,
+				...(expectedRevision ? { expectedRevision } : {}),
+				args,
+			});
+		};
+		const sendHost = (requestId: string, name: string, args: Record<string, unknown>): void => {
+			command += 1;
+			client!.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId,
+				commandId: `packaged-${command}`,
+				hostId: welcome.hostId,
+				command: name,
 				args,
 			});
 		};
 		send("attach", "session.attach", {});
-		const attached = await responseFor(client, "attach");
+		const attached = await responseFor(client, "attach", observed);
 		if (!attached.ok) throw new Error(`packaged session attach failed: ${attached.error.message}`);
 		let stateReady = false;
 		let stateFailure = "unknown";
 		for (let attempt = 0; attempt < 40 && !stateReady; attempt += 1) {
 			const requestId = `state-${attempt}`;
 			send(requestId, "session.state.get", {});
-			const state = await responseFor(client, requestId);
+			const state = await responseFor(client, requestId, observed);
 			stateReady = state.ok;
 			if (!state.ok) stateFailure = `${state.error.code}: ${state.error.message}`;
 			if (!stateReady) await Bun.sleep(100);
 		}
 		if (!stateReady) throw new Error(`packaged session did not become writable (${stateFailure})`);
+		sendHost("list-after-state", "session.list", {});
+		const listed = await responseFor(client, "list-after-state", observed);
+		if (!listed.ok) throw new Error(`packaged session list failed: ${listed.error.message}`);
+		if (
+			!listed.result ||
+			typeof listed.result !== "object" ||
+			Array.isArray(listed.result) ||
+			!Array.isArray((listed.result as Record<string, unknown>).sessions)
+		)
+			throw new Error("packaged session list result is malformed");
+		const latest = ((listed.result as Record<string, unknown>).sessions as Array<Record<string, unknown>>)
+			.find(item => item.sessionId === session.sessionId);
+		if (!latest || typeof latest.revision !== "string") throw new Error("packaged session revision is unavailable");
+		currentRevision = latest.revision;
+		send("model", "session.model.set", { selector: "gate0/deterministic", persistence: "session" }, currentRevision);
+		const modelSwitch = await responseFor(client, "model", observed);
+		if (!modelSwitch.ok) throw new Error(`packaged session model switch failed: ${modelSwitch.error.message}`);
 		send("prompt", "session.prompt", { message: "Packaged host prompt" });
-		const prompted = await responseFor(client, "prompt");
+		const prompted = await responseFor(client, "prompt", observed);
 		if (!prompted.ok) throw new Error(`packaged session prompt failed: ${prompted.error.message}`);
-		let assistantProjected = false;
+		let assistantProjected = observed.some(frame => isGate0AssistantProjection(frame, session.sessionId));
 		const deadline = Date.now() + TIMEOUT_MS;
 		while (Date.now() < deadline && !assistantProjected) {
 			const frame = await next(client);
-			assistantProjected =
-				frame.type === "entry" &&
-				frame.sessionId === session.sessionId &&
-				frame.entry.kind === "message" &&
-				frame.entry.data.role === "assistant" &&
-				frame.entry.data.text === "Gate 0 response 1";
+			assistantProjected = isGate0AssistantProjection(frame, session.sessionId);
 		}
 		if (!assistantProjected) throw new Error("official OMP assistant entry did not reach the T4 wire");
 		const transcript = await readFile(session.path, "utf8");
@@ -177,7 +232,7 @@ async function main(): Promise<void> {
 			},
 			platform: { os: process.platform, arch: process.arch },
 			packagedHost: { binary: "t4-host", authority: "official", exclusiveSessionsRoot: true },
-			scenarios: { discovery: true, attach: true, prompt: true, durableJsonl: true, t4WireProjection: true },
+			scenarios: { discovery: true, attach: true, modelSwitch: true, prompt: true, durableJsonl: true, t4WireProjection: true },
 			passed: true,
 		};
 		const evidenceRoot = join(repoRoot, "artifacts", "official-omp-packaged-host");

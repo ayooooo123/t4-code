@@ -878,6 +878,169 @@ describe("appserver lifecycle", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	test("migrates a safe pre-ledger lockless session on first attach", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-pre-ledger-migration-"));
+		const socketPath = join(root, "run", "appserver.sock");
+		const sessionOwnershipPath = join(root, "profile", "owned-sessions.json");
+		const transcriptPath = join(root, "pre-ledger-session.jsonl");
+		const sid = sessionId("pre-ledger-session");
+		const timestamp = "2026-07-22T00:00:00.000Z";
+		await writeFile(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", version: 3, id: sid, cwd: root, timestamp, title: "Pre-ledger session" })}\n`,
+		);
+		let lockStatus: "live" | "missing" = "missing";
+		const factory = new DeferredPromptFactory();
+		const spawn = factory.spawn.bind(factory);
+		factory.spawn = () => {
+			lockStatus = "live";
+			return spawn();
+		};
+		const appserver = createAppserver({
+			hostId: host,
+			epoch: "pre-ledger-migration-test",
+			socketPath,
+			sessionOwnershipPath,
+			discovery: new FileSessionDiscovery(root, realFs, host, true),
+			childFactory: factory,
+			lockStatus: () => lockStatus,
+			lockCheck: async () => {},
+		});
+		await appserver.start();
+		const client = await RawUdsWebSocket.connect(socketPath);
+		try {
+			client.sendJson({
+				v: "omp-app/1",
+				type: "hello",
+				protocol: { min: "omp-app/1", max: "omp-app/1" },
+				client: { name: "pre-ledger-migration-test", version: "1", build: "test", platform: "linux" },
+				requestedFeatures: ["session.observer", "session.unverified"],
+				capabilities: { client: ["sessions.read"] },
+				savedCursors: [],
+			});
+			expect(await client.nextServer()).toMatchObject({ type: "welcome" });
+			expect((await client.nextServer()).type).toBe("sessions");
+			client.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "attach-pre-ledger",
+				commandId: "attach-pre-ledger-command",
+				hostId: host,
+				sessionId: sid,
+				command: "session.attach",
+				args: {},
+			});
+			for (;;) {
+				const frame = await client.nextServer();
+				if (frame.type === "response" && frame.requestId === "attach-pre-ledger") {
+					expect(frame.ok).toBe(true);
+					break;
+				}
+			}
+			await Promise.race([
+				(async () => {
+					while (factory.children.length === 0) await Bun.sleep(20);
+					while (appserver.snapshot(sid)?.ref.liveState?.sessionControl !== undefined) await Bun.sleep(20);
+				})(),
+				Bun.sleep(1_000).then(() => {
+					throw new Error(
+						`safe pre-ledger session was not migrated: ${JSON.stringify({
+							children: factory.children.length,
+							killed: factory.children.map(child => child.killed),
+							control: appserver.snapshot(sid)?.ref.liveState?.sessionControl,
+						})}`,
+					);
+				}),
+			]);
+			expect(factory.children).toHaveLength(1);
+			const ownership = new SessionOwnershipStore(sessionOwnershipPath);
+			await ownership.load();
+			expect(ownership.owns(sid, transcriptPath)).toBe(true);
+		} finally {
+			client.destroy();
+			await client.closed();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+	test("keeps unowned lockless sessions unverified after the pre-ledger migration window", async () => {
+		const root = await mkdtemp(join(tmpdir(), "t4-lockless-after-migration-"));
+		const socketPath = join(root, "run", "appserver.sock");
+		const sessionOwnershipPath = join(root, "profile", "owned-sessions.json");
+		const transcriptPath = join(root, "unowned-lockless-session.jsonl");
+		const sid = sessionId("unowned-lockless-session");
+		const timestamp = "2026-07-22T00:00:00.000Z";
+		await writeFile(
+			transcriptPath,
+			`${JSON.stringify({ type: "session", version: 3, id: sid, cwd: root, timestamp, title: "Unowned lockless session" })}\n`,
+		);
+		const closedMigrationWindow = new SessionOwnershipStore(sessionOwnershipPath);
+		await closedMigrationWindow.add(sessionId("other-owned-session"), join(root, "other-owned-session.jsonl"));
+		await closedMigrationWindow.delete(sessionId("other-owned-session"));
+		const factory = new FakeFactory();
+		const appserver = createAppserver({
+			hostId: host,
+			epoch: "lockless-after-migration-test",
+			socketPath,
+			sessionOwnershipPath,
+			discovery: new FileSessionDiscovery(root, realFs, host, true),
+			childFactory: factory,
+			lockStatus: () => "missing",
+			lockCheck: async () => {
+				throw new Error("unowned lockless session must not be write-locked");
+			},
+		});
+		await appserver.start();
+		const client = await RawUdsWebSocket.connect(socketPath);
+		try {
+			client.sendJson({
+				v: "omp-app/1",
+				type: "hello",
+				protocol: { min: "omp-app/1", max: "omp-app/1" },
+				client: { name: "lockless-after-migration-test", version: "1", build: "test", platform: "linux" },
+				requestedFeatures: ["session.observer", "session.unverified"],
+				capabilities: { client: ["sessions.read"] },
+				savedCursors: [],
+			});
+			expect(await client.nextServer()).toMatchObject({ type: "welcome" });
+			expect((await client.nextServer()).type).toBe("sessions");
+			client.sendJson({
+				v: "omp-app/1",
+				type: "command",
+				requestId: "attach-lockless-after-migration",
+				commandId: "attach-lockless-after-migration-command",
+				hostId: host,
+				sessionId: sid,
+				command: "session.attach",
+				args: {},
+			});
+			for (;;) {
+				const frame = await client.nextServer();
+				if (frame.type === "response" && frame.requestId === "attach-lockless-after-migration") {
+					expect(frame.ok).toBe(true);
+					break;
+				}
+			}
+			await Promise.race([
+				(async () => {
+					for (;;) {
+						const control = appserver.snapshot(sid)?.ref.liveState?.sessionControl;
+						if (control?.mode === "unverified") return;
+						await Bun.sleep(20);
+					}
+				})(),
+				Bun.sleep(1_000).then(() => {
+					throw new Error("unowned lockless session was not marked unverified");
+				}),
+			]);
+			expect(factory.children).toHaveLength(0);
+		} finally {
+			client.destroy();
+			await client.closed();
+			await appserver.stop();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 	test("persists ownership after safely promoting an external session", async () => {
 		const root = await mkdtemp(join(tmpdir(), "t4-promoted-session-restart-"));
 		const socketPath = join(root, "run", "appserver.sock");
@@ -887,10 +1050,15 @@ describe("appserver lifecycle", () => {
 		const timestamp = "2026-07-23T00:00:00.000Z";
 		await writeFile(
 			transcriptPath,
-			`${JSON.stringify({ type: "session", version: 3, id: sid, cwd: root, timestamp, title: "Promoted session" })}\n`,
+			`${JSON.stringify({ type: "session", version: 3, id: sid, cwd: root, timestamp, title: "Promoted session" })}\n${JSON.stringify({ type: "message", id: "assistant-with-dangling-tool", parentId: null, timestamp, message: { role: "assistant", content: [{ type: "toolCall", id: "toolu_dangling", name: "bash", arguments: { command: "sleep 1" } }] } })}\n`,
 		);
 		let lockStatus: "live" | "missing" = "live";
 		const factory = new DeferredPromptFactory();
+		const spawn = factory.spawn.bind(factory);
+		factory.spawn = () => {
+			lockStatus = "live";
+			return spawn();
+		};
 		const appserver = createAppserver({
 			hostId: host,
 			epoch: "promoted-session-restart-test",

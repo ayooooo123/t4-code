@@ -351,7 +351,7 @@ export async function runHostDaemon(
       projectRootForProject,
       lockCheck,
       lockStatus,
-      ...(config.authorityMode === "official" ? { claimLocklessSessions: true } : {}),
+      ...(config.authorityMode === "official" || !config.remote ? { claimLocklessSessions: true } : {}),
       ...(transcriptImageRoot ? { transcriptImageRoot } : {}),
       rpcChildInvocation: { executable: config.ompExecutable, prefixArgv: [] },
       rpcChildEnvironment: { OMP_PROFILE: config.profileId },

@@ -148,10 +148,13 @@ function rawUserMessage(
 class DurableJsonlReconciler {
 	#offset = 0;
 	#entryCount = 0;
+	#rawEntryCount = 0;
 	#lastEntryId: string | null = null;
 	#skippingOversizedLine = false;
 	#oversizedLineStart = 0;
 	readonly #projectedEntryIds = new Set<string>();
+	readonly #entryPositions = new Map<string, number>();
+	readonly #rawEntryPositions = new Map<string, number>();
 	readonly #pendingCorrelations: PendingDurableCorrelation[] = [];
 	#reconcileTail: Promise<void> = Promise.resolve();
 
@@ -163,6 +166,23 @@ class DurableJsonlReconciler {
 
 	watermark(): RpcLoadedTranscriptWatermark {
 		return { lastEntryId: this.#lastEntryId, entryCount: this.#entryCount };
+	}
+	includesWatermark(watermark: RpcLoadedTranscriptWatermark, allowNonDurableLastEntryId = false): boolean {
+		if (watermark.entryCount > this.#rawEntryCount) return false;
+		if (watermark.entryCount === 0) return watermark.lastEntryId === null;
+		if (typeof watermark.lastEntryId !== "string") return false;
+		const logicalPosition = this.#entryPositions.get(watermark.lastEntryId);
+		const rawPosition = this.#rawEntryPositions.get(watermark.lastEntryId);
+		// Official OMP reports the active branch watermark, which can name an
+		// in-memory branch entry instead of a durable JSONL record for compacted
+		// sessions. Validate durable IDs when they are present; otherwise let the
+		// durable reconciler below be the source of truth.
+		if (logicalPosition === undefined && rawPosition === undefined) return allowNonDurableLastEntryId;
+		return (
+			(watermark.entryCount === this.#entryCount && watermark.lastEntryId === this.#lastEntryId) ||
+			logicalPosition === watermark.entryCount ||
+			rawPosition === watermark.entryCount
+		);
 	}
 
 	recordCorrelation(internalId: string, command: Record<string, unknown>): void {
@@ -221,10 +241,13 @@ class DurableJsonlReconciler {
 		if (info.size < this.#offset) {
 			this.#offset = 0;
 			this.#entryCount = 0;
+			this.#rawEntryCount = 0;
 			this.#lastEntryId = null;
 			this.#skippingOversizedLine = false;
 			this.#oversizedLineStart = 0;
 			this.#projectedEntryIds.clear();
+			this.#entryPositions.clear();
+			this.#rawEntryPositions.clear();
 			await this.initialize();
 			return;
 		}
@@ -289,6 +312,7 @@ class DurableJsonlReconciler {
 		// correlation queue. Its identity is unknowable without parsing it, so
 		// retain no correlation across this gap.
 		this.#pendingCorrelations.length = 0;
+		this.#rawEntryCount += 1;
 		if (publish) this.transcriptRecordOmitted?.(this.#oversizedLineStart);
 	}
 
@@ -301,7 +325,10 @@ class DurableJsonlReconciler {
 		}
 		const id = durableEntryId(value);
 		if (!id) return;
+		this.#rawEntryCount += 1;
 		this.#entryCount += 1;
+		if (!this.#entryPositions.has(id)) this.#entryPositions.set(id, this.#entryCount);
+		if (!this.#rawEntryPositions.has(id)) this.#rawEntryPositions.set(id, this.#rawEntryCount);
 		this.#lastEntryId = id;
 		if (!publish || !value || typeof value !== "object" || Array.isArray(value)) return;
 		if (this.#projectedEntryIds.has(id)) return;
@@ -493,6 +520,7 @@ export class RpcChildSupervisor {
 		private readonly failureStopGraceMs = FAILURE_STOP_GRACE_MS,
 		private readonly runtimeVersion?: string,
 		private readonly protocolNegotiationTimeoutMs = PROTOCOL_NEGOTIATION_TIMEOUT_MS,
+		private readonly allowNonDurableReadyWatermark = false,
 	) {
 		this.#operationCapabilities = new OfficialOmpCapabilityAdapter(runtimeVersion);
 		this.#transcript = new DurableJsonlReconciler(
@@ -721,12 +749,13 @@ export class RpcChildSupervisor {
 					if (this.#ready) throw new Error("duplicate rpc ready");
 					await this.#transcript.initialize();
 					const reconciled = this.#transcript.watermark();
-					if (
-						this.#loadedWatermark &&
-						(this.#loadedWatermark.entryCount !== reconciled.entryCount ||
-							this.#loadedWatermark.lastEntryId !== reconciled.lastEntryId)
-					)
+					const readyWatermark = this.#loadedWatermark;
+					if (readyWatermark && !this.#transcript.includesWatermark(readyWatermark, this.allowNonDurableReadyWatermark))
 						throw new Error("rpc ready watermark does not match durable transcript");
+					// The official runtime can append a startup bookkeeping entry after
+					// computing its ready watermark but before the appserver reconciles
+					// the shared JSONL file. The durable transcript is the handoff source
+					// of truth once it has been proven to include the ready watermark.
 					this.#loadedWatermark = reconciled;
 					this.#ready = true;
 					ready.resolve();
