@@ -48,6 +48,17 @@ describe("OMP authority bridge contract", () => {
 		).toMatchObject({ type: "event", event: "terminal" });
 	});
 
+	test("ignores safe future ready methods without exposing unsupported host calls", () => {
+		const frame = decodeOmpAuthorityBridgeServerFrame({
+			v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
+			type: "ready",
+			methods: ["session.list", "session.fork"],
+			ompVersion: "17.0.5",
+			ompBuild: "commit",
+		});
+		expect(frame).toMatchObject({ type: "ready", methods: ["session.list"] });
+	});
+
 	test("rejects unknown versions, methods, fields, duplicate ready methods, and oversized values", () => {
 		expect(() => decodeOmpAuthorityBridgeClientFrame({
 			v: "t4-omp-authority/2",
@@ -125,7 +136,7 @@ describe("OMP authority bridge contract", () => {
 				type: "response",
 				id: "oversized-catalog-request",
 				ok: true,
-				result: { items: [{ description: "x".repeat(600_000) }] },
+				result: { items: [{ description: "x".repeat(OMP_AUTHORITY_BRIDGE_MAX_LINE_BYTES + 1) }] },
 			}),
 		).toThrow("text bounds");
 	});

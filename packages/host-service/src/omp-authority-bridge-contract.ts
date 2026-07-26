@@ -128,6 +128,11 @@ function method(value: unknown): OmpAuthorityBridgeMethod {
 	return value as OmpAuthorityBridgeMethod;
 }
 
+function advertisedMethod(value: unknown): OmpAuthorityBridgeMethod | undefined {
+	const advertised = identifier(value, "bridge method");
+	return METHOD_SET.has(advertised) ? advertised as OmpAuthorityBridgeMethod : undefined;
+}
+
 function boundedJson(value: unknown, label: string, maxTextBytes = MAX_TEXT_BYTES): unknown {
 	let nodes = 0;
 	let textBytes = 0;
@@ -189,10 +194,11 @@ export function decodeOmpAuthorityBridgeServerFrame(value: unknown): OmpAuthorit
 		exactKeys(frame, ["v", "type", "methods", "ompVersion", "ompBuild"], "bridge ready");
 		if (!Array.isArray(frame.methods) || new Set(frame.methods).size !== frame.methods.length)
 			throw new Error("bridge methods are invalid");
+		const advertisedMethods = frame.methods.map(advertisedMethod);
 		return {
 			v: OMP_AUTHORITY_BRIDGE_PROTOCOL,
 			type: "ready",
-			methods: frame.methods.map(method),
+			methods: advertisedMethods.filter((item): item is OmpAuthorityBridgeMethod => item !== undefined),
 			ompVersion: boundedText(frame.ompVersion, "OMP version", 128),
 			ompBuild: boundedText(frame.ompBuild, "OMP build", 256),
 		};

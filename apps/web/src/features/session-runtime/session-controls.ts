@@ -321,7 +321,6 @@ function modelChoicesFrom(
   const modelTags = settingCurrentValue(settings, "modelTags");
   const configuredCycle = stringArray(settingCurrentValue(settings, "cycleOrder"));
   const cycle = configuredCycle ?? Object.keys(roles);
-  const hasCycleAuthority = configuredCycle !== null || roleSettings !== null;
   const catalogHasModelAuthority = catalog?.items.some((item) => item.kind === "model") ?? false;
   const availableSelectors = new Set<string>();
   if (catalogHasModelAuthority && catalog !== undefined) {
@@ -352,23 +351,16 @@ function modelChoicesFrom(
     });
   }
 
-  // OMP's configured cycle is the authority for the primary model picker.
-  // It is the same ordered role list the TUI walks for Ctrl+P. The catalog is
-  // intentionally much broader (often hundreds of models) and belongs in the
-  // advanced model settings surface, not this high-frequency session control.
-  // An explicitly empty cycle is still authoritative. Catalog fallback is
-  // only for legacy hosts that publish no cycle or role settings at all.
-  if (hasCycleAuthority) return choices;
-
-  // Older hosts may publish a model catalog without settings metadata. Keep a
-  // bounded compatibility fallback so those hosts can still switch models.
+  // Keep the high-signal Ctrl-P roles first, then expose every connected
+  // catalog model so the session switcher can reach concrete models whether
+  // or not a role also points at that selector.
+  const seenModelSelectors = new Set<string>();
   if (catalog !== undefined) {
-    const seenSelectors = new Set<string>();
     for (const item of catalog.items) {
       if (item.kind !== "model" || item.supported === false) continue;
       const selector = modelItemSelector(item);
-      if (selector === null || seenSelectors.has(selector)) continue;
-      seenSelectors.add(selector);
+      if (selector === null || seenModelSelectors.has(selector)) continue;
+      seenModelSelectors.add(selector);
       choices.push({
         id: `model:${selector}`,
         kind: "model",

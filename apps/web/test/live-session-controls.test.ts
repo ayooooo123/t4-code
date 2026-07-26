@@ -245,7 +245,7 @@ describe("defaults from live host settings", () => {
     expect(controls.fastUnsupportedReason).toContain("does not report");
   });
 
-  it("limits the primary picker to configured Ctrl-P roles in exact cycle order", async () => {
+  it("keeps configured Ctrl-P roles first, then every connected catalog model", async () => {
     const { runtime } = await startedRuntime({
       items: [
         ...CONTROL_COMMANDS,
@@ -258,15 +258,24 @@ describe("defaults from live host settings", () => {
       ],
     });
     const choices = runtime.getSnapshot().controls.modelChoices;
-    expect(choices.map((choice) => choice.id)).toEqual([
+    expect(choices.slice(0, 3).map((choice) => choice.id)).toEqual([
       "role:smol",
       "role:default",
       "role:Opus 4.6",
     ]);
-    const smol = choices[0];
-    expect(smol?.kind).toBe("role");
-    expect(smol?.label).toBe("Fast");
-    expect(smol?.selector).toBe("google/gemini-3.5-flash:high");
+    expect(choices.slice(3).map((choice) => choice.id)).toEqual([
+      "model:anthropic/luna-5.6",
+      "model:google/gemini-3.5-flash",
+      "model:anthropic/claude-opus-4-6",
+      ...Array.from({ length: 184 }, (_, index) => `model:catalog/model-${index}`),
+    ]);
+    const catalog = choices[3];
+    expect(catalog).toMatchObject({
+      kind: "model",
+      label: "Luna 5.6",
+      selector: "anthropic/luna-5.6",
+      role: null,
+    });
     // Custom cycle-role names keep their exact configured selector.
     const custom = choices[2];
     expect(custom?.label).toBe("Opus 4.6");
@@ -296,15 +305,26 @@ describe("defaults from live host settings", () => {
     expect(runtime.getSnapshot().controls.modelChoices.map((choice) => choice.id)).toEqual([
       "role:smol",
       "role:default",
+      "model:anthropic/luna-5.6",
+      "model:google/gemini-3.5-flash",
     ]);
   });
 
-  it("honors an explicitly empty Ctrl-P cycle instead of exposing the catalog", async () => {
+  it("shows connected catalog models even when Ctrl-P cycle is explicitly empty", async () => {
     const { runtime } = await startedRuntime({
       items: [...CONTROL_COMMANDS, modelItem("Luna 5.6", "anthropic", "luna-5.6")],
       settings: { ...PROFILE_SETTINGS, cycleOrder: { effective: [] } },
     });
-    expect(runtime.getSnapshot().controls.modelChoices).toEqual([]);
+    expect(runtime.getSnapshot().controls.modelChoices).toEqual([
+      {
+        id: "model:anthropic/luna-5.6",
+        kind: "model",
+        label: "Luna 5.6",
+        detail: "anthropic/luna-5.6",
+        selector: "anthropic/luna-5.6",
+        role: null,
+      },
+    ]);
   });
 
   it("falls back to available catalog models when an older host publishes no cycle settings", async () => {

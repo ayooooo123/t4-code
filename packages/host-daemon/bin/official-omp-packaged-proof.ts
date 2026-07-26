@@ -140,12 +140,6 @@ async function main(): Promise<void> {
 		if (!discovered) throw new Error("packaged T4 host did not discover the official OMP session");
 		let currentRevision = discovered.revision;
 		const observed: ServerFrame[] = [];
-		const refreshRevision = (): void => {
-			for (const frame of observed) {
-				if (frame.type === "session.delta" && frame.sessionId === session.sessionId)
-					currentRevision = frame.revision;
-			}
-		};
 		let command = 0;
 		const send = (
 			requestId: string,
