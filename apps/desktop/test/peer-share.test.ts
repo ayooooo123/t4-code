@@ -300,6 +300,10 @@ describe("PeerShareHost", () => {
     await waitForWrites(socket, 1);
     socket.send(encodePeerWireFrame({ type: "authorize", proof: "not-the-capability-proof" }));
 
+    await waitForWrites(socket, 2);
+    expect(new PeerWireDecoder().push(socket.writes[1]!)).toEqual([
+      { type: "close", code: 4001, reason: "pairing rejected" },
+    ]);
     await waitFor(() => socket.destroyed, "invalid proof rejection");
     expect(opens).toBe(0);
     await host.stop();
@@ -407,6 +411,55 @@ describe("PeerShareHost", () => {
 
     expect(opens).toBe(4);
     expect(phones.slice(0, 4).every((phone) => !phone.destroyed)).toBe(true);
+    await host.stop();
+  });
+
+  it("prunes stale authorized streams before rejecting a reconnect", async () => {
+    const dht = new FakeDht();
+    const desktopPublicKey = new Uint8Array(32).fill(3);
+    let randomCall = 0;
+    let opens = 0;
+    let now = 0;
+    const host = new peer.PeerShareHost({
+      createDht: () => dht,
+      createKeyPair: () => ({ publicKey: desktopPublicKey, secretKey: new Uint8Array(64).fill(4) }),
+      randomBytes: (length) => new Uint8Array(length).fill(++randomCall),
+      createAppserverTransport: async () => {
+        opens += 1;
+        return new FakeOmpTransport();
+      },
+      now: () => now,
+      setTimer: () => 1,
+      clearTimer: () => undefined,
+    });
+    await host.start();
+
+    const authorize = async (socket: FakePeerSocket, nonce: string): Promise<void> => {
+      dht.server.connection?.(socket);
+      socket.send(encodePeerWireFrame({ type: "hello", version: 1, nonce }));
+      await waitForWrites(socket, 1);
+      const challenge = new PeerWireDecoder().push(socket.writes[0]!)[0];
+      if (challenge?.type !== "challenge") throw new Error("missing challenge");
+      const proof = createHmac("sha256", Buffer.alloc(32, 1))
+        .update("t4peer/v1\0")
+        .update(nonce)
+        .update(challenge.nonce)
+        .update(desktopPublicKey)
+        .digest("base64url");
+      socket.send(encodePeerWireFrame({ type: "authorize", proof }));
+    };
+
+    const stalePhones = Array.from({ length: 4 }, () => new FakePeerSocket());
+    for (const [index, phone] of stalePhones.entries()) await authorize(phone, `stale-${index}`);
+    await waitFor(() => stalePhones.every((phone) => phone.writes.length >= 2), "four stale phones authorized");
+    now = 120_000;
+    const reconnect = new FakePeerSocket();
+    await authorize(reconnect, "reconnect");
+    await waitForWrites(reconnect, 2);
+
+    expect(new PeerWireDecoder().push(reconnect.writes[1]!)).toEqual([{ type: "authorized" }]);
+    expect(stalePhones.every((phone) => phone.destroyed)).toBe(true);
+    expect(opens).toBe(5);
     await host.stop();
   });
 

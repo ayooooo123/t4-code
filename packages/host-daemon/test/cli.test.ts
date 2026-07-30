@@ -135,6 +135,53 @@ describe("T4 host daemon CLI", () => {
     expect(searchCloses).toBe(1);
     expect(bridgeStops).toBe(1);
   });
+  test("uses explicit OMP bridge stdio argv and top-level session RPC argv", async () => {
+    let bridgeStops = 0;
+    let capturedInvocation: unknown;
+    let capturedOptions: Record<string, unknown> | undefined;
+    const bridge = {
+      start: async () => {},
+      createAuthorities: () => ({
+        hostInfo: async () => ({ transcriptImageRoot: "/tmp/images" }),
+        sessionAuthority: {},
+        discovery: {},
+        operationsAuthority: {},
+        projectRootForProject: async () => "/tmp",
+        projectRootForSession: async () => "/tmp",
+        lockCheck: async () => {},
+        lockStatus: async () => "missing",
+      }),
+      identity: { ompVersion: "17.0.5", ompBuild: "test" },
+      stop: async () => { bridgeStops += 1; },
+    };
+    await expect(
+      runHostDaemon(
+        { ompExecutable: "/opt/omp", profileId: "test", stateRoot: "/tmp/t4-host-test" },
+        {
+          createBridge: (_config, invocation) => {
+            capturedInvocation = invocation;
+            return bridge as never;
+          },
+          createTranscriptSearch: () => ({ close: async () => {} }) as never,
+          createLocal: (options: unknown) => {
+            capturedOptions = options as Record<string, unknown>;
+            throw new Error("captured appserver options");
+          },
+        },
+      ),
+    ).rejects.toThrow("captured appserver options");
+    expect(capturedInvocation).toEqual({
+      executable: "/opt/omp",
+      argv: ["bridge", "--stdio"],
+      environment: { OMP_PROFILE: "test" },
+    });
+    expect(capturedOptions?.rpcChildInvocation).toEqual({
+      executable: "/opt/omp",
+      prefixArgv: [],
+    });
+    expect(bridgeStops).toBe(1);
+  });
+
 
   test("claims lockless sessions for local bridge hosts only", async () => {
     const captures: Record<string, unknown>[] = [];

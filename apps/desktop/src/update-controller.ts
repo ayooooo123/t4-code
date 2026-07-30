@@ -66,6 +66,7 @@ export interface DesktopUpdateControllerOptions {
   readonly now?: () => number;
   readonly setTimer?: (callback: () => void, delayMs: number) => unknown;
   readonly clearTimer?: (handle: unknown) => void;
+  readonly report?: (message: string) => void;
 }
 
 interface ReleaseAsset {
@@ -486,6 +487,9 @@ export class DesktopUpdateController {
   restartToUpdate(): DesktopUpdateState {
     if (!this.disposed && this.nativeEligible && this.state.phase === "ready") {
       try {
+        this.options.report?.(
+          `[desktop] native update restart requested: current=${this.options.currentVersion} available=${this.state.availableVersion}`,
+        );
         this.options.nativeUpdater.quitAndInstall(false, true);
       } catch (error) {
         this.onNativeError(

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { hostId, revision, sessionId, type DurableEntry, type SessionRef } from "@t4-code/protocol";
 import { MAX_INDEXED_SESSION_REFS } from "../src/projection.ts";
 import { PreviewCaptureResource, previewKey } from "../src/preview.ts";
@@ -1861,6 +1861,30 @@ describe("client projections", () => {
     expect(decodeProjectionCacheValue("x".repeat(MAX_PROJECTION_CACHE_BYTES + 1))).toBeUndefined();
   });
 
+  it("retains a bounded form of one oversized latest cache entry", () => {
+    const hugeEntry: DurableEntry = Object.freeze({
+      ...childEntry("large-cache-entry", "small prefix"),
+      data: Object.freeze({
+        role: "assistant",
+        text: "large payload ".repeat(300_000),
+      }),
+    });
+    const base = applyPublicFrame(createProjectionSnapshot(), frame("snapshot"));
+    const key = sessionKey("session-a");
+    const warm = base.sessions.get(key)!;
+    const state = Object.freeze({
+      ...base,
+      sessions: new Map([[key, Object.freeze({ ...warm, entries: Object.freeze([hugeEntry]) })]]),
+    });
+
+    const restored = decodeProjectionCacheValue(encodeProjectionCache(state));
+    const entries = restored?.sessions.get(sessionKey("session-a"))?.entries;
+    expect(entries).toHaveLength(1);
+    expect(JSON.stringify(entries![0])).toContain("large payload");
+    expect(JSON.stringify(entries![0]).length).toBeLessThan(300_000);
+    expect(restored?.sessions.get(sessionKey("session-a"))?.historyTruncated).not.toBe(true);
+  });
+
   it("preserves an existing truncated-history marker across cache re-encoding", () => {
     const base = applyPublicFrame(createProjectionSnapshot(), frame("snapshot"));
     const key = sessionKey("session-a");
@@ -1874,6 +1898,68 @@ describe("client projections", () => {
     expect(restored?.sessions.get(key)?.historyTruncated).toBe(true);
     const restoredAgain = decodeProjectionCacheValue(encodeProjectionCache(restored!));
     expect(restoredAgain?.sessions.get(key)?.historyTruncated).toBe(true);
+  });
+
+  it("coalesces cache saves off the projection mutation hot path", async () => {
+    const saves: string[] = [];
+    const cacheStore: ProjectionCacheStore = {
+      load: () => undefined,
+      save: (serialized) => {
+        saves.push(serialized);
+      },
+    };
+    const store = new ProjectionStore({ cacheStore });
+    store.applyPublicFrame(frame("snapshot"));
+    for (let seq = 2; seq <= 20; seq += 1) {
+      store.applyPublicFrame({
+        ...frame("event"),
+        cursor: { epoch: "e1", seq },
+        event: { type: "message.delta", text: `chunk-${seq}` },
+      });
+    }
+    expect(saves).toEqual([]);
+    await store.flush();
+    expect(saves).toHaveLength(1);
+    expect(decodeProjectionCacheValue(saves[0])?.sessions.get(sessionKey("session-a"))).toBeDefined();
+  });
+
+  it("delays a newer pending cache save after the current save resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const saves: string[] = [];
+      let release: (() => void) | undefined;
+      let store: ProjectionStore | undefined;
+      const cacheStore: ProjectionCacheStore = {
+        load: () => undefined,
+        save: (serialized) => {
+          const pending = Promise.withResolvers<void>();
+          saves.push(serialized);
+          if (saves.length === 1) {
+            store?.applyPublicFrame({
+              ...frame("event"),
+              cursor: { epoch: "e1", seq: 2 },
+              event: { type: "message.delta", text: "during-save" },
+            });
+          }
+          release = pending.resolve;
+          return pending.promise;
+        },
+      };
+      store = new ProjectionStore({ cacheStore });
+      store.applyPublicFrame(frame("snapshot"));
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(saves).toHaveLength(1);
+      release?.();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(saves).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(saves).toHaveLength(2);
+      release?.();
+      await store.flush();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("serializes cache saves and disposes listeners", async () => {
@@ -1894,16 +1980,12 @@ describe("client projections", () => {
     });
     store.applyPublicFrame(frame("snapshot"));
     store.applyPublicFrame(frame("event"));
-    expect(saves).toHaveLength(1);
+    expect(saves).toHaveLength(0);
     const shutdown = store.dispose();
     expect(saves).toHaveLength(1);
     release?.();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(saves).toHaveLength(2);
-    expect(saves[1]).not.toBe(saves[0]);
-    release?.();
     await shutdown;
+    expect(decodeProjectionCacheValue(saves[0])?.sessions.get(sessionKey("session-a"))?.cursor?.seq).toBe(2);
     dispose();
     store.applyPublicFrame({ ...frame("event"), cursor: { epoch: "e1", seq: 3 } });
     expect(calls).toBe(2);

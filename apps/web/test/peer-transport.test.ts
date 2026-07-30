@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { encodePeerInvite, encodePeerWireFrame } from "@t4-code/protocol";
 
+import { parsePeerBackend } from "../src/platform/mobile-connection-records.ts";
+import { MOBILE_PEER_BACKEND_STORAGE_KEY } from "../src/platform/native-mobile.ts";
 import { CapacitorPeerTransport } from "../src/platform/peer-transport.ts";
 
 const INVITE = encodePeerInvite({
@@ -12,6 +14,13 @@ function base64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/gu, "");
+}
+
+class MemoryStorage {
+  readonly values = new Map<string, string>();
+  getItem(key: string): string | null { return this.values.get(key) ?? null; }
+  setItem(key: string, value: string): void { this.values.set(key, value); }
+  removeItem(key: string): void { this.values.delete(key); }
 }
 
 afterEach(() => {
@@ -47,6 +56,107 @@ describe("CapacitorPeerTransport", () => {
 
     expect(settled).toBe(true);
     expect(cancelOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a stale saved peer invite when authorization is rejected", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, JSON.stringify(parsePeerBackend(INVITE)));
+    const reload = vi.fn();
+    const peerDataListeners = new Set<(event: { sessionId: string; data?: string }) => void>();
+    const peerClosedListeners = new Set<(event: { sessionId: string }) => void>();
+    const challenge = base64Url(encodePeerWireFrame({ type: "challenge", nonce: "desktop-nonce" }));
+    const rejected = base64Url(encodePeerWireFrame({ type: "close", code: 4001, reason: "pairing rejected" }));
+    let writes = 0;
+    const nativeWrite = vi.fn(async () => {
+      writes += 1;
+      if (writes === 1) queueMicrotask(() => {
+        for (const listener of peerDataListeners) listener({ sessionId: "session-1", data: challenge });
+      });
+      if (writes === 2) queueMicrotask(() => {
+        for (const listener of peerDataListeners) listener({ sessionId: "session-1", data: rejected });
+        for (const listener of peerClosedListeners) listener({ sessionId: "session-1" });
+      });
+    });
+    Object.assign(globalThis, {
+      window: {
+        Capacitor: {
+          Plugins: {
+            T4PeerConnection: {
+              addListener: (
+                eventName: string,
+                listener: (event: { sessionId: string; data?: string }) => void,
+              ) => {
+                if (eventName === "peerData") peerDataListeners.add(listener);
+                if (eventName === "peerClosed") peerClosedListeners.add(listener as (event: { sessionId: string }) => void);
+                return Promise.resolve({ remove: () => undefined });
+              },
+              cancelOpen: () => Promise.resolve(),
+              close: () => Promise.resolve(),
+              open: () => Promise.resolve({ sessionId: "session-1" }),
+              write: nativeWrite,
+            },
+          },
+        },
+        localStorage: storage,
+        location: { reload },
+      },
+    });
+    const transport = new CapacitorPeerTransport(INVITE);
+
+    await expect(transport.open()).rejects.toThrow("private mobile pairing was rejected");
+
+    expect(storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY)).toBeNull();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a saved peer invite when an accepted proof closes before authorization", async () => {
+    const storage = new MemoryStorage();
+    const saved = JSON.stringify(parsePeerBackend(INVITE));
+    storage.setItem(MOBILE_PEER_BACKEND_STORAGE_KEY, saved);
+    const reload = vi.fn();
+    const peerDataListeners = new Set<(event: { sessionId: string; data?: string }) => void>();
+    const peerClosedListeners = new Set<(event: { sessionId: string }) => void>();
+    const challenge = base64Url(encodePeerWireFrame({ type: "challenge", nonce: "desktop-nonce" }));
+    let writes = 0;
+    const nativeWrite = vi.fn(async () => {
+      writes += 1;
+      if (writes === 1) queueMicrotask(() => {
+        for (const listener of peerDataListeners) listener({ sessionId: "session-1", data: challenge });
+      });
+      if (writes === 2) queueMicrotask(() => {
+        for (const listener of peerClosedListeners) listener({ sessionId: "session-1" });
+      });
+    });
+    Object.assign(globalThis, {
+      window: {
+        Capacitor: {
+          Plugins: {
+            T4PeerConnection: {
+              addListener: (
+                eventName: string,
+                listener: (event: { sessionId: string; data?: string }) => void,
+              ) => {
+                if (eventName === "peerData") peerDataListeners.add(listener);
+                if (eventName === "peerClosed") peerClosedListeners.add(listener as (event: { sessionId: string }) => void);
+                return Promise.resolve({ remove: () => undefined });
+              },
+              cancelOpen: () => Promise.resolve(),
+              close: () => Promise.resolve(),
+              open: () => Promise.resolve({ sessionId: "session-1" }),
+              write: nativeWrite,
+            },
+          },
+        },
+        localStorage: storage,
+        location: { reload },
+      },
+    });
+    const transport = new CapacitorPeerTransport(INVITE);
+
+    await expect(transport.open()).rejects.toThrow("private mobile connection closed before it was ready");
+
+    expect(storage.getItem(MOBILE_PEER_BACKEND_STORAGE_KEY)).toBe(saved);
+    expect(reload).not.toHaveBeenCalled();
   });
 
   it("waits for native close completion before opening a replacement", async () => {

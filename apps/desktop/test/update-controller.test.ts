@@ -137,6 +137,7 @@ function controller(
     readonly fetchManifest?: () => Promise<UpdateFetchResponse>;
     readonly opened?: string[];
     readonly timers?: Array<() => void>;
+    readonly report?: (message: string) => void;
   } = {},
 ) {
   const updater = options.updater ?? new FakeUpdater();
@@ -163,6 +164,7 @@ function controller(
       return callback;
     },
     clearTimer: () => {},
+    ...(options.report === undefined ? {} : { report: options.report }),
   });
   return { instance, updater, opened, timers };
 }
@@ -271,6 +273,26 @@ describe("desktop update controller", () => {
     expect(updater.restartCalls).toBe(0);
     instance.restartToUpdate();
     expect(updater.restartCalls).toBe(1);
+    instance.dispose();
+  });
+
+  it("reports the user-driven native installer restart cause", async () => {
+    const reports: string[] = [];
+    const updater = new FakeUpdater();
+    updater.checkResult = { isUpdateAvailable: true, updateInfo: { version: "0.1.18" } };
+    const { instance } = controller({
+      updater,
+      nativeLinuxPackage: "deb",
+      report: (message) => reports.push(message),
+    });
+    expect((await instance.checkForUpdate()).phase).toBe("available");
+    await instance.downloadUpdate();
+    expect(updater.restartCalls).toBe(0);
+    instance.restartToUpdate();
+    expect(updater.restartCalls).toBe(1);
+    expect(reports).toEqual([
+      "[desktop] native update restart requested: current=0.1.17 available=0.1.18",
+    ]);
     instance.dispose();
   });
 

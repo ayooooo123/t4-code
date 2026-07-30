@@ -152,6 +152,8 @@ class FakeShell implements DesktopShellPort {
   rejectConnect = false;
   rejectLeaseCode: "outcome_unknown" | "stale" | "timeout" | undefined;
   hangRelease = false;
+  controllerLeaseId = "lease-fixture";
+  controllerExpiresAt: string | number = "2030-01-01T00:00:00.000Z";
   promptExpiresAt: string | number = "2030-01-01T00:00:00.000Z";
   promptAcquireGate: Promise<void> | undefined;
   controllerAcquireGate: Promise<void> | undefined;
@@ -223,7 +225,7 @@ class FakeShell implements DesktopShellPort {
       if (request.intent.command === "controller.lease.release" && this.hangRelease) return new Promise<CommandResult & Record<string, unknown>>(() => undefined);
       const base = { targetId: request.targetId, requestId: `${request.targetId}-lease-request`, commandId: `${request.targetId}-lease-command`, accepted: true };
       if (request.intent.command === "controller.lease.release") return base;
-      return { ...base, leaseId: "lease-fixture", expiresAt: "2030-01-01T00:00:00.000Z", cursor: "cursor-fixture" };
+      return { ...base, leaseId: this.controllerLeaseId, expiresAt: this.controllerExpiresAt, cursor: "cursor-fixture" };
     }
     if (request.intent.command.startsWith("prompt.lease")) {
       if (this.rejectLeaseCode !== undefined) {
@@ -1341,6 +1343,59 @@ describe("desktop runtime projection", () => {
     expect(second).toEqual(first);
     expect(shell.commands.filter((command) => command.intent.command === "controller.lease.acquire")).toHaveLength(1);
     expect(shell.commands.at(-1)?.intent).toMatchObject({ hostId: hostId("host-remote"), sessionId: sessionId("session-a"), command: "controller.lease.acquire", expectedRevision: revision("revision-a"), args: { ownerId: "owner-a" } });
+  });
+  it("renews a cached controller lease before reusing it near expiry", async () => {
+    let now = 1_000;
+    const { shell, runtime } = await leaseRuntime(["controller.lease"], { clock: { now: () => now } });
+    shell.controllerExpiresAt = new Date(now + 2_000).toISOString();
+    await runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a");
+    now += 1_100;
+    shell.controllerExpiresAt = new Date(now + 30_000).toISOString();
+    await runtime.commandWithControllerLease("remote", leaseIntent({ message: "reuse" }));
+    expect(shell.commands.map((command) => command.intent.command)).toEqual([
+      "controller.lease.acquire",
+      "controller.lease.renew",
+      "session.prompt",
+    ]);
+    expect(shell.commands.at(-1)?.intent.args).toEqual({ message: "reuse", leaseId: "lease-fixture" });
+  });
+  it("keeps a renewed cached controller lease when dispatch is cancelled", async () => {
+    let now = 1_000;
+    const { shell, runtime } = await leaseRuntime(["controller.lease"], { clock: { now: () => now } });
+    shell.controllerExpiresAt = new Date(now + 2_000).toISOString();
+    await runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a");
+    now += 1_100;
+    shell.controllerExpiresAt = new Date(now + 30_000).toISOString();
+    await expect(
+      runtime.commandWithControllerLease(
+        "remote",
+        leaseIntent({ message: "cancelled" }),
+        undefined,
+        () => { throw new Error("blocked dispatch"); },
+      ),
+    ).rejects.toThrow("blocked dispatch");
+    expect(shell.commands.map((command) => command.intent.command)).toEqual([
+      "controller.lease.acquire",
+      "controller.lease.renew",
+    ]);
+    expect(runtime.controllerLeaseFor("remote", "host-remote", "session-a", "revision-a")?.leaseId).toBe("lease-fixture");
+  });
+  it("drops an expired cached controller lease before acquiring a fresh one", async () => {
+    let now = 1_000;
+    const { shell, runtime } = await leaseRuntime(["controller.lease"], { clock: { now: () => now } });
+    shell.controllerLeaseId = "lease-old";
+    shell.controllerExpiresAt = new Date(now + 1_000).toISOString();
+    await runtime.acquireControllerLease("remote", "host-remote", "session-a", "revision-a");
+    now += 1_001;
+    shell.controllerExpiresAt = new Date(now + 30_000).toISOString();
+    shell.controllerLeaseId = "lease-fresh";
+    await runtime.commandWithControllerLease("remote", leaseIntent({ message: "fresh" }));
+    expect(shell.commands.map((command) => command.intent.command)).toEqual([
+      "controller.lease.acquire",
+      "controller.lease.acquire",
+      "session.prompt",
+    ]);
+    expect(shell.commands.at(-1)?.intent.args).toEqual({ message: "fresh", leaseId: "lease-fresh" });
   });
   it("releases a controller lease granted after disconnect and blocks stale dispatch", async () => {
     const { shell, runtime } = await leaseRuntime(["controller.lease"]);

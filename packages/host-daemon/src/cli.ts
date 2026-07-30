@@ -13,6 +13,8 @@ import {
   TranscriptSearchIndex,
   type AppserverHandle,
   type AppserverOptions,
+  type OmpAuthorityBridgeInvocation,
+  type RpcChildInvocation,
   type DesktopOperationsAuthority,
   type SessionAuthority,
   type SessionDiscovery,
@@ -177,6 +179,23 @@ export function parseHostDaemonArgs(argv: readonly string[], home = homedir()): 
       : {}),
   };
 }
+function authorityBridgeInvocation(config: HostDaemonConfig): OmpAuthorityBridgeInvocation {
+  return {
+    executable: config.ompExecutable,
+    argv: ["bridge", "--stdio"],
+    environment: { OMP_PROFILE: config.profileId },
+  };
+}
+
+function sessionRpcChildInvocation(config: HostDaemonConfig): RpcChildInvocation {
+  return {
+    executable: config.ompExecutable,
+    // OMP session RPC is a top-level `omp --mode rpc` launch. The authority
+    // bridge is the separate `omp bridge --stdio` process above.
+    prefixArgv: [],
+  };
+}
+
 
 export function hostDaemonPaths(
   config: Pick<HostDaemonConfig, "profileId" | "stateRoot">,
@@ -199,7 +218,7 @@ export function hostDaemonPaths(
 }
 
 export interface HostDaemonDependencies {
-  readonly createBridge?: (config: HostDaemonConfig) => OmpAuthorityBridgeClient;
+  readonly createBridge?: (config: HostDaemonConfig, invocation: OmpAuthorityBridgeInvocation) => OmpAuthorityBridgeClient;
   readonly createOfficialAuthority?: (
     config: HostDaemonConfig,
     paths: HostDaemonPaths,
@@ -303,12 +322,10 @@ export async function runHostDaemon(
     lockCheck = session => official.lockCheck(session);
     lockStatus = () => official.lockStatus();
   } else {
+    const invocation = authorityBridgeInvocation(config);
     bridge =
-      dependencies.createBridge?.(config) ??
-      new OmpAuthorityBridgeClient({
-        executable: config.ompExecutable,
-        environment: { OMP_PROFILE: config.profileId },
-      });
+      dependencies.createBridge?.(config, invocation) ??
+      new OmpAuthorityBridgeClient(invocation);
     try {
       await bridge.start();
       const authorities = bridge.createAuthorities();
@@ -361,7 +378,7 @@ export async function runHostDaemon(
       // bridge authority keeps the conservative "unclear ownership stays read-only".
       ...(config.authorityMode === "official" || !config.remote ? { claimLocklessSessions: true } : {}),
       ...(transcriptImageRoot ? { transcriptImageRoot } : {}),
-      rpcChildInvocation: { executable: config.ompExecutable, prefixArgv: [] },
+      rpcChildInvocation: sessionRpcChildInvocation(config),
       rpcChildEnvironment: { OMP_PROFILE: config.profileId },
       ...(config.authorityMode === "official" ? { rpcDialect: "official-17.0.9" as const } : {}),
       ...(process.platform === "darwin"

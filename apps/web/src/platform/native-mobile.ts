@@ -421,6 +421,20 @@ export function readStoredPeerMobileBackend(
   return decodeStoredPeerBackend(raw);
 }
 
+export function removeStoredPeerMobileBackend(
+  invite: string,
+  storage: MutableMobileStorage = window.localStorage,
+): boolean {
+  try {
+    const peer = readStoredPeerMobileBackend(storage);
+    if (peer?.invite !== invite) return false;
+    storage.removeItem(MOBILE_PEER_BACKEND_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function firstRunStorageIsEmpty(storage: ReadableMobileStorage): boolean {
   try {
     return [

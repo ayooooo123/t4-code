@@ -13,8 +13,8 @@ import { hostId } from "@t4-code/host-wire";
 import { ClusterInternalRemotePolicy, sessionHostConfigFromEnv, type SessionHostConfig } from "./session-host-policy.ts";
 import { KubernetesTokenReviewer } from "./kubernetes-client.ts";
 
-const OMP_VERSION = "17.0.5";
-const OMP_COMMIT = "d83b688817651d39bfab00676db6109a2d1ccec5";
+const OMP_VERSION = "17.0.9";
+const OMP_COMMIT = "639bac596d94b5993349f3f6696176cb2bf9b5d3";
 
 export async function runSessionHost(
 	config: SessionHostConfig,

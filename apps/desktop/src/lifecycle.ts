@@ -34,7 +34,6 @@ import {
   discoverT4HostExecutable,
   OmpAppserverCompatibilityError,
   probeOmpAppserver,
-  repairAppserverService,
   NodeServiceFileSystem,
 } from "./service.ts";
 import { WorkspaceRootsService } from "./workspace-roots.ts";
@@ -96,8 +95,9 @@ export interface DesktopLifecycleOptions {
   readonly createSpeechService?: (options: {
     readonly discoverExecutable: () => Promise<string | undefined>;
   }) => DesktopSpeechService;
-  readonly createUpdateController?: () => DesktopUpdateController;
+  readonly createUpdateController?: (report: (message: string) => void) => DesktopUpdateController;
   readonly installMenu?: (options: ApplicationMenuOptions) => void;
+  readonly report?: (message: string) => void;
 }
 
 class ServiceRecoveryCancelledError extends Error {
@@ -135,8 +135,9 @@ export class DesktopLifecycle {
   private readonly workspaceRootsFactory: () => WorkspaceRootsService;
   private peerShare: Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop"> | undefined;
   private workspaceRoots: WorkspaceRootsService | undefined;
-  private readonly updateControllerFactory: () => DesktopUpdateController;
+  private readonly updateControllerFactory: (report: (message: string) => void) => DesktopUpdateController;
   private readonly menuInstaller: (options: ApplicationMenuOptions) => void;
+  private readonly report: (message: string) => void;
   private mainWindow: BrowserWindow | undefined;
   private browserRuntime: BrowserRuntime | undefined;
   private ipc: DesktopIpcRegistry | undefined;
@@ -151,6 +152,7 @@ export class DesktopLifecycle {
   private serviceExecutablePromise: Promise<string | undefined> | undefined;
   private hostExecutablePromise: Promise<string | undefined> | undefined;
   private serviceRecoveryPromise: Promise<ServiceManager | undefined> | undefined;
+  private defaultServiceRecoveryGeneration = 0;
   private automaticServiceRepairPromise: Promise<void> | undefined;
   private readonly serviceRecoveryPromises = new Map<string, Promise<ServiceManager | undefined>>();
   private readonly serviceAvailabilityIssues = new Map<string, ServiceAvailabilityIssue>();
@@ -229,7 +231,9 @@ export class DesktopLifecycle {
     this.workspaceRootsFactory = options.createWorkspaceRoots ?? (() => new WorkspaceRootsService({ store: new ElectronWorkspaceRootsStore() }));
     this.speechServiceFactory =
       options.createSpeechService ?? ((speechOptions) => createDesktopSpeechService(speechOptions));
-    this.updateControllerFactory = options.createUpdateController ?? createElectronUpdateController;
+    this.report = options.report ?? console.error;
+    this.updateControllerFactory =
+      options.createUpdateController ?? ((report) => createElectronUpdateController(report));
     this.menuInstaller = options.installMenu ?? installApplicationMenu;
   }
   async start(): Promise<void> {
@@ -247,6 +251,7 @@ export class DesktopLifecycle {
     this.started = true;
     const gotLock = this.electronApp.requestSingleInstanceLock();
     if (!gotLock) {
+      this.report("[desktop] app.quit requested: secondary instance without single-instance lock");
       this.electronApp.quit();
       return;
     }
@@ -288,7 +293,7 @@ export class DesktopLifecycle {
     this.workspaceRoots = this.workspaceRootsFactory();
     const peerShare = this.peerShareFactory(this.workspaceRoots);
     this.peerShare = peerShare;
-    this.updateController = this.updateControllerFactory();
+    this.updateController = this.updateControllerFactory(this.report);
     if (this.electronApp.isPackaged) {
       this.phoneSetup = new PhoneSetupService({
         resourcesPath: process.resourcesPath,
@@ -342,6 +347,7 @@ export class DesktopLifecycle {
       this.ipc?.emitRuntimeError(runtimeError(error, `local:${profileId}`));
     });
     this.beforeQuitHandler = () => {
+      this.report(`[desktop] before-quit received: stopping=${this.stopping}`);
       void this.stop().catch(() => {
         // Electron is already quitting; teardown remains best effort.
       });
@@ -456,7 +462,7 @@ export class DesktopLifecycle {
         ? this.serviceRecoveryPromise
         : this.serviceRecoveryPromises.get(profile);
     if (activeRecovery !== undefined) return activeRecovery;
-    const recovery = this.recoverServiceManager(profile);
+    const recovery = this.recoverServiceManager(profile, this.defaultServiceRecoveryGeneration);
     if (profile === "default") this.serviceRecoveryPromise = recovery;
     else this.serviceRecoveryPromises.set(profile, recovery);
     const clearRecovery = (): void => {
@@ -495,13 +501,30 @@ export class DesktopLifecycle {
   private async repairAutomaticDefaultService(): Promise<void> {
     const profile = await this.localProfileRegistry?.get("default");
     if (profile?.autoStart !== true || this.stopping) return;
-    const manager = await this.acquireServiceManager();
-    if (manager === undefined || this.stopping) return;
-    await repairAppserverService(manager);
+    await this.refreshDefaultServiceManager();
   }
 
-  private async recoverServiceManager(profileId = "default"): Promise<ServiceManager | undefined> {
+  private refreshDefaultServiceManager(): Promise<ServiceManager | undefined> {
+    if (this.stopping) return Promise.resolve(undefined);
+    this.serviceManager = undefined;
+    this.defaultServiceRecoveryGeneration += 1;
+    const generation = this.defaultServiceRecoveryGeneration;
+    const recovery = this.recoverServiceManager("default", generation);
+    this.serviceRecoveryPromise = recovery;
+    const clearRecovery = (): void => {
+      if (this.serviceRecoveryPromise === recovery) this.serviceRecoveryPromise = undefined;
+    };
+    void recovery.then(clearRecovery, clearRecovery);
+    return recovery;
+  }
+
+  private async recoverServiceManager(
+    profileId = "default",
+    defaultGeneration = this.defaultServiceRecoveryGeneration,
+  ): Promise<ServiceManager | undefined> {
     if (this.stopping) return undefined;
+    const defaultRecoveryIsStale = (): boolean =>
+      profileId === "default" && defaultGeneration !== this.defaultServiceRecoveryGeneration;
     let executable: string | undefined;
     let hostExecutable: string | undefined;
     try {
@@ -510,11 +533,14 @@ export class DesktopLifecycle {
         this.discoverHostServiceExecutable(),
       ]);
       this.assertServiceRecoveryActive();
+      if (defaultRecoveryIsStale()) return this.serviceManager;
     } catch (error) {
-      if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
+      if (this.stopping || error instanceof ServiceRecoveryCancelledError || defaultRecoveryIsStale())
+        return undefined;
       this.recordServiceFailure(error, profileId);
       return undefined;
     }
+    if (defaultRecoveryIsStale()) return this.serviceManager;
     if (executable === undefined) {
       const issue: ServiceAvailabilityIssue = {
         code: "omp_not_found",
@@ -530,6 +556,7 @@ export class DesktopLifecycle {
         message:
           "The T4 host executable was not found. Repair or reinstall T4 Code, then choose Check again.",
       };
+      if (defaultRecoveryIsStale()) return this.serviceManager;
       if (profileId === "default") this.serviceAvailabilityIssue = issue;
       else this.serviceAvailabilityIssues.set(profileId, issue);
       return undefined;
@@ -555,6 +582,7 @@ export class DesktopLifecycle {
         await this.ensureServiceReady(candidate, executable);
       } catch (error) {
         if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
+        if (defaultRecoveryIsStale()) return this.serviceManager;
         // Creation succeeded, so keep the manager available for authoritative
         // inspection and explicit repair actions even if automatic startup did
         // not finish. The preparation error remains a one-shot runtime event.
@@ -564,12 +592,14 @@ export class DesktopLifecycle {
         return candidate;
       }
       this.assertServiceRecoveryActive();
+      if (defaultRecoveryIsStale()) return this.serviceManager;
       this.serviceManager = candidate;
       this.serviceAvailabilityIssue = undefined;
       this.startupServiceError = undefined;
       return candidate;
     } catch (error) {
-      if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
+      if (this.stopping || error instanceof ServiceRecoveryCancelledError || defaultRecoveryIsStale())
+        return undefined;
       this.recordServiceFailure(error, profileId);
       return undefined;
     }
@@ -660,7 +690,13 @@ export class DesktopLifecycle {
       for (const link of links) this.ipc?.emitPairLink(link);
       this.updateController?.schedulePassiveCheck();
     });
+    handle.window.on("close", () => {
+      this.report(
+        `[desktop] main window close requested: stopping=${this.stopping} destroyed=${handle.window.isDestroyed()}`,
+      );
+    });
     handle.window.on("closed", () => {
+      this.report(`[desktop] main window closed: stopping=${this.stopping}`);
       if (this.mainWindow !== handle.window) return;
       const browser = this.browserRuntime;
       const ipc = this.ipc;
@@ -721,6 +757,7 @@ export class DesktopLifecycle {
       trustedRenderer: handle.trustedRenderer,
       getServiceManager: () => this.serviceManager,
       acquireServiceManager: () => this.acquireServiceManager(),
+      refreshServiceManager: () => this.refreshDefaultServiceManager(),
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
       ...(this.speechService === undefined ? {} : { speech: this.speechService }),
       ...(this.profileRuntime === undefined ? {} : { profileRuntime: this.profileRuntime }),

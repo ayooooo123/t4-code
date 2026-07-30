@@ -134,7 +134,7 @@ function roleTagName(modelTags: unknown, role: string): string | null {
 }
 
 /** `provider/model` with any trailing `:level` thinking suffix removed. */
-function baseSelector(selector: string): string {
+export function baseSelector(selector: string): string {
   const colon = selector.lastIndexOf(":");
   return colon > selector.indexOf("/") && colon !== -1 ? selector.slice(0, colon) : selector;
 }

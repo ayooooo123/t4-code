@@ -48,8 +48,8 @@ async function main(): Promise<void> {
     verifiedRuntime?: unknown;
   };
   const expected = runtime(matrix.verifiedRuntime);
-  if (expected.sourceRepository !== "https://github.com/wolfiesch/oh-my-pi")
-    throw new Error("verified runtime repository is not the owned OMP fork");
+  if (expected.sourceRepository !== "https://github.com/can1357/oh-my-pi")
+    throw new Error("verified runtime repository is not the official OMP repository");
   if ((await gitHead(exactSourceRoot)) !== expected.sourceCommit)
     throw new Error("checked-out current OMP source does not match verifiedRuntime.sourceCommit");
   const cli = join(exactSourceRoot, "packages", "coding-agent", "src", "cli.ts");

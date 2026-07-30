@@ -89,6 +89,7 @@ export interface IpcRuntime {
   readonly getServiceManager?: () => ServiceManager | undefined;
   readonly speech?: DesktopSpeechService;
   readonly acquireServiceManager?: () => Promise<ServiceManager | undefined>;
+  readonly refreshServiceManager?: () => Promise<ServiceManager | undefined>;
   readonly getServiceAvailabilityIssue?: () => ServiceAvailabilityIssue | undefined;
   readonly profileRuntime?: LocalProfileRuntime;
   readonly drainPairLinks?: () => readonly PairLinkEvent[];
@@ -544,7 +545,11 @@ export class DesktopIpcRegistry {
     // point must run after the write instead of reusing a pre-write snapshot.
     this.serviceInspectionPromise = undefined;
     const operation = async (): Promise<void> => {
-      const manager = await this.acquireServiceManager();
+      const manager = await (
+        action === "install" || action === "restart"
+          ? (this.runtime.refreshServiceManager?.() ?? this.acquireServiceManager())
+          : this.acquireServiceManager()
+      );
       if (manager === undefined) throw new Error(this.unavailableInspection().issue?.message ?? "T4 host service is unavailable");
       await manager[action]();
     };

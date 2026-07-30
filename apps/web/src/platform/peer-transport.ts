@@ -6,8 +6,13 @@ import {
 } from "@t4-code/protocol";
 import type { OmpTransport, Unsubscribe } from "@t4-code/client";
 
-import { peerConnection, type T4PeerConnectionPlugin } from "./native-mobile.ts";
+import {
+  peerConnection,
+  removeStoredPeerMobileBackend,
+  type T4PeerConnectionPlugin,
+} from "./native-mobile.ts";
 
+const PEER_CLOSE_PAIRING_REJECTED = 4001;
 const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 const PEER_OPEN_TIMEOUT_MS = 50_000;
 const encoder = new TextEncoder();
@@ -96,6 +101,7 @@ export class CapacitorPeerTransport implements OmpTransport {
     let resolveOpen: (() => void) | undefined;
     let rejectOpen: ((error: Error) => void) | undefined;
     const opening = new Promise<void>((resolve, reject) => { resolveOpen = resolve; rejectOpen = reject; });
+    let authorizationSent = false;
     const fail = (error: Error): void => {
       if (this.closed) return;
       void plugin.cancelOpen({ attemptId }).catch(() => undefined);
@@ -103,15 +109,42 @@ export class CapacitorPeerTransport implements OmpTransport {
       for (const listener of this.errors) listener(error);
       this.close();
     };
+    const failPairingRejected = (): void => {
+      try {
+        if (removeStoredPeerMobileBackend(this.invite) && typeof window !== "undefined") {
+          window.location.reload();
+        }
+      } catch {
+        /* the rejection below still tells the user to pair again */
+      }
+      fail(new Error("private mobile pairing was rejected. Scan the key again."));
+    };
     const processFrame = async (frame: PeerWireFrame): Promise<void> => {
       if (frame.type === "challenge") {
         const authorization = await proof(decoded.capability, nonce, frame.nonce, decoded.desktopPublicKey);
+        authorizationSent = true;
         await this.writeFrame({ type: "authorize", proof: authorization });
         return;
       }
       if (frame.type === "authorized") {
         this.opened = true;
         resolveOpen?.();
+        return;
+      }
+      if (frame.type === "close") {
+        if (!this.opened && frame.code === PEER_CLOSE_PAIRING_REJECTED && authorizationSent) {
+          failPairingRejected();
+          return;
+        }
+        if (!this.opened) {
+          fail(new Error(frame.reason));
+          return;
+        }
+        this.finishClose();
+        return;
+      }
+      if (frame.type === "error") {
+        fail(new Error(frame.code));
         return;
       }
       if (frame.type === "message" && this.opened) {
@@ -137,6 +170,14 @@ export class CapacitorPeerTransport implements OmpTransport {
     });
     const closeListener = await plugin.addListener("peerClosed", (event) => {
       if (event.sessionId !== this.sessionId) return;
+      if (!this.opened) {
+        fail(new Error("private mobile connection closed before it was ready"));
+        return;
+      }
+      if (!this.opened) {
+        fail(new Error("private mobile connection closed before it was ready"));
+        return;
+      }
       this.finishClose();
     });
     this.removers = [dataListener.remove, closeListener.remove];

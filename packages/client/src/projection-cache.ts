@@ -15,7 +15,7 @@ import type {
 } from "./projection.ts";
 import { ImmutableSet } from "./immutable-set.ts";
 import { ImmutableMap } from "./immutable-map.ts";
-import { retainedJsonBytes } from "./transcript-retention.ts";
+import { retainedJsonBytes, sanitizeRetainedDurableEntry } from "./transcript-retention.ts";
 import { previewKey, type PreviewCaptureMetadata } from "./preview.ts";
 
 export const PROJECTION_CACHE_VERSION = 2 as const;
@@ -201,10 +201,11 @@ function cachedEntries(
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry === undefined) continue;
-    const entryBytes = retainedJsonBytes(entry);
+    const sanitized = sanitizeRetainedDurableEntry(entry);
+    const entryBytes = retainedJsonBytes(sanitized);
     const separator = retained.length === 0 ? 0 : 1;
     if (bytes + separator + entryBytes > maxBytes) break;
-    retained.push(entry);
+    retained.push(sanitized);
     bytes += separator + entryBytes;
   }
   retained.reverse();

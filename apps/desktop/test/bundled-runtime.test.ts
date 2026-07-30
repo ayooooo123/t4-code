@@ -28,6 +28,7 @@ describe("bundled OMP runtime", () => {
     expect((await stat(first)).mode & 0o777).toBe(0o755);
   });
 
+
   it("rejects a bundled executable that does not match its manifest", async () => {
     const root = await mkdtemp(join(tmpdir(), "t4-bundled-runtime-bad-"));
     const resourcesPath = join(root, "resources");

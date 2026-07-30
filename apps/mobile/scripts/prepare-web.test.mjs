@@ -227,6 +227,15 @@ test("private Android connections have a bounded native open attempt", async () 
   assert.doesNotMatch(plugin, /call\.reject\(message\)\s+try \{ dht\?\.close\(\) \}/);
 });
 
+test("private Android open replaces stale native sessions", async () => {
+  const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
+
+  assert.match(plugin, /val staleSessionIds = synchronized\(sessions\)/);
+  assert.match(plugin, /val stale = sessions\.keys\.toList\(\)/);
+  assert.match(plugin, /for \(id in staleSessionIds\) closeSession\(id, true\)/);
+  assert.match(plugin, /Closing stale private connection before opening a replacement/);
+});
+
 test("private Android reconnects retain the foreground-service DHT node", async () => {
   const plugin = await readFile(resolve(mobileRoot, "android/app/src/main/kotlin/com/lycaonsolutions/t4code/T4PeerConnectionPlugin.kt"), "utf8");
   const service = await readFile(

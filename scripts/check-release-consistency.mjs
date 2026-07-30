@@ -40,7 +40,7 @@ export const RELEASE_CONTRACT_PATHS = [
 ];
 
 const REPOSITORY_URL = "https://github.com/LycaonLLC/t4-code";
-const OMP_RUNTIME_REPOSITORY = "https://github.com/wolfiesch/oh-my-pi";
+const OMP_INTEGRATION_RUNTIME_REPOSITORY = "https://github.com/wolfiesch/oh-my-pi";
 const OMP_APP_WIRE_SOURCE_REPOSITORY = "https://github.com/lyc-aon/oh-my-pi";
 const OMP_UPSTREAM_REPOSITORY = "https://github.com/can1357/oh-my-pi";
 const OMP_HOST_MIGRATION_SOURCE_REPOSITORY = "https://github.com/lyc-aon/oh-my-pi";
@@ -236,10 +236,13 @@ function validateRuntimeMetadata(value, label, matrixPath, errors) {
   const version = value?.version;
   const sourceCommit = value?.sourceCommit;
   const sourceTag = value?.sourceTag;
-  const upstreamTag = value?.upstreamTag;
-  const upstreamCommit = value?.upstreamCommit;
-  const sourceCommitUrl = `${OMP_RUNTIME_REPOSITORY}/commit/${sourceCommit ?? ""}`;
-  const sourceTagUrl = `${OMP_RUNTIME_REPOSITORY}/tree/${sourceTag ?? ""}`;
+  const sourceRepository = value?.sourceRepository;
+  const isOfficialRuntime = sourceRepository === OMP_UPSTREAM_REPOSITORY;
+  const isIntegrationRuntime = sourceRepository === OMP_INTEGRATION_RUNTIME_REPOSITORY;
+  const upstreamTag = isOfficialRuntime ? sourceTag : value?.upstreamTag;
+  const upstreamCommit = isOfficialRuntime ? sourceCommit : value?.upstreamCommit;
+  const sourceCommitUrl = `${typeof sourceRepository === "string" ? sourceRepository : ""}/commit/${sourceCommit ?? ""}`;
+  const sourceTagUrl = `${typeof sourceRepository === "string" ? sourceRepository : ""}/tree/${sourceTag ?? ""}`;
   const upstreamTagUrl = `${OMP_UPSTREAM_REPOSITORY}/tree/${upstreamTag ?? ""}`;
   const upstreamCommitUrl = `${OMP_UPSTREAM_REPOSITORY}/commit/${upstreamCommit ?? ""}`;
   const prefix = `${matrixPath} ${label}`;
@@ -250,8 +253,10 @@ function validateRuntimeMetadata(value, label, matrixPath, errors) {
   if (typeof version !== "string" || !VERSION_PATTERN.test(version)) {
     errors.push(`${prefix} version must be a stable x.y.z version`);
   }
-  if (value?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
-    errors.push(`${prefix} repository must be ${OMP_RUNTIME_REPOSITORY}`);
+  if (!isOfficialRuntime && !isIntegrationRuntime) {
+    errors.push(
+      `${prefix} repository must be ${OMP_UPSTREAM_REPOSITORY} or ${OMP_INTEGRATION_RUNTIME_REPOSITORY}`,
+    );
   }
   if (typeof sourceCommit !== "string" || !SHA_PATTERN.test(sourceCommit)) {
     errors.push(`${prefix} commit must be a lowercase 40-character Git SHA`);
@@ -260,6 +265,14 @@ function validateRuntimeMetadata(value, label, matrixPath, errors) {
     errors.push(`${prefix} URL must be ${sourceCommitUrl}`);
   }
   if (
+    isOfficialRuntime &&
+    typeof version === "string" &&
+    sourceTag !== `v${version}`
+  ) {
+    errors.push(`${prefix} tag must be v${version}`);
+  }
+  if (
+    isIntegrationRuntime &&
     typeof version === "string" &&
     (typeof sourceTag !== "string" ||
       !new RegExp(`^t4code-${version.replaceAll(".", "\\.")}-appserver-[1-9]\\d*$`, "u").test(
@@ -268,28 +281,30 @@ function validateRuntimeMetadata(value, label, matrixPath, errors) {
   ) {
     errors.push(`${prefix} tag must identify the OMP version and appserver revision`);
   }
-  if (value?.upstreamRepository !== OMP_UPSTREAM_REPOSITORY) {
-    errors.push(`${prefix} upstream repository must be ${OMP_UPSTREAM_REPOSITORY}`);
-  }
-  if (typeof version === "string" && upstreamTag !== `v${version}`) {
-    errors.push(`${prefix} upstream tag must be v${version}`);
-  }
-  if (typeof upstreamCommit !== "string" || !SHA_PATTERN.test(upstreamCommit)) {
-    errors.push(`${prefix} upstream commit must be a lowercase 40-character Git SHA`);
-  }
-  const integrationPatches = value?.integrationPatches;
-  if (
-    !Array.isArray(integrationPatches) ||
-    integrationPatches.length === 0 ||
-    integrationPatches.some(
-      (patch) => typeof patch !== "string" || !PATCH_NAME_PATTERN.test(patch),
-    ) ||
-    new Set(integrationPatches).size !== integrationPatches.length
-  ) {
-    errors.push(`${prefix} integration patches must be unique kebab-case names`);
-  }
-  if (value?.upstreamTagContainsIntegrationPatches !== false) {
-    errors.push(`${prefix} must record that stock upstream lacks the integration patches`);
+  if (isIntegrationRuntime) {
+    if (value?.upstreamRepository !== OMP_UPSTREAM_REPOSITORY) {
+      errors.push(`${prefix} upstream repository must be ${OMP_UPSTREAM_REPOSITORY}`);
+    }
+    if (typeof version === "string" && upstreamTag !== `v${version}`) {
+      errors.push(`${prefix} upstream tag must be v${version}`);
+    }
+    if (typeof upstreamCommit !== "string" || !SHA_PATTERN.test(upstreamCommit)) {
+      errors.push(`${prefix} upstream commit must be a lowercase 40-character Git SHA`);
+    }
+    const integrationPatches = value?.integrationPatches;
+    if (
+      !Array.isArray(integrationPatches) ||
+      integrationPatches.length === 0 ||
+      integrationPatches.some(
+        (patch) => typeof patch !== "string" || !PATCH_NAME_PATTERN.test(patch),
+      ) ||
+      new Set(integrationPatches).size !== integrationPatches.length
+    ) {
+      errors.push(`${prefix} integration patches must be unique kebab-case names`);
+    }
+    if (value?.upstreamTagContainsIntegrationPatches !== false) {
+      errors.push(`${prefix} must record that stock upstream lacks the integration patches`);
+    }
   }
 
   return Object.freeze({
@@ -297,6 +312,7 @@ function validateRuntimeMetadata(value, label, matrixPath, errors) {
     sourceCommit,
     sourceTag,
     upstreamTag,
+    sourceRepository,
     upstreamCommit,
     sourceCommitUrl,
     sourceTagUrl,
@@ -424,8 +440,11 @@ function validateOfficialGate0Snapshot(snapshot, officialRuntime, path, errors) 
   if (snapshot?.packagedHostProof?.authorityMode !== "official-exclusive-profile") {
     errors.push(`${path} packagedHostProof.authorityMode must be official-exclusive-profile`);
   }
-  if (snapshot?.packagedHostProof?.releasedDefault !== "lycaon-authority-bridge") {
-    errors.push(`${path} packagedHostProof.releasedDefault must preserve the Lycaon fallback`);
+  if (snapshot?.packagedHostProof?.releasedDefault !== "official-omp-authority") {
+    errors.push(`${path} packagedHostProof.releasedDefault must record the official runtime default`);
+  }
+  if (snapshot?.t4Policy?.releasedFallback !== "none-official-runtime-is-default") {
+    errors.push(`${path} released fallback policy must record that official runtime is default`);
   }
   if (snapshot?.t4Policy?.ambiguousDispatch !== "outcome-unknown-no-auto-replay") {
     errors.push(`${path} ambiguous dispatch policy must fail closed without automatic replay`);
@@ -721,6 +740,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   const ompRuntimeVersion = publishedRuntime.version;
   const ompRuntimeCommit = publishedRuntime.sourceCommit;
   const ompRuntimeSourceTag = publishedRuntime.sourceTag;
+  const ompRuntimeRepository = publishedRuntime.sourceRepository;
+  const ompRuntimeIsOfficial = ompRuntimeRepository === OMP_UPSTREAM_REPOSITORY;
   const ompUpstreamTag = publishedRuntime.upstreamTag;
   const ompUpstreamCommit = publishedRuntime.upstreamCommit;
   const ompRuntimeCommitUrl = publishedRuntime.sourceCommitUrl;
@@ -785,7 +806,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   requireText(
     site,
-    "export const OMP_RUNTIME_URL = `https://github.com/wolfiesch/oh-my-pi/tree/${OMP_RUNTIME_TAG}`;",
+    `export const OMP_RUNTIME_URL = \`${ompRuntimeRepository}/tree/\${OMP_RUNTIME_TAG}\`;`,
     "apps/site/src/release.ts",
     errors,
   );
@@ -824,18 +845,20 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     "README.md",
     errors,
   );
-  requireText(
-    readme,
-    `official upstream [\`${ompUpstreamTag}\`](${ompUpstreamTagUrl}) tag at [\`${String(ompUpstreamCommit).slice(0, 8)}\`](${ompUpstreamCommitUrl})`,
-    "README.md",
-    errors,
-  );
-  requireText(
-    readme,
-    `The official upstream ${ompUpstreamTag} tag has no \`appserver\` command, so it cannot host T4 Code.`,
-    "README.md",
-    errors,
-  );
+  if (!ompRuntimeIsOfficial) {
+    requireText(
+      readme,
+      `official upstream [\`${ompUpstreamTag}\`](${ompUpstreamTagUrl}) tag at [\`${String(ompUpstreamCommit).slice(0, 8)}\`](${ompUpstreamCommitUrl})`,
+      "README.md",
+      errors,
+    );
+    requireText(
+      readme,
+      `The official upstream ${ompUpstreamTag} tag has no \`appserver\` command, so it cannot host T4 Code.`,
+      "README.md",
+      errors,
+    );
+  }
   requireText(
     readme,
     `T4 Code vendors \`@oh-my-pi/app-wire\` ${publishedAppWireVersion} from integration commit [\`${publishedAppWireSourceCommit.slice(0, 8)}\`](${OMP_APP_WIRE_SOURCE_REPOSITORY}/commit/${publishedAppWireSourceCommit}), source tree \`${publishedAppWireSourceTree}\`.`,
@@ -865,15 +888,20 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   }
 
   const releaseNotes = files.get("docs/CURRENT_RELEASE_NOTES.md") ?? "";
-  for (const expected of [
+  const expectedReleaseNotes = [
     `app-wire ${publishedAppWireVersion}`,
     `[${publishedAppWireSourceCommit.slice(0, 8)}](${OMP_APP_WIRE_SOURCE_REPOSITORY}/commit/${publishedAppWireSourceCommit})`,
     `OMP ${ompRuntimeVersion}`,
     `[${String(ompRuntimeCommit).slice(0, 8)}](${ompRuntimeCommitUrl})`,
     `[${ompRuntimeSourceTag}](${ompRuntimeSourceUrl})`,
-    `[${ompUpstreamTag} tag](${ompUpstreamTagUrl})`,
-    `[${String(ompUpstreamCommit).slice(0, 8)}](${ompUpstreamCommitUrl})`,
-  ]) {
+  ];
+  if (!ompRuntimeIsOfficial) {
+    expectedReleaseNotes.push(
+      `[${ompUpstreamTag} tag](${ompUpstreamTagUrl})`,
+      `[${String(ompUpstreamCommit).slice(0, 8)}](${ompUpstreamCommitUrl})`,
+    );
+  }
+  for (const expected of expectedReleaseNotes) {
     requireText(releaseNotes, expected, "docs/CURRENT_RELEASE_NOTES.md", errors);
   }
 
@@ -910,11 +938,9 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
 
   const siteDocs = files.get("apps/site/src/docs/content.ts") ?? "";
   requireText(siteDocs, "OMP_RUNTIME_URL", "apps/site/src/docs/content.ts", errors);
-  requireText(siteDocs, "OMP_UPSTREAM_URL", "apps/site/src/docs/content.ts", errors);
-  requireText(siteDocs, "OMP_UPSTREAM_COMMIT", "apps/site/src/docs/content.ts", errors);
   requireText(
     siteDocs,
-    "Official upstream OMP v${OMP_RUNTIME_VERSION} does not ship the \\`appserver\\` command, so it cannot host T4 Code.",
+    "The verified official OMP ${OMP_RUNTIME_VERSION} runtime includes the bounded \\`t4-omp-authority/1\\` bridge",
     "apps/site/src/docs/content.ts",
     errors,
   );
@@ -963,11 +989,11 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   const uploadStep = extractWorkflowStep(continuityJob, "Upload continuity evidence", errors);
   for (const command of [
-    `source_repository="$(jq -er '.verifiedRuntime.sourceRepository' compat/omp-app-matrix.json)"`,
-    `test "$source_repository" = "https://github.com/wolfiesch/oh-my-pi"`,
+    `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
+    `case "$source_repository" in https://github.com/*/*) ;; *) exit 1 ;; esac`,
     `sha="$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)"`,
     '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]',
-    `echo "repository=wolfiesch/oh-my-pi" >> "$GITHUB_OUTPUT"`,
+    `echo "repository=\${source_repository#https://github.com/}" >> "$GITHUB_OUTPUT"`,
     `echo "sha=$sha" >> "$GITHUB_OUTPUT"`,
   ]) {
     requireWorkflowStepText(
@@ -1041,10 +1067,10 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   for (const command of [
     `source_repository="$(jq -er '.verifiedRuntime.sourceRepository' compat/omp-app-matrix.json)"`,
-    `test "$source_repository" = "https://github.com/wolfiesch/oh-my-pi"`,
+    `test "$source_repository" = "https://github.com/can1357/oh-my-pi"`,
     `sha="$(jq -er '.verifiedRuntime.sourceCommit' compat/omp-app-matrix.json)"`,
     '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]',
-    `echo "repository=wolfiesch/oh-my-pi" >> "$GITHUB_OUTPUT"`,
+    `echo "repository=\${source_repository#https://github.com/}" >> "$GITHUB_OUTPUT"`,
     `echo "sha=$sha" >> "$GITHUB_OUTPUT"`,
   ]) {
     requireWorkflowStepText(
@@ -1105,11 +1131,11 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     "core:",
     "legacy-bridge-continuity:",
     'ref: ${{ github.event.pull_request.head.sha || github.sha }}',
-    `source_repository="$(jq -er '.verifiedRuntime.sourceRepository' compat/omp-app-matrix.json)"`,
-    `test "$source_repository" = "https://github.com/wolfiesch/oh-my-pi"`,
+    `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
+    `case "$source_repository" in https://github.com/*/*) ;; *) exit 1 ;; esac`,
     `sha="$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)"`,
     '[[ "$sha" =~ ^[0-9a-f]{40}$ ]]',
-    `echo "repository=wolfiesch/oh-my-pi" >> "$GITHUB_OUTPUT"`,
+    `echo "repository=\${source_repository#https://github.com/}" >> "$GITHUB_OUTPUT"`,
     "repository: ${{ steps.authority.outputs.repository }}",
     "ref: ${{ steps.authority.outputs.sha }}",
     "T4_OMP_SOURCE_DIR: ${{ github.workspace }}/.continuity/omp",
@@ -1118,6 +1144,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
     "if-no-files-found: error",
     "current-bridge-continuity:",
     `sha="$(jq -er '.verifiedRuntime.sourceCommit' compat/omp-app-matrix.json)"`,
+    `test "$source_repository" = "https://github.com/can1357/oh-my-pi"`,
+    `echo "repository=\${source_repository#https://github.com/}" >> "$GITHUB_OUTPUT"`,
     "repository: ${{ steps.current-authority.outputs.repository }}",
     "ref: ${{ steps.current-authority.outputs.sha }}",
     "T4_CURRENT_OMP_SOURCE_DIR: ${{ github.workspace }}/.current-continuity/omp",

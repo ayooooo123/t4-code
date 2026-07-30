@@ -93,8 +93,10 @@ test("rejects duplicate keys in JSON release contracts", () => {
 
 test("promotes the verified runtime into the product release", () => {
   const matrix = JSON.parse(files.get("compat/omp-app-matrix.json"));
-  assert.equal(matrix.verifiedRuntime.sourceTag, "t4code-17.0.5-appserver-19");
-  assert.equal(matrix.publishedRuntime.sourceTag, "t4code-17.0.5-appserver-19");
+  assert.equal(matrix.verifiedRuntime.sourceRepository, "https://github.com/can1357/oh-my-pi");
+  assert.equal(matrix.verifiedRuntime.sourceTag, "v17.0.9");
+  assert.equal(matrix.publishedRuntime.sourceRepository, "https://github.com/can1357/oh-my-pi");
+  assert.equal(matrix.publishedRuntime.sourceTag, "v17.0.9");
   assert.deepEqual(matrix.publishedRuntime, matrix.verifiedRuntime);
 });
 
@@ -230,15 +232,15 @@ test("tagged releases reject published provenance drift", () => {
       },
     ],
     [
-      "upstream commit",
+      "repository",
       (runtime) => {
-        runtime.upstreamCommit = "0".repeat(40);
+        runtime.sourceRepository = "https://github.com/wolfiesch/oh-my-pi";
       },
     ],
     [
-      "integration patches",
+      "URL",
       (runtime) => {
-        runtime.integrationPatches = runtime.integrationPatches.slice(0, -1);
+        runtime.sourceUrl = "https://github.com/can1357/oh-my-pi/commit/0000000000000000000000000000000000000000";
       },
     ],
   ];
@@ -345,7 +347,7 @@ test("rejects updater channel, stable manifest, and publication-contract drift",
       (text) =>
         replaceRequired(
           text,
-          'test "$source_repository" = "https://github.com/wolfiesch/oh-my-pi"',
+          'test "$source_repository" = "https://github.com/can1357/oh-my-pi"',
           'test "$source_repository" = "https://github.com/example/other"',
         ),
     ],
@@ -560,17 +562,70 @@ test("rejects drift in verified OMP runtime provenance", () => {
       runtime.sourceTag = "wrong-tag";
     },
     (runtime) => {
-      runtime.upstreamCommit = "invalid";
+      runtime.sourceRepository = "https://example.invalid/oh-my-pi";
     },
     (runtime) => {
-      runtime.integrationPatches = runtime.integrationPatches.map((patch) =>
-        patch === "versioned-agent-view-lifecycle-corpus" ? "Wrong integration patch" : patch,
-      );
+      runtime.sourceUrl = "https://github.com/can1357/oh-my-pi/commit/0000000000000000000000000000000000000000";
     },
   ];
   for (const [index, mutate] of cases.entries()) {
     const drifted = changedRuntime("verifiedRuntime", mutate);
     assert.ok(collectReleaseConsistencyErrors(drifted).length > 0, `runtime drift case ${index}`);
+  }
+});
+
+test("keeps integration-runtime provenance strict", () => {
+  const integrationRuntime = () => ({
+    package: "omp",
+    version: "17.0.5",
+    sourceRepository: "https://github.com/wolfiesch/oh-my-pi",
+    sourceCommit: "d83b688817651d39bfab00676db6109a2d1ccec5",
+    sourceUrl:
+      "https://github.com/wolfiesch/oh-my-pi/commit/d83b688817651d39bfab00676db6109a2d1ccec5",
+    sourceTag: "t4code-17.0.5-appserver-19",
+    upstreamRepository: "https://github.com/can1357/oh-my-pi",
+    upstreamTag: "v17.0.5",
+    upstreamCommit: "9fd6e97113f5ed3a847e66d346970efdf8afcad9",
+    integrationPatches: ["thin-omp-authority-bridge"],
+    upstreamTagContainsIntegrationPatches: false,
+  });
+  const cases = [
+    [
+      "upstream repository",
+      (runtime) => {
+        delete runtime.upstreamRepository;
+      },
+    ],
+    [
+      "upstream commit",
+      (runtime) => {
+        runtime.upstreamCommit = "invalid";
+      },
+    ],
+    [
+      "integration patches",
+      (runtime) => {
+        runtime.integrationPatches = ["thin-omp-authority-bridge", "thin-omp-authority-bridge"];
+      },
+    ],
+    [
+      "stock upstream lacks the integration patches",
+      (runtime) => {
+        runtime.upstreamTagContainsIntegrationPatches = true;
+      },
+    ],
+  ];
+  for (const [expected, mutate] of cases) {
+    const drifted = changed("compat/omp-app-matrix.json", (text) => {
+      const matrix = JSON.parse(text);
+      matrix.verifiedRuntime = integrationRuntime();
+      mutate(matrix.verifiedRuntime);
+      return JSON.stringify(matrix);
+    });
+    assert.ok(
+      collectReleaseConsistencyErrors(drifted).some((error) => error.includes(expected)),
+      `integration runtime drift must mention ${expected}`,
+    );
   }
 });
 
@@ -583,7 +638,7 @@ test("rejects drift in published OMP runtime provenance", () => {
       runtime.sourceTag = "wrong-tag";
     },
     (runtime) => {
-      runtime.upstreamCommit = "0000000000000000000000000000000000000000";
+      runtime.sourceRepository = "https://example.invalid/oh-my-pi";
     },
   ];
   for (const mutate of cases) {
@@ -658,17 +713,21 @@ test("deploys release site source only after artifact publication", () => {
   assert.ok(ciWorkflow.includes("ref: ${{ github.event.pull_request.head.sha || github.sha }}"));
   assert.ok(
     ciWorkflow.includes(
-      `source_repository="$(jq -er '.verifiedRuntime.sourceRepository' compat/omp-app-matrix.json)"`,
+      `source_repository="$(jq -er '.sourceRepository' provenance/omp-host-migration.json)"`,
     ),
   );
-  assert.ok(
-    ciWorkflow.includes('test "$source_repository" = "https://github.com/wolfiesch/oh-my-pi"'),
-  );
+  assert.ok(ciWorkflow.includes('case "$source_repository" in https://github.com/*/*) ;; *) exit 1 ;; esac'));
   assert.ok(
     ciWorkflow.includes("sha=\"$(jq -er '.inputs.operationsContinuity' provenance/omp-host-migration.json)\""),
   );
   assert.ok(ciWorkflow.includes('[[ "$sha" =~ ^[0-9a-f]{40}$ ]]'));
-  assert.ok(ciWorkflow.includes('echo "repository=wolfiesch/oh-my-pi" >> "$GITHUB_OUTPUT"'));
+  assert.ok(ciWorkflow.includes('echo "repository=${source_repository#https://github.com/}" >> "$GITHUB_OUTPUT"'));
+  assert.ok(
+    ciWorkflow.includes(
+      `source_repository="$(jq -er '.verifiedRuntime.sourceRepository' compat/omp-app-matrix.json)"`,
+    ),
+  );
+  assert.ok(ciWorkflow.includes('test "$source_repository" = "https://github.com/can1357/oh-my-pi"'));
   assert.ok(ciWorkflow.includes("repository: ${{ steps.authority.outputs.repository }}"));
   assert.ok(ciWorkflow.includes("ref: ${{ steps.authority.outputs.sha }}"));
   assert.ok(ciWorkflow.includes("T4_OMP_SOURCE_DIR: ${{ github.workspace }}/.continuity/omp"));

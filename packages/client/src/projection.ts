@@ -283,6 +283,11 @@ const DEFAULT_OPTIONS: Required<ProjectionOptions> = {
   maxPreviews: MAX_RETAINED_PREVIEWS,
   maxPreviewEvents: MAX_RETAINED_PREVIEW_EVENTS,
 };
+
+// Long active sessions can mutate projection state many times per second.
+// Cache persistence is restart-only warm state, so keep its expensive JSON
+// serialization off the hot path and force it only at flush/dispose.
+const PROJECTION_CACHE_SAVE_DELAY_MS = 1_000;
 const EMPTY_MAP: ReadonlyMap<string, never> = new ImmutableMap<string, never>();
 const UTF8_ENCODER = new TextEncoder();
 const UTF8_DECODER = new TextDecoder();
@@ -1875,6 +1880,7 @@ export class ProjectionStore {
   private readonly cacheStore: ProjectionCacheStore | undefined;
   private cacheSave: Promise<void> | undefined;
   private pendingSnapshot: ProjectionSnapshot | undefined;
+  private cacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private cacheReadyPromise: Promise<void>;
   get hydrated(): Promise<void> {
     return this.cacheReadyPromise;
@@ -2073,34 +2079,59 @@ export class ProjectionStore {
   private queueCacheSave(): void {
     if (this.cacheStore === undefined || this.disposed) return;
     this.pendingSnapshot = this.current;
-    if (this.cacheSave === undefined) this.cacheSave = this.drainCacheSaves();
+    this.scheduleCacheSave();
+  }
+  private scheduleCacheSave(): void {
+    if (
+      this.cacheStore === undefined ||
+      this.cacheSave !== undefined ||
+      this.cacheSaveTimer !== undefined
+    ) {
+      return;
+    }
+    this.cacheSaveTimer = setTimeout(() => {
+      this.cacheSaveTimer = undefined;
+      this.startCacheSave();
+    }, PROJECTION_CACHE_SAVE_DELAY_MS);
+  }
+  private startCacheSave(): void {
+    if (this.cacheStore === undefined || this.cacheSave !== undefined) return;
+    this.cacheSave = this.drainCacheSaves();
+  }
+  private forcePendingCacheSave(): void {
+    if (this.cacheSaveTimer !== undefined) {
+      clearTimeout(this.cacheSaveTimer);
+      this.cacheSaveTimer = undefined;
+    }
+    if (this.pendingSnapshot !== undefined) this.startCacheSave();
   }
   private async drainCacheSaves(): Promise<void> {
     try {
-      // Disposal blocks new mutations, but already-coalesced snapshots must still drain.
-      while (this.pendingSnapshot !== undefined) {
-        const snapshot = this.pendingSnapshot;
-        this.pendingSnapshot = undefined;
-        let serialized: string;
-        try {
-          serialized = encodeProjectionCache(snapshot);
-        } catch {
-          continue;
-        }
-        try {
-          await Promise.resolve(this.cacheStore?.save(serialized));
-        } catch {
-          /* persistence cannot block live state */
-        }
+      const snapshot = this.pendingSnapshot;
+      this.pendingSnapshot = undefined;
+      if (snapshot === undefined) return;
+      let serialized: string;
+      try {
+        serialized = encodeProjectionCache(snapshot);
+      } catch {
+        return;
+      }
+      try {
+        await Promise.resolve(this.cacheStore?.save(serialized));
+      } catch {
+        /* persistence cannot block live state */
       }
     } finally {
       this.cacheSave = undefined;
-      if (this.pendingSnapshot !== undefined && !this.disposed)
-        this.cacheSave = this.drainCacheSaves();
+      if (this.pendingSnapshot !== undefined && !this.disposed) this.scheduleCacheSave();
     }
   }
   async flush(): Promise<void> {
-    while (this.cacheSave !== undefined) await this.cacheSave;
+    for (;;) {
+      this.forcePendingCacheSave();
+      if (this.cacheSave === undefined) return;
+      await this.cacheSave;
+    }
   }
   async dispose(): Promise<void> {
     if (this.disposed) return;

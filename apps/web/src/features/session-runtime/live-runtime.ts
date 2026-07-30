@@ -53,6 +53,7 @@ import {
   type TranscriptMediaReference,
 } from "./transcript-images.ts";
 import {
+  baseSelector,
   commandSupport,
   deriveComposerControls,
   FAST_SET_COMMAND,
@@ -1046,13 +1047,12 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       return sendActiveTurnMessage("session.followUp", { message: intent.text });
     }
     if (intent.kind === "setModel") {
-      // Session-scoped switch: the host resolves a role or a concrete
-      // selector; the renderer never writes settings from the composer.
-      // The wire takes role XOR selector — a cycle-role pick sends the
-      // role and lets the host resolve it, never the cached selector.
+      // Session-scoped switch: prefer the concrete selector when the menu has
+      // one. Official OMP direct RPC accepts provider/model only, so strip
+      // any thinking suffix and leave reasoning changes on the thinking path.
       const args: Record<string, unknown> = { persistence: "session" };
-      if (intent.role !== null) args.role = intent.role;
-      else if (intent.selector !== null) args.selector = intent.selector;
+      if (intent.selector !== null) args.selector = baseSelector(intent.selector);
+      else if (intent.role !== null) args.role = intent.role;
       return applyControlCommand("model", MODEL_SET_COMMAND, args);
     }
     if (intent.kind === "setThinking") {

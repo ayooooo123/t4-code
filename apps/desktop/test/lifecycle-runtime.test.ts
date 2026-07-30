@@ -107,6 +107,7 @@ class FakeWindow {
     this.emit("did-finish-load");
   }
   close(): void {
+    this.emit("close");
     this.destroyed = true;
     this.emit("closed");
   }
@@ -151,6 +152,7 @@ function setup(
     readonly createProjectionCache?: NonNullable<DesktopLifecycleOptions["createProjectionCache"]>;
     readonly createBrowserRuntime?: NonNullable<DesktopLifecycleOptions["createBrowserRuntime"]>;
     readonly clusterOperatorEnabled?: boolean;
+    readonly report?: (message: string) => void;
   } = {},
 ) {
   const app = new FakeApp();
@@ -270,6 +272,7 @@ function setup(
     installMenu: (options) => {
       menuOptions = options;
     },
+    ...(overrides.report === undefined ? {} : { report: overrides.report }),
   });
   return {
     app,
@@ -702,6 +705,23 @@ describe("desktop Electron lifecycle", () => {
     await fixture.lifecycle.stop();
     expect(fixture.updateDisposeCount).toBe(1);
   });
+  it("reports window close and before-quit breadcrumbs", async () => {
+    const reports: string[] = [];
+    const fixture = setup(undefined, async () => true, {
+      report: (message) => reports.push(message),
+    });
+    await fixture.lifecycle.start();
+
+    fixture.windows[0]!.close();
+    fixture.app.listeners.get("before-quit")?.();
+    await Promise.resolve();
+
+    expect(reports).toEqual([
+      "[desktop] main window close requested: stopping=false destroyed=false",
+      "[desktop] main window closed: stopping=false",
+      "[desktop] before-quit received: stopping=false",
+    ]);
+  });
   it("closes the target manager exactly once across before-quit and stop", async () => {
     const fixture = setup();
     await fixture.lifecycle.start();
@@ -791,6 +811,92 @@ describe("desktop Electron lifecycle", () => {
       ).getServiceManager(),
     ).toBe(service);
     expect(fixture.windows).toHaveLength(1);
+    await fixture.lifecycle.stop();
+  });
+  it("rediscovers the bundled OMP path before automatic default service repair", async () => {
+    const calls: string[] = [];
+    const repaired = Promise.withResolvers<void>();
+    let discoveries = 0;
+    const runtimes = ["/opt/t4/runtime/old/omp", "/opt/t4/runtime/new/omp"];
+    const fixture = setup(undefined, async (executable) => {
+      calls.push(`probe:${executable}`);
+      if (executable.endsWith("/new/omp")) repaired.resolve();
+      return true;
+    }, {
+      discoverExecutable: async () => runtimes[Math.min(discoveries++, runtimes.length - 1)]!,
+      createServiceManager: (options) => {
+        const runtime = String(options.argv[2]);
+        calls.push(`manager:${runtime}`);
+        let definition: "current" | "drifted" = runtime.endsWith("/old/omp") ? "current" : "drifted";
+        const service: ServiceManager = {
+          inspect: async () => {
+            calls.push(`inspect:${runtime}`);
+            return { definition, service: "running", diagnostics: "" };
+          },
+          install: async () => {
+            calls.push(`install:${runtime}`);
+            definition = "current";
+          },
+          start: async () => {
+            calls.push(`start:${runtime}`);
+          },
+          stop: async () => {},
+          restart: async () => {},
+          uninstall: async () => {},
+        };
+        return service;
+      },
+    });
+    await fixture.lifecycle.start();
+    expect(discoveries).toBe(1);
+
+    fixture.managerOptions?.events.onState({ targetId: "local", state: "connecting" });
+    await repaired.promise;
+
+    expect(discoveries).toBe(2);
+    expect(calls).toContain("manager:/opt/t4/runtime/new/omp");
+    expect(calls).toContain("install:/opt/t4/runtime/new/omp");
+    expect(calls.at(-1)).toBe("probe:/opt/t4/runtime/new/omp");
+    await fixture.lifecycle.stop();
+  });
+  it("rediscovers the bundled OMP path before manual install repair", async () => {
+    const calls: string[] = [];
+    let discoveries = 0;
+    const runtimes = ["/opt/t4/runtime/old/omp", "/opt/t4/runtime/new/omp"];
+    const fixture = setup(undefined, async () => true, {
+      discoverExecutable: async () => runtimes[Math.min(discoveries++, runtimes.length - 1)]!,
+      createServiceManager: (options) => {
+        const runtime = String(options.argv[2]);
+        calls.push(`manager:${runtime}`);
+        return {
+          inspect: async () => {
+            calls.push(`inspect:${runtime}`);
+            return { definition: "current", service: "running", diagnostics: "" };
+          },
+          install: async () => {
+            calls.push(`install:${runtime}`);
+          },
+          start: async () => {
+            calls.push(`start:${runtime}`);
+          },
+          stop: async () => {},
+          restart: async () => {},
+          uninstall: async () => {},
+        } as ServiceManager;
+      },
+    });
+    await fixture.lifecycle.start();
+    const runtime = fixture.runtimes[0] as { window: FakeWindow };
+    const event = { sender: runtime.window.webContents, senderFrame: runtime.window.webContents.mainFrame };
+    const install = fixture.ipc.handlers.get("omp:service:install") as (
+      event: unknown,
+      request: unknown,
+    ) => Promise<void>;
+
+    await install(event, { channel: "omp:service:install", payload: {} });
+    expect(discoveries).toBe(2);
+    expect(calls).toContain("manager:/opt/t4/runtime/new/omp");
+    expect(calls).toContain("install:/opt/t4/runtime/new/omp");
     await fixture.lifecycle.stop();
   });
   it("automatically repairs the default service when its connected target falls back to connecting", async () => {

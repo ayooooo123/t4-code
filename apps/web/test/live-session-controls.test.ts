@@ -470,8 +470,10 @@ describe("control commands leave immediately with exact payloads", () => {
       persistence: "session",
     });
 
-    // The wire takes role XOR selector: a cycle-role pick that also knows
-    // its resolved selector still sends only the role.
+    // Role menu choices carry the concrete selector shown to the user. Prefer
+    // that selector so official OMP runtimes, which do not accept role ids on
+    // their direct RPC model command, can still switch models from the menu.
+    // The thinking suffix stays on the separate thinking command/state path.
     await runtime.submitPrompt({
       kind: "setModel",
       selector: "google/gemini-3.5-flash:high",
@@ -480,7 +482,10 @@ describe("control commands leave immediately with exact payloads", () => {
     const bothCommand = shell.commands.findLast(
       (request) => request.intent.command === "session.model.set",
     );
-    expect(bothCommand?.intent.args).toEqual({ role: "smol", persistence: "session" });
+    expect(bothCommand?.intent.args).toEqual({
+      selector: "google/gemini-3.5-flash",
+      persistence: "session",
+    });
   });
 
   it("setThinking sends session.thinking.set with the level", async () => {

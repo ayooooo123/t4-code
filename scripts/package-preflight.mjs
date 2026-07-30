@@ -72,13 +72,29 @@ export function runPreflight(repoRoot = resolve(import.meta.dirname, "..")) {
     const executablePath = join(runtimeRoot, "omp");
     try {
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-      const matrix = JSON.parse(readFileSync(join(repoRoot, "compat", "omp-app-matrix.json"), "utf8"));
-      const pinned = matrix.verifiedRuntime?.artifacts?.["darwin-arm64"];
       const digest = createHash("sha256").update(readFileSync(executablePath)).digest("hex");
-      if (
-        manifest.tag !== matrix.verifiedRuntime?.sourceTag || manifest.sha256 !== pinned?.sha256 ||
-        manifest.size !== pinned?.size || lstatSync(executablePath).size !== pinned?.size || digest !== pinned?.sha256
-      ) errors.push("staged OMP runtime does not match compat/omp-app-matrix.json");
+      const localRuntime = process.env.T4_STAGE_OMP_RUNTIME;
+      const localRuntimeTag = process.env.T4_STAGE_OMP_RUNTIME_TAG;
+      if (localRuntime !== undefined || localRuntimeTag !== undefined || process.env.T4_ALLOW_LOCAL_OMP_RUNTIME === "1") {
+        if (process.env.T4_ALLOW_LOCAL_OMP_RUNTIME !== "1") {
+          errors.push("local OMP runtime package preflight requires T4_ALLOW_LOCAL_OMP_RUNTIME=1");
+        }
+        const localPath = typeof localRuntime === "string" ? resolve(localRuntime) : "";
+        const localSize = localPath.length > 0 ? lstatSync(localPath).size : undefined;
+        const localDigest =
+          localPath.length > 0 ? createHash("sha256").update(readFileSync(localPath)).digest("hex") : undefined;
+        if (
+          manifest.tag !== localRuntimeTag || manifest.sha256 !== localDigest ||
+          manifest.size !== localSize || lstatSync(executablePath).size !== localSize || digest !== localDigest
+        ) errors.push("staged OMP runtime does not match local override");
+      } else {
+        const matrix = JSON.parse(readFileSync(join(repoRoot, "compat", "omp-app-matrix.json"), "utf8"));
+        const pinned = matrix.verifiedRuntime?.artifacts?.["darwin-arm64"];
+        if (
+          manifest.tag !== matrix.verifiedRuntime?.sourceTag || manifest.sha256 !== pinned?.sha256 ||
+          manifest.size !== pinned?.size || lstatSync(executablePath).size !== pinned?.size || digest !== pinned?.sha256
+        ) errors.push("staged OMP runtime does not match compat/omp-app-matrix.json");
+      }
     } catch {
       errors.push("missing or invalid staged OMP runtime");
     }

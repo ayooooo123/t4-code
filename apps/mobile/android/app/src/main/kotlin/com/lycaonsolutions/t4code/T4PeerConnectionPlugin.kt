@@ -55,13 +55,19 @@ class T4PeerConnectionPlugin : Plugin() {
             call.reject("Could not start the private connection service.")
             return
         }
-        synchronized(sessions) {
-            if (opening || sessions.isNotEmpty()) {
+        val staleSessionIds = synchronized(sessions) {
+            if (opening) {
                 call.reject("Only one private mobile connection can be active.")
                 return
             }
+            val stale = sessions.keys.toList()
             opening = true
             openingAttemptId = attemptId
+            stale
+        }
+        if (staleSessionIds.isNotEmpty()) {
+            Log.i(TAG, "Closing stale private connection before opening a replacement.")
+            for (id in staleSessionIds) closeSession(id, true)
         }
         val job = scope.launch {
             var dht: HyperDHT? = null

@@ -41,11 +41,9 @@ describe("T4 setup doctor", () => {
   it("uses current verified runtime metadata", async () => {
     const source = await readSourceContract();
 
-    expect(source.ompVersion).toBe("17.0.5");
-    expect(source.ompTag).toBe("t4code-17.0.5-appserver-19");
-    expect(source.ompUrl).toBe(
-      "https://github.com/wolfiesch/oh-my-pi/tree/t4code-17.0.5-appserver-19",
-    );
+    expect(source.ompVersion).toBe("17.0.9");
+    expect(source.ompTag).toBe("v17.0.9");
+    expect(source.ompUrl).toBe("https://github.com/can1357/oh-my-pi/tree/v17.0.9");
   });
 
   it("accepts the checked-in toolchain and a healthy local runtime", async () => {

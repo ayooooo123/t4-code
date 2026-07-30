@@ -3,7 +3,9 @@ import { autoUpdater } from "electron-updater";
 import { DesktopUpdateController, type NativeUpdaterPort } from "./update-controller.ts";
 import { detectNativeLinuxPackage } from "./linux-update-package.ts";
 
-export function createElectronUpdateController(): DesktopUpdateController {
+export function createElectronUpdateController(
+  report: (message: string) => void = console.error,
+): DesktopUpdateController {
   const nativeLinuxPackage = detectNativeLinuxPackage({
     platform: process.platform,
     isPackaged: app.isPackaged,
@@ -27,5 +29,6 @@ export function createElectronUpdateController(): DesktopUpdateController {
       };
     },
     openExternal: (url) => shell.openExternal(url),
+    report,
   });
 }

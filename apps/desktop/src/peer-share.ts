@@ -7,6 +7,10 @@ import { createLocalTransport } from "./transport.ts";
 const SHARE_DURATION_MS = 15 * 60 * 1_000;
 const KEY_BYTES = 32;
 const MAX_ACTIVE_STREAMS = 4;
+const STALE_ACTIVE_STREAM_MS = 60_000;
+const PEER_CLOSE_PAIRING_REJECTED = 4001;
+const PEER_CLOSE_CAPACITY = 4002;
+const PEER_CLOSE_UPSTREAM_UNAVAILABLE = 4003;
 
 export interface PeerKeyPair {
   readonly publicKey: Uint8Array;
@@ -37,6 +41,7 @@ export interface PeerStream {
   on(event: "data", listener: (value: Uint8Array) => void): void;
   on(event: "close", listener: () => void): void;
   write(value: Uint8Array): void;
+  end?(value?: Uint8Array): void;
   destroy?(): void;
 }
 
@@ -99,6 +104,12 @@ function sameProof(expected: string, provided: string): boolean {
   return expectedBytes.byteLength === providedBytes.byteLength && timingSafeEqual(expectedBytes, providedBytes);
 }
 
+
+interface ActivePeerStream {
+  readonly stream: PeerStream;
+  lastClientFrameAt: number;
+  readonly close: () => void;
+}
 export class PeerShareHost {
   private readonly createDht: () => PeerDht;
   private readonly createKeyPair: () => PeerKeyPair;
@@ -110,7 +121,7 @@ export class PeerShareHost {
   private readonly pairingStore: PeerPairingStore | undefined;
   private readonly workspaceRoots: PeerWorkspaceRoots | undefined;
   private readonly activeTransports = new Set<OmpTransport>();
-  private readonly activeStreams = new Set<PeerStream>();
+  private readonly activeStreams = new Map<PeerStream, ActivePeerStream>();
   private dht: PeerDht | undefined;
   private server: PeerServer | undefined;
   private timer: unknown;
@@ -201,7 +212,7 @@ export class PeerShareHost {
     this.server = undefined;
     this.timer = undefined;
     this.live = undefined;
-    const activeStreams = [...this.activeStreams];
+    const activeStreams = [...this.activeStreams.keys()];
     this.activeStreams.clear();
     if (timer !== undefined) this.clearTimer(timer);
     for (const transport of this.activeTransports) transport.close();
@@ -211,6 +222,13 @@ export class PeerShareHost {
     if (dht !== undefined) await dht.destroy().catch(() => undefined);
   }
 
+
+  private pruneStaleStreams(): void {
+    const staleBefore = this.now() - STALE_ACTIVE_STREAM_MS;
+    for (const active of this.activeStreams.values()) {
+      if (active.lastClientFrameAt <= staleBefore) active.close();
+    }
+  }
   private onConnection(stream: PeerStream): void {
     const decoder = new PeerWireDecoder();
     let phase: "hello" | "challenge" | "opening" | "authorized" = "hello";
@@ -218,7 +236,11 @@ export class PeerShareHost {
     let challenge: string | undefined;
     let upstream: OmpTransport | undefined;
     let queue = Promise.resolve();
-    const release = () => { this.activeStreams.delete(stream); };
+    let activeStream: ActivePeerStream | undefined;
+    const release = () => {
+      this.activeStreams.delete(stream);
+      activeStream = undefined;
+    };
     const closeUpstream = () => {
       if (upstream === undefined) return;
       const transport = upstream;
@@ -229,6 +251,17 @@ export class PeerShareHost {
     const terminate = () => {
       release();
       closeUpstream();
+      stream.destroy?.();
+    };
+    const closeWithReason = (code: number, reason: string) => {
+      const frame = encodePeerWireFrame({ type: "close", code, reason });
+      release();
+      closeUpstream();
+      if (stream.end !== undefined) {
+        stream.end(frame);
+        return;
+      }
+      stream.write(frame);
       stream.destroy?.();
     };
     stream.on("close", () => {
@@ -243,6 +276,7 @@ export class PeerShareHost {
             terminate();
             return;
           }
+          if (activeStream !== undefined) activeStream.lastClientFrameAt = this.now();
           if (phase === "hello" && frame.type === "hello") {
             clientNonce = frame.nonce;
             challenge = Buffer.from(requireLength(this.randomBytes(KEY_BYTES), "peer challenge", KEY_BYTES)).toString("base64url");
@@ -258,16 +292,24 @@ export class PeerShareHost {
               this.live.desktopPublicKey,
             );
             if (!sameProof(expected, frame.proof)) {
-              terminate();
+              closeWithReason(PEER_CLOSE_PAIRING_REJECTED, "pairing rejected");
               return;
             }
+            this.pruneStaleStreams();
             if (this.activeStreams.size >= MAX_ACTIVE_STREAMS) {
-              terminate();
+              closeWithReason(PEER_CLOSE_CAPACITY, "too many private mobile connections");
               return;
             }
-            this.activeStreams.add(stream);
+            activeStream = { stream, lastClientFrameAt: this.now(), close: terminate };
+            this.activeStreams.set(stream, activeStream);
             phase = "opening";
-            const transport = await this.createAppserverTransport();
+            let transport: OmpTransport;
+            try {
+              transport = await this.createAppserverTransport();
+            } catch {
+              closeWithReason(PEER_CLOSE_UPSTREAM_UNAVAILABLE, "desktop host is unavailable");
+              return;
+            }
             if (this.live === undefined || phase !== "opening" || !this.activeStreams.has(stream)) {
               transport.close();
               release();

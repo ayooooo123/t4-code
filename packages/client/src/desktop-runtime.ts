@@ -350,8 +350,21 @@ export class DesktopRuntimeController {
     const generation = identity.generation;
     const key = this.leaseKey(targetId, hostIdValue, sessionIdValue, expectedRevision, generation);
     const existing = this.controllerLeases.get(key);
-    if (existing?.lease !== undefined && existing.lease.generation === generation && existing.lease.expiresAt > this.clock.now()) return { required: true, ...existing.lease };
     if (existing?.pending !== undefined) return existing.pending;
+    if (existing?.lease !== undefined && existing.lease.generation === generation) {
+      const now = this.clock.now();
+      if (existing.lease.expiresAt <= now) {
+        this.controllerLeases.delete(key);
+      } else {
+        if (!existing.lease.needsRenewal(now)) return { required: true, ...existing.lease };
+        const pending = this.renewCachedControllerLease(targetId, hostIdValue, sessionIdValue, expectedRevision, existing.lease, identity, key);
+        this.controllerLeases.set(key, { key, lease: existing.lease, pending });
+        void pending.catch(() => {
+          if (this.controllerLeases.get(key)?.pending === pending) this.controllerLeases.delete(key);
+        });
+        return pending;
+      }
+    }
     const pending = this.acquireControllerLeaseNow(targetId, hostIdValue, sessionIdValue, expectedRevision, ownerId, generation, key);
     this.controllerLeases.set(key, { key, pending });
     void pending.then((result) => {
@@ -440,7 +453,16 @@ export class DesktopRuntimeController {
     const generation = this.generationFor(targetId);
     const keyPrefix = `${targetId}\u0000${hostIdValue}\u0000${sessionIdValue}\u0000${expectedRevision}\u0000`;
     for (const candidate of this.controllerLeases.values()) {
-      if (candidate.lease !== undefined && candidate.key.startsWith(keyPrefix) && candidate.lease.generation === generation && candidate.lease.expiresAt > this.clock.now()) return candidate.lease;
+      if (candidate.lease !== undefined && candidate.key.startsWith(keyPrefix) && candidate.lease.generation === generation && !candidate.lease.needsRenewal()) return candidate.lease;
+    }
+    return undefined;
+  }
+  private unexpiredControllerLeaseFor(targetId: string, hostIdValue: string, sessionIdValue: string, expectedRevision: string): DesktopControllerLease | undefined {
+    const generation = this.generationFor(targetId);
+    const keyPrefix = `${targetId}\u0000${hostIdValue}\u0000${sessionIdValue}\u0000${expectedRevision}\u0000`;
+    const now = this.clock.now();
+    for (const candidate of this.controllerLeases.values()) {
+      if (candidate.lease !== undefined && candidate.key.startsWith(keyPrefix) && candidate.lease.generation === generation && candidate.lease.expiresAt > now) return candidate.lease;
     }
     return undefined;
   }
@@ -473,7 +495,7 @@ export class DesktopRuntimeController {
       return this.command(targetId, intent);
     }
     const sessionIdValue = String(intent.sessionId);
-    const priorLease = this.controllerLeaseFor(targetId, hostIdValue, sessionIdValue, String(revisionValue));
+    const priorLease = this.unexpiredControllerLeaseFor(targetId, hostIdValue, sessionIdValue, String(revisionValue));
     const holdKey = `c\u0000${targetId}\u0000${hostIdValue}\u0000${sessionIdValue}\u0000${String(revisionValue)}`;
     const releaseHold = this.holdLeaseWindow(holdKey);
     try {
@@ -662,6 +684,49 @@ export class DesktopRuntimeController {
       return { required: true, ...lease };
     } catch (error) {
       if (this.controllerLeases.get(key)?.pending !== undefined) this.controllerLeases.delete(key);
+      throw error;
+    }
+  }
+  private async renewCachedControllerLease(
+    targetId: string,
+    hostIdValue: string,
+    sessionIdValue: string,
+    expectedRevision: string,
+    activeLease: DesktopControllerLease,
+    identity: DesktopTargetIdentity,
+    key: string,
+  ): Promise<DesktopControllerLeaseAcquireResult> {
+    try {
+      const raw = await this.issueControllerLeaseCommand({
+        targetId,
+        hostIdValue,
+        sessionIdValue,
+        expectedRevision,
+        command: "controller.lease.renew",
+        args: { leaseId: activeLease.leaseId },
+      });
+      const payload = leasePayload(raw);
+      if (payload?.accepted === false) throw new DesktopRuntimeError("stale", "controller lease renewal was rejected");
+      const renewed = this.makeLease(
+        targetId,
+        hostIdValue,
+        sessionIdValue,
+        expectedRevision,
+        activeLease.ownerId,
+        activeLease.leaseId,
+        identity.generation,
+        payload,
+      );
+      if (!this.isCurrentTargetIdentity(identity)) {
+        await this.releaseLeaseBestEffort(renewed);
+        throw new DesktopRuntimeError("stale", "controller lease renewal completed for a stale target binding");
+      }
+      this.controllerLeases.set(key, { key, lease: renewed });
+      return { required: true, ...renewed };
+    } catch (error) {
+      if (this.isCurrentTargetIdentity(identity) && this.controllerLeases.get(key)?.lease === activeLease) {
+        this.controllerLeases.delete(key);
+      }
       throw error;
     }
   }
