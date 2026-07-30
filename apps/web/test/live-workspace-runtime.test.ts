@@ -7,6 +7,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import { deriveWorkspaceData } from "../src/platform/live-workspace.ts";
+import { sessionWriteLink } from "../src/features/session-runtime/session-inventory.ts";
 import { workspaceSnapshotEqual } from "../src/state/shell-data.ts";
 
 function warmProjection(
@@ -132,5 +133,90 @@ describe("live workspace runtime identity", () => {
 
     expect(workspaceSnapshotEqual(base, transcriptOnly)).toBe(true);
     expect(workspaceSnapshotEqual(transcriptOnly, confirmationChanged)).toBe(false);
+  });
+
+  it("shows current active inventory as working while cached transcript replay catches up", () => {
+    const projection = createProjectionSnapshot();
+    const sessionKey = "host-local\u0000session-1";
+    const ref = {
+      hostId: "host-local",
+      sessionId: "session-1",
+      title: "Active cached transcript",
+      status: "active",
+      revision: "r-active",
+      updatedAt: "2026-07-30T02:38:55.532Z",
+      project: { projectId: "project-1", name: "Project" },
+      model: "gpt-5.5",
+    };
+    const snapshot: DesktopRuntimeSnapshot = {
+      version: 1,
+      integration: OMP_RUNTIME_INTEGRATION,
+      platform: "darwin",
+      desktopVersion: "test",
+      startState: "started",
+      targets: new Map([
+        [
+          "local",
+          {
+            targetId: "local",
+            label: "This machine",
+            kind: "local",
+            state: "connected",
+            paired: true,
+          },
+        ],
+      ]),
+      connections: new Map([["local", "connected"]]),
+      targetHosts: new Map([["local", "host-local"]]),
+      hosts: new Map([
+        [
+          "host-local",
+          {
+            targetId: "local",
+            hostId: "host-local",
+            ompVersion: "test",
+            ompBuild: "test",
+            appserverVersion: "test",
+            appserverBuild: "test",
+            epoch: "epoch-1",
+            grantedCapabilities: ["sessions.read"],
+            grantedFeatures: [],
+            negotiatedLimits: {},
+            authentication: "local",
+            resumed: false,
+          },
+        ],
+      ]),
+      catalogs: new Map(),
+      settings: new Map(),
+      projection: {
+        ...projection,
+        sessions: new Map([[sessionKey, warmProjection("cached")]]),
+        sessionIndex: new Map([[sessionKey, ref]]) as unknown as DesktopRuntimeSnapshot["projection"]["sessionIndex"],
+        sessionIndexMetadata: new Map([["host-local", { totalCount: 1, truncated: false }]]),
+        sessionRefArrivalOrdinals: new Map([[sessionKey, 1]]),
+      },
+      runtimeErrors: [],
+    };
+
+    expect(deriveWorkspaceData(snapshot).sessions[0]).toMatchObject({
+      freshness: "live",
+      lifecycle: "active",
+      status: "working",
+    });
+    expect(sessionWriteLink(snapshot, "local", "host-local", "session-1")).toBe("live");
+
+    const catchingUp: DesktopRuntimeSnapshot = {
+      ...snapshot,
+      projection: {
+        ...snapshot.projection,
+        sessions: new Map([[sessionKey, { ...warmProjection("catching-up"), catchingUpSinceArrivalOrdinal: 1 }]]),
+      },
+    };
+    expect(sessionWriteLink(catchingUp, "local", "host-local", "session-1")).toBe("cached");
+    expect(deriveWorkspaceData(catchingUp).sessions[0]).toMatchObject({
+      freshness: "cached",
+      status: null,
+    });
   });
 });

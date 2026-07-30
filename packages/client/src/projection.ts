@@ -178,6 +178,12 @@ export interface SessionProjection {
    * advance this fence, and cache/recovery deliberately resets it.
    */
   readonly contextMaintenanceEventArrivalOrdinal: number;
+  /**
+   * Local receive order when this session entered catch-up because live
+   * transcript cursors skipped ahead. A later session inventory ref can be
+   * current for rail activity even before transcript replay repairs history.
+   */
+  readonly catchingUpSinceArrivalOrdinal?: number | undefined;
   readonly gap?: ProjectionGapFrame | undefined;
   readonly historyTruncated?: boolean;
   readonly entryIds: ReadonlySet<string>;
@@ -1398,6 +1404,7 @@ function applyProjectionInput(
             epoch: frame.cursor.epoch,
             freshness: "fresh",
             gap: undefined,
+            catchingUpSinceArrivalOrdinal: undefined,
           });
         },
         config,
@@ -1421,7 +1428,11 @@ function applyProjectionInput(
         return withSession(
           snapshot,
           sessionKey,
-          (session) => Object.freeze({ ...session, freshness: "catching-up" }),
+          (session) => Object.freeze({
+            ...session,
+            freshness: "catching-up",
+            catchingUpSinceArrivalOrdinal: snapshot.arrivalOrdinal,
+          }),
           config,
         );
       const eventArrivalOrdinal =
@@ -1465,6 +1476,7 @@ function applyProjectionInput(
               epoch: frame.cursor.epoch,
               freshness: "fresh",
               gap: undefined,
+              catchingUpSinceArrivalOrdinal: undefined,
             });
           }
           const transientEntryId =
@@ -1504,6 +1516,7 @@ function applyProjectionInput(
               ? eventArrivalOrdinal
               : session.contextMaintenanceEventArrivalOrdinal,
             gap: undefined,
+            catchingUpSinceArrivalOrdinal: undefined,
           });
         },
         config,
@@ -1516,7 +1529,13 @@ function applyProjectionInput(
       return withSession(
         snapshot,
         sessionKey,
-        (session) => Object.freeze({ ...session, freshness: "catching-up", gap: frame }),
+        (session) =>
+          Object.freeze({
+            ...session,
+            freshness: "catching-up",
+            gap: frame,
+            catchingUpSinceArrivalOrdinal: snapshot.arrivalOrdinal,
+          }),
         config,
       );
     }
@@ -1774,7 +1793,9 @@ function applyProjectionInput(
             ...session,
             confirmations: confirmationsAfterResponse(session.confirmations, frame),
             results: mapWith(session.results, String(frame.requestId), resultProjection(frame)),
-            ...(attachedAtCurrentCursor ? { freshness: "fresh" as const, gap: undefined } : {}),
+            ...(attachedAtCurrentCursor
+              ? { freshness: "fresh" as const, gap: undefined, catchingUpSinceArrivalOrdinal: undefined }
+              : {}),
           });
         },
         config,

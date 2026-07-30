@@ -25,7 +25,6 @@ import {
   readSessionControl,
   sessionControlDisplayKind,
 } from "../features/session-runtime/session-observer.ts";
-import { sessionRefIsCurrent } from "../features/session-runtime/session-inventory.ts";
 
 /** Composite route id for one live session; unambiguous and URL-safe. */
 export function sessionViewId(hostId: string, sessionId: string): string {
@@ -357,13 +356,20 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
     }
     const connection = hostConnection(snapshot, hostId);
     const warm = warmSessionProjection(snapshot, hostId, sessionId);
-    const inventoryReady = sessionRefIsCurrent(snapshot, hostId, sessionId);
+    const refArrivalOrdinal = snapshot.projection.sessionRefArrivalOrdinals.get(
+      `${hostId}\u0000${sessionId}`,
+    );
+    const inventoryReady = refArrivalOrdinal !== undefined;
+    const catchUpFromCurrentStream =
+      warm?.catchingUpSinceArrivalOrdinal !== undefined &&
+      refArrivalOrdinal !== undefined &&
+      refArrivalOrdinal <= warm.catchingUpSinceArrivalOrdinal;
     const freshness =
       connection.state === "connecting"
         ? "cached"
         : connection.state !== "connected"
           ? "offline"
-          : !inventoryReady || (warm !== undefined && warm.freshness !== "fresh")
+          : !inventoryReady || catchUpFromCurrentStream
         ? "cached"
         : "live";
     const pendingApprovals = Math.max(
@@ -375,10 +381,10 @@ export function deriveWorkspaceData(snapshot: DesktopRuntimeSnapshot): Workspace
       typeof rawArchivedAt === "string" && Number.isFinite(Date.parse(rawArchivedAt))
         ? rawArchivedAt
         : null;
-    // Ref activity is current only with a fresh connected projection. Cached
-    // and offline rows must surface freshness instead of a stale Working pill.
-    // Last-known activity still prevents inventing a completion timestamp:
-    // losing freshness is not evidence that the turn completed.
+    // Session inventory is authoritative for current activity after a cache
+    // restore even while the per-session transcript is still replaying. A
+    // live stream gap remains cached/catching-up; dispatch gates use the same
+    // ordinal marker before sending writes.
     const lastKnownWorking = sessionIsWorking(ref);
     const displayWorking = freshness === "live" && lastKnownWorking;
     // Ownership display: while another app provably runs this session, the

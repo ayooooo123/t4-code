@@ -30,12 +30,12 @@ export function sessionRefIsCurrent(
 }
 
 /**
- * Dispatch-time freshness for one session, stricter than the render link:
- * offline when the target is not connected; live ONLY when the target is
- * bound to this host, THIS session has a ref from the current connection,
- * and any warm projection is fresh. A truncated host inventory is safe for
- * a ref it actually returned; retained refs that were not returned after a
- * reconnect stay cached/read-only.
+ * Dispatch-time freshness for one session: offline when the target is not
+ * connected; live when the target is bound to this host and THIS session has
+ * a ref from the current connection. A live transcript cursor gap stays
+ * cached until a later inventory ref proves current authority; a restored
+ * cache without that live-gap marker may become writable from current
+ * inventory alone. The host still enforces revision/ownership on dispatch.
  */
 export function sessionWriteLink(
   snapshot: DesktopRuntimeSnapshot,
@@ -46,10 +46,14 @@ export function sessionWriteLink(
   if (snapshot.connections.get(targetId) !== "connected") return "offline";
   const key = `${hostId}\u0000${sessionId}`;
   const warm = snapshot.projection.sessions.get(key);
+  const refArrivalOrdinal = snapshot.projection.sessionRefArrivalOrdinals.get(key);
   const inventoryReady =
     snapshot.targetHosts.get(targetId) === hostId &&
-    sessionRefIsCurrent(snapshot, hostId, sessionId);
-  return !inventoryReady || (warm !== undefined && warm.freshness !== "fresh")
-    ? "cached"
-    : "live";
+    snapshot.projection.sessionIndex.has(key) &&
+    refArrivalOrdinal !== undefined;
+  const catchUpFromCurrentStream =
+    warm?.catchingUpSinceArrivalOrdinal !== undefined &&
+    refArrivalOrdinal !== undefined &&
+    refArrivalOrdinal <= warm.catchingUpSinceArrivalOrdinal;
+  return !inventoryReady || catchUpFromCurrentStream ? "cached" : "live";
 }
