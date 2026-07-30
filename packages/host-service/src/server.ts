@@ -563,6 +563,20 @@ function childAgentInvoked(value: unknown): boolean | undefined {
 }
 type AppWs = ConnectionTransport;
 type LocalWs = Bun.ServerWebSocket<ServerWebSocketData>;
+const MAX_OUTBOUND_QUEUED_FRAMES = 512;
+const MAX_OUTBOUND_QUEUED_BYTES = 8 * 1024 * 1024;
+const OUTBOUND_BACKPRESSURE_CLOSE_CODE = 1013;
+const OUTBOUND_BACKPRESSURE_CLOSE_REASON = "client outbound queue full";
+
+interface OutboundQueueState {
+	frames: number;
+	bytes: number;
+}
+
+function outboundFrameByteLength(frame: ServerFrame): number {
+	return utf8ByteLength(JSON.stringify(frame));
+}
+
 interface RunIdentity {
 	paths: OwnerPaths;
 	record: OwnerRecord;
@@ -870,6 +884,8 @@ export class LocalAppserver implements AppserverHandle {
 	#discoveryMisses = new Map<SessionId, number>();
 	#agentTranscripts = new Map<SessionId, AgentTranscriptProjection>();
 	#startPromises = new Map<SessionId, Promise<RpcChildSupervisor>>();
+	#outboundQueues = new Map<AppWs, OutboundQueueState>();
+	#closedOutboundTransports = new WeakSet<AppWs>();
 	#lifecycleMutations = new Set<SessionId>();
 	#testControlMutations = new Set<Promise<Response>>();
 	#inflightSessionOperations = new Map<SessionId, number>();
@@ -4115,6 +4131,7 @@ export class LocalAppserver implements AppserverHandle {
 	}
 	private async disconnectClient(ws: AppWs): Promise<void> {
 		if (!this.#clients.has(ws)) return;
+		this.#closedOutboundTransports.add(ws);
 		const detachedSessions = [...(this.#attached.get(ws) ?? [])];
 		const controllers = this.#abortControllers.get(ws);
 		for (const controller of controllers ?? []) controller.abort();
@@ -4270,7 +4287,37 @@ export class LocalAppserver implements AppserverHandle {
 			this.#inflightLifecycleMutations -= 1;
 		}
 	}
+	#closeOutboundTransport(transport: AppWs): void {
+		if (this.#closedOutboundTransports.has(transport)) return;
+		this.#closedOutboundTransports.add(transport);
+		transport.close(OUTBOUND_BACKPRESSURE_CLOSE_CODE, OUTBOUND_BACKPRESSURE_CLOSE_REASON);
+	}
+	#reserveOutboundFrame(transport: AppWs, frame: ServerFrame): number | undefined {
+		if (this.#closedOutboundTransports.has(transport)) return undefined;
+		const frameBytes = outboundFrameByteLength(frame);
+		let queue = this.#outboundQueues.get(transport);
+		if (!queue) {
+			queue = { frames: 0, bytes: 0 };
+			this.#outboundQueues.set(transport, queue);
+		}
+		if (queue.frames >= MAX_OUTBOUND_QUEUED_FRAMES || queue.bytes + frameBytes > MAX_OUTBOUND_QUEUED_BYTES) {
+			this.#closeOutboundTransport(transport);
+			return undefined;
+		}
+		queue.frames += 1;
+		queue.bytes += frameBytes;
+		return frameBytes;
+	}
+	#releaseOutboundFrame(transport: AppWs, frameBytes: number): void {
+		const queue = this.#outboundQueues.get(transport);
+		if (!queue) return;
+		queue.frames = Math.max(0, queue.frames - 1);
+		queue.bytes = Math.max(0, queue.bytes - frameBytes);
+		if (queue.frames === 0 && queue.bytes === 0) this.#outboundQueues.delete(transport);
+	}
 	async #sendFrame(transport: AppWs, frame: ServerFrame): Promise<boolean> {
+		const frameBytes = this.#reserveOutboundFrame(transport, frame);
+		if (frameBytes === undefined) return false;
 		const previous = this.#outboundTails.get(transport) ?? Promise.resolve();
 		const send = previous.then(() => this.#sendFrameNow(transport, frame));
 		const tail = send.then(
@@ -4281,10 +4328,12 @@ export class LocalAppserver implements AppserverHandle {
 		try {
 			return await send;
 		} finally {
+			this.#releaseOutboundFrame(transport, frameBytes);
 			if (this.#outboundTails.get(transport) === tail) this.#outboundTails.delete(transport);
 		}
 	}
 	async #sendFrameNow(transport: AppWs, frame: ServerFrame): Promise<boolean> {
+		if (this.#closedOutboundTransports.has(transport)) return false;
 		const compatibleFrame = this.#clientFeatures.get(transport)?.has(SESSION_UNVERIFIED_FEATURE)
 			? frame
 			: downgradeUnverifiedSessionFrame(frame);
@@ -4962,7 +5011,7 @@ export class LocalAppserver implements AppserverHandle {
 			busySessions,
 			openTerminalSessions,
 			pendingConfirmations: this.#challenges.size,
-			outboundSends: this.#outboundTails.size,
+			outboundSends: [...this.#outboundQueues.values()].reduce((count, queue) => count + queue.frames, 0),
 		};
 	}
 	#tryDrainIfIdle(expectedHostId: string, expectedEpoch: string): AppserverDrainResult {

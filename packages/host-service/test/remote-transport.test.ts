@@ -573,6 +573,67 @@ describe("remote appserver policy transport", () => {
 		}
 	});
 
+	test("closes a client whose app-level outbound queue saturates behind a slow transform", async () => {
+		const harness = new FakeBunHarness();
+		harness.install();
+		const releaseFirstPong = Promise.withResolvers<void>();
+		const firstPongStarted = Promise.withResolvers<void>();
+		let holdNextPong = false;
+		let transformedPongs = 0;
+		try {
+			const appserver = createAppserver({
+				hostId: hostId("host"),
+				socketPath: join(mkdtempSync(join(tmpdir(), "omp-outbound-backpressure-")), "app.sock"),
+				discovery: { list: async () => [leaseSessionRecord()] },
+				remoteEndpoint: { address: "100.64.0.1", port: 1 },
+				remoteResolver: { resolve: async () => peerIdentity("node") },
+				remotePolicy: {
+					authenticate: async () => ({ authenticated: true, grantedCapabilities: ["sessions.read"] }),
+					authorize: async () => true,
+					transformOutbound: async (_connection, frame) => {
+						if (frame.type === "pong") {
+							transformedPongs += 1;
+							if (holdNextPong) {
+								holdNextPong = false;
+								firstPongStarted.resolve();
+								await releaseFirstPong.promise;
+							}
+						}
+						return frame;
+					},
+				},
+			});
+			await appserver.start();
+			const remote = harness.remote();
+			const socket = await openRemote(remote);
+			await remote.config.websocket?.message?.(socket, hello(["resume"], ["sessions.read"]));
+			await flush();
+			socket.sends.length = 0;
+			holdNextPong = true;
+
+			const firstDispatch = Promise.resolve(remote.config.websocket?.message?.(socket, ping()));
+			await firstPongStarted.promise;
+			const dispatches = Array.from({ length: 600 }, () =>
+				Promise.resolve(remote.config.websocket?.message?.(socket, ping())),
+			);
+			await flush();
+			expect(transformedPongs).toBe(1);
+			expect(socket.closes.at(-1)).toMatchObject({
+				code: 1013,
+				reason: "client outbound queue full",
+			});
+
+			releaseFirstPong.resolve();
+			await Promise.allSettled([firstDispatch, ...dispatches]);
+			await flush();
+			expect(transformedPongs).toBe(1);
+			expect(socket.sends).toEqual([]);
+			await appserver.stop();
+		} finally {
+			harness.restore();
+		}
+	});
+
 	test("paired prompt lease authorizes one remote prompt and release blocks the next", async () => {
 		const harness = new FakeBunHarness();
 		harness.install();
