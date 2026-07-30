@@ -225,6 +225,32 @@ function sessionDelta(
   };
 }
 
+function bindAcceptedControlRevisionRefresh(shell: FakeShell): void {
+  const fallback = shell.commandResult;
+  let seq = 1;
+  let revisionIndex = 1;
+  shell.commandResult = (request) => {
+    if (
+      request.intent.command === "session.model.set" ||
+      request.intent.command === "session.thinking.set" ||
+      request.intent.command === "session.fast.set"
+    ) {
+      seq += 1;
+      revisionIndex += 1;
+      return { accepted: true };
+    }
+    if (request.intent.command === "session.list") {
+      return {
+        cursor: { epoch: "session-index-1", seq },
+        sessions: [sessionDelta(seq, `rev-${revisionIndex}`).upsert],
+        totalCount: 1,
+        truncated: false,
+      };
+    }
+    return fallback?.(request);
+  };
+}
+
 async function settle(rounds = 12): Promise<void> {
   for (let index = 0; index < rounds; index += 1) await Promise.resolve();
 }
@@ -449,6 +475,7 @@ describe("retained transcript history", () => {
 describe("control commands leave immediately with exact payloads", () => {
   it("setModel sends session.model.set with role/selector and session persistence", async () => {
     const { shell, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     const roleOutcome = await runtime.submitPrompt({
       kind: "setModel",
       selector: null,
@@ -488,8 +515,84 @@ describe("control commands leave immediately with exact payloads", () => {
     });
   });
 
+  it("retries a control command once with the host's current revision after stale live-state churn", async () => {
+    const { shell, controller, runtime } = await startedRuntime();
+    const promptLeaseRevisions: (string | undefined)[] = [];
+    const originalPromptLease = controller.commandWithPromptLease;
+    controller.commandWithPromptLease = async function (targetId, intent, leaseRevision) {
+      promptLeaseRevisions.push(leaseRevision);
+      return originalPromptLease.call(this, targetId, intent, leaseRevision);
+    };
+    shell.command = async (request) => {
+      shell.commands.push(request);
+      if (
+        request.intent.command === "session.model.set" &&
+        shell.commandCount("session.model.set") === 1
+      ) {
+        return {
+          targetId: request.targetId,
+          requestId: "stale-req-1",
+          commandId: "stale-cmd-1",
+          accepted: false,
+          error: {
+            code: "stale_revision",
+            message: "session revision is stale",
+            details: { expectedRevision: "rev-1", actualRevision: "rev-2" },
+          },
+        };
+      }
+      const result =
+        request.intent.command === "session.model.set"
+          ? { accepted: true }
+          : request.intent.command === "session.list"
+            ? {
+                cursor: { epoch: "session-index-1", seq: 2 },
+                sessions: [sessionDelta(2, "rev-2", { model: "google/gemini-3.5-flash" }).upsert],
+                totalCount: 1,
+                truncated: false,
+              }
+            : request.intent.command === "session.prompt"
+              ? { accepted: true }
+              : undefined;
+      return {
+        targetId: request.targetId,
+        requestId: `retry-req-${shell.commands.length}`,
+        commandId: `retry-cmd-${shell.commands.length}`,
+        accepted: true,
+        ...(result === undefined ? {} : { result }),
+      };
+    };
+
+    const model = runtime.submitPrompt({
+      kind: "setModel",
+      selector: "google/gemini-3.5-flash:high",
+      role: "smol",
+    });
+    const prompt = runtime.submitPrompt({
+      kind: "prompt",
+      text: "send after model retry",
+      attachments: [],
+    });
+
+    expect((await model).kind).toBe("accepted");
+    expect((await prompt).kind).toBe("accepted");
+    const modelCommands = shell.commands.filter(
+      (request) => request.intent.command === "session.model.set",
+    );
+    expect(modelCommands).toHaveLength(2);
+    expect(modelCommands[0]?.intent.expectedRevision).toBe("rev-1");
+    expect(modelCommands[1]?.intent.expectedRevision).toBe("rev-2");
+    expect(modelCommands[1]?.intent.args).toEqual({
+      selector: "google/gemini-3.5-flash",
+      persistence: "session",
+    });
+    expect(shell.commandCount("session.list")).toBe(1);
+    expect(promptLeaseRevisions).toContain("rev-2");
+  });
+
   it("setThinking sends session.thinking.set with the level", async () => {
     const { shell, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     await runtime.submitPrompt({ kind: "setThinking", level: "xhigh" });
     const sent = shell.commands.find(
       (request) => request.intent.command === "session.thinking.set",
@@ -499,6 +602,7 @@ describe("control commands leave immediately with exact payloads", () => {
 
   it("setFast sends session.fast.set with the toggle", async () => {
     const { shell, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     await runtime.submitPrompt({ kind: "setFast", enabled: true });
     const sent = shell.commands.find((request) => request.intent.command === "session.fast.set");
     expect(sent?.intent.args).toEqual({ enabled: true });
@@ -506,6 +610,7 @@ describe("control commands leave immediately with exact payloads", () => {
 
   it("holds the control while in flight and never swaps the label optimistically", async () => {
     const { shell, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     const gate = deferred<boolean>();
     shell.commandBehavior = { kind: "defer", gate };
     const settled = runtime.submitPrompt({ kind: "setModel", selector: null, role: "smol" });
@@ -523,6 +628,7 @@ describe("control commands leave immediately with exact payloads", () => {
 
   it("holds a fast prompt until the accepted model revision reconciles", async () => {
     const { shell, controller, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     const modelGate = deferred<boolean>();
     const listGate = deferred<boolean>();
     const leaseRevisions: (string | undefined)[] = [];
@@ -677,6 +783,7 @@ describe("server reconciliation", () => {
 
   it("a rejected control command sets a bounded error and keeps server truth", async () => {
     const { shell, runtime } = await startedRuntime();
+    bindAcceptedControlRevisionRefresh(shell);
     shell.commandBehavior = { kind: "reject" };
     const outcome = await runtime.submitPrompt({ kind: "setThinking", level: "max" });
     expect(outcome.kind).toBe("rejected");

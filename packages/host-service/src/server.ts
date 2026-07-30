@@ -355,12 +355,18 @@ async function raceAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): P
 	}
 }
 
-function queuedLifecycleWork(liveState: Record<string, unknown> | undefined): boolean {
+export function queuedLifecycleWork(liveState: Record<string, unknown> | undefined): boolean {
 	if (!liveState) return false;
-	if (typeof liveState.queuedMessageCount === "number" && liveState.queuedMessageCount > 0) return true;
 	const queued = liveState.queuedMessages;
-	if (!queued || typeof queued !== "object" || Array.isArray(queued)) return false;
-	return Object.values(queued).some(value => Array.isArray(value) && value.length > 0);
+	if (queued !== undefined) {
+		if (!queued || typeof queued !== "object" || Array.isArray(queued)) return false;
+		for (const key in queued as Record<string, unknown>) {
+			const value = (queued as Record<string, unknown>)[key];
+			if (Array.isArray(value) && value.length > 0) return true;
+		}
+		return false;
+	}
+	return typeof liveState.queuedMessageCount === "number" && liveState.queuedMessageCount > 0;
 }
 function response(
 	hostId: HostId,

@@ -541,21 +541,36 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
       if (gated !== null) throw new WriteGateError(gated.reason);
     };
     try {
-      const intentPayload = {
-        hostId: wireHostId,
-        sessionId: wireSessionId,
-        command,
-        args,
-        ...(revisionValue === undefined ? {} : { expectedRevision: revisionValue }),
+      const sendOnce = (revisionToSend: Revision | undefined) => {
+        const intentPayload = {
+          hostId: wireHostId,
+          sessionId: wireSessionId,
+          command,
+          args,
+          ...(revisionToSend === undefined ? {} : { expectedRevision: revisionToSend }),
+        };
+        return usePromptLease
+          ? controller.commandWithPromptLease(
+              targetId,
+              intentPayload,
+              promptLeaseRevision === undefined ? undefined : String(promptLeaseRevision),
+              guard,
+            )
+          : controller.commandWithControllerLease(targetId, intentPayload, undefined, guard);
       };
-      const result = usePromptLease
-        ? await controller.commandWithPromptLease(
-            targetId,
-            intentPayload,
-            promptLeaseRevision === undefined ? undefined : String(promptLeaseRevision),
-            guard,
-          )
-        : await controller.commandWithControllerLease(targetId, intentPayload, undefined, guard);
+      let result = await sendOnce(revisionValue);
+      const actualRevision = result.error?.details?.actualRevision;
+      if (
+        !result.accepted &&
+        withRevision &&
+        !usePromptLease &&
+        result.error?.code === "stale_revision" &&
+        typeof actualRevision === "string" &&
+        actualRevision !== String(revisionValue)
+      ) {
+        guard();
+        result = await sendOnce(brandRevision(actualRevision));
+      }
       return result.accepted
         ? { kind: "accepted" }
         : { kind: "rejected", reason: promptRejectionReason(result.error) };
@@ -573,14 +588,16 @@ export function createLiveSessionRuntime(options: LiveRuntimeOptions): SessionRu
    * revision or weakening stale-write protection.
    */
   const reconcileAcceptedControl = async (sentRevision: Revision): Promise<boolean> => {
-    if (String(expectedRevision()) !== String(sentRevision)) return true;
+    const currentRevision = expectedRevision();
+    if (currentRevision !== undefined && String(currentRevision) !== String(sentRevision)) return true;
     try {
       const refreshed = await controller.command(targetId, {
         hostId: wireHostId,
         command: "session.list",
         args: {},
       });
-      return refreshed.accepted && expectedRevision() !== undefined;
+      const nextRevision = expectedRevision();
+      return refreshed.accepted && nextRevision !== undefined && String(nextRevision) !== String(sentRevision);
     } catch {
       return false;
     }

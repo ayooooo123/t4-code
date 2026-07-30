@@ -25,7 +25,7 @@ import {
 import type { RpcSessionEntryFrame } from "../src/omp-rpc-contract.ts";
 import { SessionProjection } from "../src/projection.ts";
 import { RpcChildSupervisor, resolveRpcChildInvocation } from "../src/rpc-child.ts";
-import { createAppserver } from "../src/server.ts";
+import { createAppserver, queuedLifecycleWork } from "../src/server.ts";
 import type { ChildHandle, FileSystem, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
 
 function wsFrame(text: string): Uint8Array {
@@ -540,6 +540,21 @@ describe("projection, replay, and idempotency", () => {
 		expect(projection.value.ref.liveState).not.toHaveProperty("pendingApproval");
 		expect(projection.value.ref.liveState).not.toHaveProperty("pendingUserInput");
 		expect(projection.updateStatus("closed")).toBeUndefined();
+	});
+	test("empty detailed queue state overrides a stale queued count", () => {
+		expect(
+			queuedLifecycleWork({
+				queuedMessageCount: 3,
+				queuedMessages: { steering: [], followUp: [] },
+			}),
+		).toBe(false);
+		expect(
+			queuedLifecycleWork({
+				queuedMessageCount: 0,
+				queuedMessages: { steering: ["steer"], followUp: [] },
+			}),
+		).toBe(true);
+		expect(queuedLifecycleWork({ queuedMessageCount: 1 })).toBe(true);
 	});
 	test("old epoch returns gap and snapshot", () => {
 		const projection = new SessionProjection(host, record("s"), "epoch-new", 3);

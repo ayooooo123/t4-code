@@ -724,7 +724,6 @@ describe("session management authority helpers", () => {
     );
   });
 
-  const SYNCING_REASON = "This session is still syncing from the host. Try again in a moment.";
   const ALL_COMMANDS = [
     "session.rename",
     "session.archive",
@@ -772,7 +771,7 @@ describe("session management authority helpers", () => {
     });
   });
 
-  it("disables management while this session's warm projection is only cached", () => {
+  it("allows management when cached warm projection is backed by current inventory", () => {
     const base = new FakeManagementController().getSnapshot();
     const warm = (freshness: string): DesktopRuntimeSnapshot => ({
       ...base,
@@ -785,8 +784,8 @@ describe("session management authority helpers", () => {
     });
     for (const command of ALL_COMMANDS) {
       expect(managementCommandSupport(warm("cached"), ADDRESS, command)).toEqual({
-        supported: false,
-        reason: SYNCING_REASON,
+        supported: true,
+        reason: null,
       });
     }
     // A fresh warm projection stays live.
@@ -969,6 +968,28 @@ describe("session management authority helpers", () => {
             text: "stale",
             at: "2026-07-13T00:00:01.000Z",
           },
+        },
+      } as SessionRef),
+    ).toBe(false);
+    expect(
+      sessionIsWorking({
+        ...ref({ status: "active" }),
+        liveState: {
+          phase: "idle",
+          isStreaming: false,
+          isCompacting: false,
+          queuedMessageCount: 0,
+          queuedMessages: { steering: [], followUp: [] },
+        },
+      } as SessionRef),
+    ).toBe(false);
+    expect(
+      sessionIsWorking({
+        ...ref(),
+        liveState: {
+          phase: "idle",
+          queuedMessageCount: 3,
+          queuedMessages: { steering: [], followUp: [] },
         },
       } as SessionRef),
     ).toBe(false);

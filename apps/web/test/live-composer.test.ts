@@ -2715,7 +2715,7 @@ describe("session lifecycle", () => {
     await controller.stop();
   });
 
-  it("keeps cached controls gated until an exact-head attach acknowledgement", async () => {
+  it("enables cached controls once current inventory proves session authority", async () => {
     let warm = applyPublicFrame(createProjectionSnapshot(), snapshotFrame(1, []));
     warm = applyPublicFrame(
       warm,
@@ -2752,8 +2752,8 @@ describe("session lifecycle", () => {
       sessionId: SESSION,
     });
 
-    expect(runtime.getSnapshot().link).toBe("cached");
-    expect(runtime.getSnapshot().canPrompt).toBe(false);
+    expect(runtime.getSnapshot().link).toBe("live");
+    expect(runtime.getSnapshot().canPrompt).toBe(true);
     expect(runtime.getSnapshot().canCancel).toBe(false);
     expect(runtime.getSnapshot().projection.ask?.askId).toBe("cached-ask");
 
@@ -2771,8 +2771,8 @@ describe("session lifecycle", () => {
         result: { attached: true, cursor: { epoch: "epoch-1", seq: 3 } },
       },
     });
-    expect(runtime.getSnapshot().link).toBe("cached");
-    expect(runtime.getSnapshot().canPrompt).toBe(false);
+    expect(runtime.getSnapshot().link).toBe("live");
+    expect(runtime.getSnapshot().canPrompt).toBe(true);
 
     shell.emitFrame({
       targetId: "local",
@@ -3294,6 +3294,7 @@ describe("window runtime slot", () => {
     await settle();
     expect(shell.commandCount("session.attach")).toBe(1);
     cachedRuntime.dispose();
+    await controller.stop();
     expect(saves.length).toBeGreaterThan(0);
     const persisted = decodeProjectionCache(saves.at(-1)!);
     const persistedSession = persisted.sessions.get(`${HOST}\u0000${SESSION}`);
@@ -3301,7 +3302,6 @@ describe("window runtime slot", () => {
       role: "assistant",
       text: "persist this mutation",
     });
-    await controller.stop();
   });
 
   it("skips projection cache saves when the shell reports caching unavailable", async () => {
