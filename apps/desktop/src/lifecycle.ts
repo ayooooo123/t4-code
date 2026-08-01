@@ -83,7 +83,7 @@ function serviceArgv(executable: string, profileId: string): string[] {
       "--omp-authority",
       "official",
       "--omp-sessions-root",
-      join(homedir(), ".omp", "t4", decodeLocalProfileId(profileId), "sessions"),
+      join(homedir(), ".omp", "agent", "sessions"),
     );
   }
   return argv;

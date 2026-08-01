@@ -846,7 +846,7 @@ describe("desktop Electron lifecycle", () => {
       "--omp-authority",
       "official",
       "--omp-sessions-root",
-      join(homedir(), ".omp", "t4", "default", "sessions"),
+      join(homedir(), ".omp", "agent", "sessions"),
     ]);
     expect(probes).toBe(0);
     await fixture.lifecycle.stop();

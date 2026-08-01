@@ -94,7 +94,7 @@ describe("service-manager definitions", () => {
     expect(content).toContain("<key>OMP_PROFILE</key>");
     expect(content).toContain("<string>default</string>");
   });
-  it("accepts official authority argv with a dedicated sessions root", () => {
+  it("accepts official authority argv with the existing OMP sessions root", () => {
     const official: ServiceSpec = {
       ...spec,
       argv: [
@@ -106,14 +106,14 @@ describe("service-manager definitions", () => {
         "--omp-authority",
         "official",
         "--omp-sessions-root",
-        "/home/alice/.omp/t4/default/sessions",
+        "/home/alice/.omp/agent/sessions",
       ],
     };
     const content = renderMacLaunchAgentDefinition(official);
 
     expect(content).toContain("<string>--omp-authority</string>");
     expect(content).toContain("<string>official</string>");
-    expect(content).toContain("<string>/home/alice/.omp/t4/default/sessions</string>");
+    expect(content).toContain("<string>/home/alice/.omp/agent/sessions</string>");
   });
 
   it("rejects path, argv, profile, uid and secret-bearing env injection", () => {
