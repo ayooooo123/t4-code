@@ -78,6 +78,10 @@ function thinkingChoiceDetail(
   return null;
 }
 
+export function modelControlTriggerDisabled(controls: ComposerControlsSnapshot, composerDisabled: boolean): boolean {
+  return composerDisabled || controls.modelChoices.length === 0;
+}
+
 export function RuntimeOptions({
   controls,
   disabled,
@@ -104,7 +108,7 @@ export function RuntimeOptions({
           disabledReason: controls.modelSupported ? null : controls.modelUnsupportedReason,
         }))}
         className={controlClassName}
-        disabled={disabled || controls.modelLabel === null}
+        disabled={modelControlTriggerDisabled(controls, disabled)}
         icon={null}
         label="Model — this session"
         note={controls.modelSupported ? null : controls.modelUnsupportedReason}
