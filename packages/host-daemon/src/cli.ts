@@ -31,6 +31,8 @@ const ORIGIN_LIMIT = 32;
 const SHUTDOWN_GRACE_MS = 2_000;
 const VERSION_OUTPUT_BYTES = 4 * 1024;
 const VERSION_TIMEOUT_MS = 5_000;
+const MODEL_CATALOG_OUTPUT_BYTES = 2 * 1024 * 1024;
+const MODEL_CATALOG_TIMEOUT_MS = 10_000;
 const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
   "session.create",
   "session.rename",
@@ -43,7 +45,7 @@ const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
   "session.close",
 ]);
 
-function officialCatalogItems(): Record<string, unknown>[] {
+function officialCommandCatalogItems(): Record<string, unknown>[] {
   const commands = process.platform === "darwin"
     ? ["project.reveal", ...OFFICIAL_CATALOG_COMMANDS]
     : OFFICIAL_CATALOG_COMMANDS;
@@ -54,6 +56,120 @@ function officialCatalogItems(): Record<string, unknown>[] {
     capabilities: [COMMAND_DESCRIPTORS[name]!.capability],
     supported: true,
   }));
+}
+
+function textField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function officialModelCatalogItemsFromJson(value: unknown): Record<string, unknown>[] {
+  const models = typeof value === "object" && value !== null && Array.isArray((value as { models?: unknown }).models)
+    ? (value as { models: unknown[] }).models
+    : [];
+  const items: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const model of models) {
+    if (typeof model !== "object" || model === null) continue;
+    const record = model as Record<string, unknown>;
+    const provider = textField(record.provider);
+    const modelId = textField(record.id);
+    const selector = textField(record.selector) ?? (provider !== undefined && modelId !== undefined ? `${provider}/${modelId}` : undefined);
+    if (provider === undefined || modelId === undefined || selector === undefined || seen.has(selector)) continue;
+    seen.add(selector);
+    items.push({
+      id: `model-${createHash("sha256").update(selector).digest("hex").slice(0, 16)}`,
+      kind: "model",
+      name: textField(record.name) ?? selector,
+      supported: true,
+      metadata: {
+        provider,
+        modelId,
+        selector,
+        ...(Number.isFinite(record.contextWindow) ? { contextWindow: record.contextWindow } : {}),
+        ...(Array.isArray(record.thinking) ? { thinkingLevels: record.thinking.filter(item => typeof item === "string") } : {}),
+        ...(Array.isArray(record.input) ? { input: record.input.filter(item => typeof item === "string") } : {}),
+      },
+    });
+  }
+  return items;
+}
+
+function officialModelCatalogItemFromSelector(selector: string): Record<string, unknown> | undefined {
+  const slash = selector.indexOf("/");
+  if (slash <= 0 || slash === selector.length - 1) return undefined;
+  const provider = selector.slice(0, slash);
+  const modelId = selector.slice(slash + 1);
+  return {
+    id: `model-${createHash("sha256").update(selector).digest("hex").slice(0, 16)}`,
+    kind: "model",
+    name: selector,
+    supported: true,
+    metadata: {
+      provider,
+      modelId,
+      selector,
+    },
+  };
+}
+
+async function officialSessionModelCatalogItems(authority: SessionAuthority): Promise<Record<string, unknown>[]> {
+  const items: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const session of await authority.list()) {
+    const selector = textField(session.model);
+    if (selector === undefined || seen.has(selector)) continue;
+    const item = officialModelCatalogItemFromSelector(selector);
+    if (item === undefined) continue;
+    seen.add(selector);
+    items.push(item);
+  }
+  return items;
+}
+
+function mergeOfficialModelCatalogItems(...groups: readonly (readonly Record<string, unknown>[])[]): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const item of group) {
+      const metadata = typeof item.metadata === "object" && item.metadata !== null ? item.metadata as Record<string, unknown> : {};
+      const selector = textField(metadata.selector) ??
+        (textField(metadata.provider) !== undefined && textField(metadata.modelId) !== undefined
+          ? `${textField(metadata.provider)}/${textField(metadata.modelId)}`
+          : textField(item.name));
+      if (selector !== undefined) {
+        if (seen.has(selector)) continue;
+        seen.add(selector);
+      }
+      items.push(item);
+    }
+  }
+  return items;
+}
+
+async function officialModelCatalogItems(config: HostDaemonConfig): Promise<Record<string, unknown>[]> {
+  const child = Bun.spawn([config.ompExecutable, "models", "--json"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, OMP_PROFILE: config.profileId },
+  });
+  const timer = setTimeout(() => child.kill(), MODEL_CATALOG_TIMEOUT_MS);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      boundedProcessOutput(child.stdout, MODEL_CATALOG_OUTPUT_BYTES),
+      boundedProcessOutput(child.stderr, VERSION_OUTPUT_BYTES),
+      child.exited,
+    ]);
+    if (exitCode !== 0) throw new Error(`official OMP model catalog failed (${exitCode}): ${stderr.trim()}`);
+    return officialModelCatalogItemsFromJson(JSON.parse(stdout));
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null) child.kill();
+  }
+}
+
+function officialCatalogItems(modelItems: readonly Record<string, unknown>[] = []): Record<string, unknown>[] {
+  return [...officialCommandCatalogItems(), ...modelItems];
 }
 
 export interface HostDaemonConfig {
@@ -227,6 +343,7 @@ export interface HostDaemonDependencies {
   readonly createLocal?: (options: AppserverOptions) => AppserverHandle;
   readonly createRemote?: typeof createRemoteAppserver;
   readonly verifyOfficialRuntime?: (executable: string) => Promise<Pick<AppserverOptions, "ompVersion" | "ompBuild">>;
+  readonly listOfficialModelCatalogItems?: (config: HostDaemonConfig) => Promise<readonly Record<string, unknown>[]>;
   readonly onSignal?: (signal: "SIGINT" | "SIGTERM", listener: () => void) => void;
   readonly removeSignal?: (signal: "SIGINT" | "SIGTERM", listener: () => void) => void;
 }
@@ -311,11 +428,21 @@ export async function runHostDaemon(
     officialAuthority = official;
     sessionAuthority = official;
     discovery = official;
+    let modelCatalogItems: Promise<readonly Record<string, unknown>[]> | undefined;
+    const loadModelCatalogItems = (): Promise<readonly Record<string, unknown>[]> => {
+      modelCatalogItems ??= (dependencies.listOfficialModelCatalogItems ?? officialModelCatalogItems)(config).catch(() => []);
+      return modelCatalogItems;
+    };
+    const loadSessionModelCatalogItems = (): Promise<readonly Record<string, unknown>[]> =>
+      officialSessionModelCatalogItems(official).catch(() => []);
     operationsAuthority = {
-      catalogGet: async () => ({
-        revision: `official-omp-${OFFICIAL_OMP_VERSION}`,
-        items: officialCatalogItems(),
-      }),
+      catalogGet: async () => {
+        const modelItems = mergeOfficialModelCatalogItems(await loadModelCatalogItems(), await loadSessionModelCatalogItems());
+        return {
+          revision: `official-omp-${OFFICIAL_OMP_VERSION}`,
+          items: officialCatalogItems(modelItems),
+        };
+      },
     };
     projectRootForProject = projectId => official.projectRootForProject(projectId);
     projectRootForSession = sessionId => official.projectRootForSession(sessionId);

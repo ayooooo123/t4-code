@@ -263,6 +263,7 @@ function setup(
       : {
           createServiceManager: overrides.createServiceManager ?? (() => serviceManager!),
           probeAppserver,
+          importLegacySessions: async () => {},
         }),
     createTargetManager: (options) => {
       managerOptions = options;
@@ -846,7 +847,7 @@ describe("desktop Electron lifecycle", () => {
       "--omp-authority",
       "official",
       "--omp-sessions-root",
-      join(homedir(), ".omp", "agent", "sessions"),
+      join(homedir(), ".omp", "t4", "default", "sessions"),
     ]);
     expect(probes).toBe(0);
     await fixture.lifecycle.stop();

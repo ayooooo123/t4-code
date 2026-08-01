@@ -1,3 +1,4 @@
+import { cp, mkdir, stat } from "node:fs/promises";
 import { app, BrowserWindow, dialog } from "electron";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -75,6 +76,39 @@ function isOfficialRuntimeExecutable(executable: string): boolean {
   return OFFICIAL_RUNTIME_TAG.test(basename(dirname(executable)));
 }
 
+function officialSessionsRoot(profileId: string, homeDirectory = homedir()): string {
+  return join(homeDirectory, ".omp", "t4", decodeLocalProfileId(profileId), "sessions");
+}
+
+function legacySessionsRoot(profileId: string, homeDirectory = homedir()): string {
+  const profile = decodeLocalProfileId(profileId);
+  return profile === "default"
+    ? join(homeDirectory, ".omp", "agent", "sessions")
+    : join(homeDirectory, ".omp", "profiles", profile, "agent", "sessions");
+}
+
+async function importLegacySessionsIfNeeded(profileId: string, homeDirectory = homedir()): Promise<void> {
+  const source = legacySessionsRoot(profileId, homeDirectory);
+  const target = officialSessionsRoot(profileId, homeDirectory);
+  if (source === target) return;
+  try {
+    if (!(await stat(source)).isDirectory()) return;
+  } catch {
+    return;
+  }
+  await mkdir(target, { recursive: true, mode: 0o700 });
+  await cp(source, target, {
+    recursive: true,
+    force: false,
+    errorOnExist: false,
+    preserveTimestamps: true,
+    filter: (path) => {
+      const name = basename(path);
+      return name !== ".t4-exclusive-owner.lock" && !name.endsWith(".lock");
+    },
+  });
+}
+
 
 function serviceArgv(executable: string, profileId: string): string[] {
   const argv = ["serve", "--omp", executable, "--profile", profileId];
@@ -83,7 +117,7 @@ function serviceArgv(executable: string, profileId: string): string[] {
       "--omp-authority",
       "official",
       "--omp-sessions-root",
-      join(homedir(), ".omp", "agent", "sessions"),
+      officialSessionsRoot(profileId),
     );
   }
   return argv;
@@ -106,6 +140,7 @@ export interface DesktopLifecycleOptions {
   readonly discoverExecutable?: () => Promise<string | undefined>;
   readonly discoverHostExecutable?: () => Promise<string | undefined>;
   readonly probeAppserver?: (executable: string) => Promise<boolean>;
+  readonly importLegacySessions?: (profileId: string) => Promise<void>;
   readonly createServiceManager?: (
     options: Parameters<typeof createAppserverServiceManager>[0],
   ) => ServiceManager;
@@ -146,6 +181,7 @@ export class DesktopLifecycle {
   private readonly serviceFactory: (
     options: Parameters<typeof createAppserverServiceManager>[0],
   ) => ServiceManager;
+  private readonly legacySessionImporter: (profileId: string) => Promise<void>;
   private readonly speechServiceFactory: (options: {
     readonly discoverExecutable: () => Promise<string | undefined>;
   }) => DesktopSpeechService;
@@ -245,6 +281,7 @@ export class DesktopLifecycle {
         ));
     this.appserverProbe = options.probeAppserver ?? ((executable) => probeOmpAppserver(executable));
     this.serviceFactory = options.createServiceManager ?? createAppserverServiceManager;
+    this.legacySessionImporter = options.importLegacySessions ?? ((profileId) => importLegacySessionsIfNeeded(profileId));
     this.targetManagerFactory =
       options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
     this.peerShareFactory = options.createPeerShare ?? ((workspaceRoots) => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore(), workspaceRoots }));
@@ -582,6 +619,7 @@ export class DesktopLifecycle {
       return undefined;
     }
     try {
+      if (isOfficialRuntimeExecutable(executable)) await this.legacySessionImporter(profileId);
       const candidate = this.serviceFactory({
         profileId,
         homeDirectory: homedir(),

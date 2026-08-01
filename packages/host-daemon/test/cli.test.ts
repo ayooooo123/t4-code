@@ -277,6 +277,7 @@ describe("T4 host daemon CLI", () => {
   test("pins and reports the exact official OMP runtime before exposing official authority", async () => {
     let authorityCloses = 0;
     let captured: Record<string, unknown> | undefined;
+    const sessionModels = ["anthropic/claude-opus-4.5"];
     const authority = {
       initialize: async () => {},
       close: async () => { authorityCloses += 1; },
@@ -284,7 +285,17 @@ describe("T4 host daemon CLI", () => {
       projectRootForSession: async () => "/tmp",
       lockCheck: async () => {},
       lockStatus: () => "missing",
-      list: async () => [],
+      list: async () => sessionModels.map((model, index) => ({
+        sessionId: `session-${index}`,
+        path: `/tmp/session-${index}.jsonl`,
+        cwd: "/tmp",
+        projectId: "project-test",
+        title: `Session ${index}`,
+        updatedAt: "2026-08-01T00:00:00.000Z",
+        status: "idle",
+        model,
+        entries: [],
+      })),
     };
     await expect(
       runHostDaemon(
@@ -300,6 +311,15 @@ describe("T4 host daemon CLI", () => {
             ompVersion: OFFICIAL_OMP_VERSION,
             ompBuild: OFFICIAL_OMP_BUILD,
           }),
+          listOfficialModelCatalogItems: async () => [
+            {
+              id: "model-openai-codex-gpt-5-5",
+              kind: "model",
+              name: "GPT-5.5",
+              supported: true,
+              metadata: { provider: "openai-codex", modelId: "gpt-5.5" },
+            },
+          ],
           createOfficialAuthority: () => authority as never,
           createTranscriptSearch: () => ({ close: async () => {} }) as never,
           createLocal: (options: unknown) => {
@@ -324,9 +344,33 @@ describe("T4 host daemon CLI", () => {
     });
     const catalog = await operations.catalogGet?.();
     if (!catalog) throw new Error("official catalog missing");
-    const officialItems = catalog.items as Array<{ kind: string; name: string }>;
-    const commandNames = officialItems.map(item => item.name);
-    expect(officialItems.every(item => item.kind === "command")).toBe(true);
+    const officialItems = catalog.items as Array<{ kind: string; name: string; metadata?: Record<string, unknown> }>;
+    const commandNames = officialItems.filter(item => item.kind === "command").map(item => item.name);
+    const modelItems = officialItems.filter(item => item.kind === "model");
+    expect(modelItems).toContainEqual(
+      expect.objectContaining({
+        name: "GPT-5.5",
+        metadata: expect.objectContaining({ provider: "openai-codex", modelId: "gpt-5.5" }),
+      }),
+    );
+    expect(modelItems).toContainEqual(
+      expect.objectContaining({
+        name: "anthropic/claude-opus-4.5",
+        metadata: expect.objectContaining({
+          provider: "anthropic",
+          modelId: "claude-opus-4.5",
+          selector: "anthropic/claude-opus-4.5",
+        }),
+      }),
+    );
+    sessionModels.push("google/gemini-3-pro");
+    const refreshedCatalog = await operations.catalogGet?.();
+    const refreshedItems = refreshedCatalog?.items as Array<{ kind: string; metadata?: Record<string, unknown> }> | undefined;
+    expect(refreshedItems?.filter(item => item.kind === "model")).toContainEqual(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ selector: "google/gemini-3-pro" }),
+      }),
+    );
     expect(commandNames).toContain("session.model.set");
     expect(commandNames).not.toContain("session.fast.set");
     expect(commandNames).not.toContain("session.retry");

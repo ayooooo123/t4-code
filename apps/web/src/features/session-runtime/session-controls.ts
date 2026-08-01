@@ -374,10 +374,12 @@ function modelChoicesFrom(
   return choices;
 }
 
-/** `provider/modelId` from a catalog model item's metadata, guarded. */
+/** Exact OMP selector from a catalog model item's metadata, guarded. */
 function modelItemSelector(item: CatalogItem): string | null {
   const metadata = item.metadata;
   if (isRecord(metadata)) {
+    const selector = metadata.selector;
+    if (typeof selector === "string" && selector.includes("/")) return selector;
     const provider = metadata.provider;
     const modelId = metadata.modelId;
     if (typeof provider === "string" && provider !== "" && typeof modelId === "string" && modelId !== "") {

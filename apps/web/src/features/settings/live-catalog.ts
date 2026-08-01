@@ -494,14 +494,16 @@ export function modelChoicesFromCatalog(catalog: CatalogFrame): readonly ModelCh
     const meta = isRecord(item.metadata) ? item.metadata : {};
     const provider = safeText(meta.provider, 256);
     const modelId = safeText(meta.modelId, 256);
-    if (provider === undefined || modelId === undefined) continue;
-    const selector = `${provider}/${modelId}`;
+    const selector = safeText(meta.selector, 512) ?? (
+      provider !== undefined && modelId !== undefined ? `${provider}/${modelId}` : undefined
+    );
+    if (provider === undefined || selector === undefined) continue;
     if (seen.has(selector)) continue;
     seen.add(selector);
     const contextWindow = finiteNumber(meta.contextWindow);
     out.push({
       selector,
-      label: safeText(item.name, 256) ?? modelId,
+      label: safeText(item.name, 256) ?? modelId ?? selector,
       provider,
       contextWindow: contextWindow ?? null,
     });
