@@ -70,16 +70,32 @@ export function validateSpec(spec: ServiceSpec): ServiceSpec {
   const executableName = executable.slice(executable.lastIndexOf("/") + 1);
   if (executableName === "t4-host") {
     if (
-      (argv.length !== 5 && argv.length !== 7) ||
       argv[0] !== "serve" ||
       argv[1] !== "--omp" ||
       !argv[2]?.startsWith("/") ||
       !argv[2].endsWith("/omp") ||
       argv[3] !== "--profile" ||
-      argv[4] !== profileId ||
-      (argv.length === 7 && (argv[5] !== "--state-root" || !argv[6]?.startsWith("/")))
+      argv[4] !== profileId
     )
       invalid("Unsupported T4 host argv.");
+    let officialAuthority = false;
+    let officialSessionsRoot = false;
+    for (let index = 5; index < argv.length;) {
+      const flag = argv[index];
+      if (flag === "--state-root") {
+        if (!argv[index + 1]?.startsWith("/")) invalid("Unsupported T4 host argv.");
+        index += 2;
+      } else if (flag === "--omp-authority") {
+        if (argv[index + 1] !== "official" || officialAuthority) invalid("Unsupported T4 host argv.");
+        officialAuthority = true;
+        index += 2;
+      } else if (flag === "--omp-sessions-root") {
+        if (!argv[index + 1]?.startsWith("/") || officialSessionsRoot) invalid("Unsupported T4 host argv.");
+        officialSessionsRoot = true;
+        index += 2;
+      } else invalid("Unsupported T4 host argv.");
+    }
+    if (officialAuthority !== officialSessionsRoot) invalid("Unsupported T4 host argv.");
   } else {
     invalid("Executable must be t4-host.");
   }

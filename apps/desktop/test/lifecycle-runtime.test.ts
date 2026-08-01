@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appserverLogsDirectory,
@@ -813,6 +813,45 @@ describe("desktop Electron lifecycle", () => {
     expect(fixture.windows).toHaveLength(1);
     await fixture.lifecycle.stop();
   });
+  it("launches official upstream bundled runtimes with file authority", async () => {
+    let argv: readonly string[] = [];
+    let probes = 0;
+    const service: ServiceManager = {
+      inspect: async () => ({ definition: "current", service: "running", diagnostics: "" }),
+      install: async () => {},
+      start: async () => {},
+      stop: async () => {},
+      restart: async () => {},
+      uninstall: async () => {},
+    };
+    const fixture = setup(undefined, async () => {
+      probes += 1;
+      return false;
+    }, {
+      discoverExecutable: async () => "/opt/t4/runtime/v17.0.9/omp",
+      createServiceManager: (options) => {
+        argv = options.argv;
+        return service;
+      },
+    });
+
+    await fixture.lifecycle.start();
+
+    expect(argv).toEqual([
+      "serve",
+      "--omp",
+      "/opt/t4/runtime/v17.0.9/omp",
+      "--profile",
+      "default",
+      "--omp-authority",
+      "official",
+      "--omp-sessions-root",
+      join(homedir(), ".omp", "t4", "default", "sessions"),
+    ]);
+    expect(probes).toBe(0);
+    await fixture.lifecycle.stop();
+  });
+
   it("rediscovers the bundled OMP path before automatic default service repair", async () => {
     const calls: string[] = [];
     const repaired = Promise.withResolvers<void>();

@@ -23,6 +23,8 @@ export interface BundledRuntimeManifest {
   readonly sha256: string;
 }
 
+const RUNTIME_TAG_PATTERN = /^(?:t4code-[0-9]+\.[0-9]+\.[0-9]+-appserver-[1-9][0-9]*|v[0-9]+\.[0-9]+\.[0-9]+)$/u;
+
 function decodeManifest(value: unknown): BundledRuntimeManifest {
   const record = value as Partial<BundledRuntimeManifest> | null;
   if (
@@ -31,7 +33,7 @@ function decodeManifest(value: unknown): BundledRuntimeManifest {
     record.arch !== "arm64" ||
     record.executable !== "omp" ||
     typeof record.tag !== "string" ||
-    !/^t4code-[0-9]+\.[0-9]+\.[0-9]+-appserver-[1-9][0-9]*$/u.test(record.tag) ||
+    !RUNTIME_TAG_PATTERN.test(record.tag) ||
     !Number.isSafeInteger(record.size) ||
     (record.size ?? 0) < 1 ||
     typeof record.sha256 !== "string" ||

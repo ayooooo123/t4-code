@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog } from "electron";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import type { CursorStore } from "@t4-code/client";
 import { parsePairDeepLink, PendingPairQueue, type PendingPair } from "@t4-code/protocol";
@@ -69,6 +69,26 @@ export function appserverLogsDirectory(
         })();
   return profile === "default" ? base : join(base, "profiles", profile);
 }
+
+const OFFICIAL_RUNTIME_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+$/u;
+function isOfficialRuntimeExecutable(executable: string): boolean {
+  return OFFICIAL_RUNTIME_TAG.test(basename(dirname(executable)));
+}
+
+
+function serviceArgv(executable: string, profileId: string): string[] {
+  const argv = ["serve", "--omp", executable, "--profile", profileId];
+  if (isOfficialRuntimeExecutable(executable)) {
+    argv.push(
+      "--omp-authority",
+      "official",
+      "--omp-sessions-root",
+      join(homedir(), ".omp", "t4", decodeLocalProfileId(profileId), "sessions"),
+    );
+  }
+  return argv;
+}
+
 
 export interface DesktopLifecycleOptions {
   readonly app?: typeof app;
@@ -415,7 +435,7 @@ export class DesktopLifecycle {
       this.ipc = undefined;
     }
   }
-  private async ensureServiceReady(manager: ServiceManager, executable: string): Promise<void> {
+  private async ensureServiceReady(manager: ServiceManager, executable: string, officialAuthority: boolean): Promise<void> {
     this.assertServiceRecoveryActive();
     let inspection = await manager.inspect();
     this.assertServiceRecoveryActive();
@@ -434,7 +454,7 @@ export class DesktopLifecycle {
       this.assertServiceRecoveryActive();
       inspection = await manager.inspect();
       this.assertServiceRecoveryActive();
-      const ready = inspection.service === "running" && (await this.appserverProbe(executable));
+      const ready = inspection.service === "running" && (officialAuthority || (await this.appserverProbe(executable)));
       this.assertServiceRecoveryActive();
       if (ready) return;
       if (Date.now() >= deadline)
@@ -567,7 +587,7 @@ export class DesktopLifecycle {
         homeDirectory: homedir(),
         logsDirectory: appserverLogsDirectory(homedir(), process.platform, process.env, profileId),
         executable: hostExecutable,
-        argv: ["serve", "--omp", executable, "--profile", profileId],
+        argv: serviceArgv(executable, profileId),
         fs: new NodeServiceFileSystem(),
       });
       this.assertServiceRecoveryActive();
@@ -579,7 +599,7 @@ export class DesktopLifecycle {
       try {
         // Always reconcile the service definition before accepting the local
         // socket. A running legacy OMP host must be replaced by t4-host.
-        await this.ensureServiceReady(candidate, executable);
+        await this.ensureServiceReady(candidate, executable, isOfficialRuntimeExecutable(executable));
       } catch (error) {
         if (this.stopping || error instanceof ServiceRecoveryCancelledError) return undefined;
         if (defaultRecoveryIsStale()) return this.serviceManager;

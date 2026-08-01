@@ -28,6 +28,26 @@ describe("bundled OMP runtime", () => {
     expect((await stat(first)).mode & 0o777).toBe(0o755);
   });
 
+  it("accepts an official upstream runtime tag", async () => {
+    const root = await mkdtemp(join(tmpdir(), "t4-bundled-runtime-official-"));
+    const resourcesPath = join(root, "resources");
+    const supportPath = join(root, "support");
+    const runtimeRoot = join(resourcesPath, "runtime");
+    await mkdir(runtimeRoot, { recursive: true });
+    const bytes = Buffer.from("official omp runtime");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    await writeFile(join(runtimeRoot, "omp"), bytes);
+    await writeFile(join(runtimeRoot, "manifest.json"), JSON.stringify({
+      version: 1, tag: "v17.0.9", platform: "darwin", arch: "arm64",
+      executable: "omp", size: bytes.length, sha256,
+    }));
+
+    const installed = await installBundledOmpRuntime({ resourcesPath, applicationSupportPath: supportPath });
+
+    expect(installed).toBe(join(supportPath, "runtime", "v17.0.9", "omp"));
+    expect(await readFile(installed)).toEqual(bytes);
+  });
+
 
   it("rejects a bundled executable that does not match its manifest", async () => {
     const root = await mkdtemp(join(tmpdir(), "t4-bundled-runtime-bad-"));
