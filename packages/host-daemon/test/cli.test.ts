@@ -6,9 +6,11 @@ import {
   hostDaemonPaths,
   OFFICIAL_OMP_BUILD,
   OFFICIAL_OMP_VERSION,
+  officialSettingsFromConfig,
   parseHostDaemonArgs,
   runHostDaemon,
   verifyOfficialRuntime,
+  type OfficialSettingsEdit,
 } from "../src/cli.ts";
 
 describe("T4 host daemon CLI", () => {
@@ -320,6 +322,23 @@ describe("T4 host daemon CLI", () => {
               metadata: { provider: "openai-codex", modelId: "gpt-5.5" },
             },
           ],
+          listOfficialSettingsMetadata: async () => ({
+            modelRoles: {
+              controlType: "record",
+              effective: { default: "openai-codex/gpt-5.5" },
+              effectiveSource: "global",
+              configured: true,
+              sensitive: false,
+              scopes: ["global", "session"],
+              tab: "model",
+            },
+            "auth.broker.token": {
+              controlType: "string",
+              configured: true,
+              sensitive: true,
+              scopes: ["global"],
+            },
+          }),
           createOfficialAuthority: () => authority as never,
           createTranscriptSearch: () => ({ close: async () => {} }) as never,
           createLocal: (options: unknown) => {
@@ -338,15 +357,38 @@ describe("T4 host daemon CLI", () => {
     });
     const operations = captured?.operationsAuthority as {
       catalogGet?: () => Promise<Record<string, unknown>>;
+      settingsRead?: () => Promise<Record<string, unknown>>;
     };
     expect(await operations.catalogGet?.()).toMatchObject({
-      revision: `official-omp-${OFFICIAL_OMP_VERSION}`,
+      revision: expect.stringContaining(`official-omp-${OFFICIAL_OMP_VERSION}-official-settings-`),
     });
     const catalog = await operations.catalogGet?.();
     if (!catalog) throw new Error("official catalog missing");
     const officialItems = catalog.items as Array<{ kind: string; name: string; metadata?: Record<string, unknown> }>;
     const commandNames = officialItems.filter(item => item.kind === "command").map(item => item.name);
     const modelItems = officialItems.filter(item => item.kind === "model");
+    const settingItems = officialItems.filter(item => item.kind === "setting");
+    expect(settingItems).toContainEqual(
+      expect.objectContaining({
+        name: "modelRoles",
+        metadata: expect.objectContaining({
+          path: "modelRoles",
+          controlType: "record",
+          effective: { default: "openai-codex/gpt-5.5" },
+        }),
+      }),
+    );
+    expect(settingItems).toContainEqual(
+      expect.objectContaining({
+        name: "auth.broker.token",
+        metadata: expect.objectContaining({
+          path: "auth.broker.token",
+          controlType: "string",
+          sensitive: true,
+        }),
+      }),
+    );
+    expect(settingItems.find(item => item.name === "auth.broker.token")?.metadata).not.toHaveProperty("effective");
     expect(modelItems).toContainEqual(
       expect.objectContaining({
         name: "GPT-5.5",
@@ -374,6 +416,26 @@ describe("T4 host daemon CLI", () => {
     expect(commandNames).toContain("session.model.set");
     expect(commandNames).not.toContain("session.fast.set");
     expect(commandNames).not.toContain("session.retry");
+    expect(commandNames).toContain("settings.read");
+    const settings = await operations.settingsRead?.();
+    expect(settings).toMatchObject({
+      revision: expect.stringContaining("official-settings-"),
+      settings: {
+        modelRoles: expect.objectContaining({
+          effective: { default: "openai-codex/gpt-5.5" },
+          sensitive: false,
+        }),
+        "auth.broker.token": expect.objectContaining({
+          configured: true,
+          sensitive: true,
+        }),
+      },
+    });
+    const settingsFrame = settings?.settings as Record<string, Record<string, unknown>> | undefined;
+    expect(settingsFrame?.["auth.broker.token"]).not.toHaveProperty("effective");
+    // Presentation keys belong to the catalog item; the frame is values only.
+    expect(settingsFrame?.modelRoles).not.toHaveProperty("tab");
+    expect(settingsFrame?.modelRoles).not.toHaveProperty("path");
     expect(authorityCloses).toBe(1);
   });
 
@@ -391,5 +453,147 @@ describe("T4 host daemon CLI", () => {
       ompBuild: OFFICIAL_OMP_BUILD,
     });
     await expect(verifyOfficialRuntime(drifted)).rejects.toThrow(`omp/${OFFICIAL_OMP_VERSION}`);
+  });
+
+  test("maps the official config schema onto wire settings with honest provenance", () => {
+    const settings = officialSettingsFromConfig(
+      {
+        autoResume: { value: false, type: "boolean", description: "Resume the most recent session" },
+        "theme.dark": { value: "titanium", type: "string", description: "" },
+        "power.sleepPrevention": { value: "idle", type: "enum", description: "Prevent sleep" },
+        modelRoles: { value: { smol: "anthropic/claude-haiku-4-5" }, type: "record", description: "" },
+        "auth.broker.token": { type: "string", description: "" },
+        "providers.headers": { value: { authorization: "Bearer x" }, type: "record", description: "" },
+      },
+      { theme: { dark: "titanium" }, modelRoles: { smol: "anthropic/claude-haiku-4-5" } },
+    ) as Record<string, Record<string, unknown>>;
+
+    // Present in the global document -> a real global override.
+    expect(settings["theme.dark"]).toMatchObject({
+      controlType: "string",
+      configured: true,
+      effective: "titanium",
+      effectiveSource: "global",
+      tab: "appearance",
+    });
+    expect(settings["theme.dark"]).not.toHaveProperty("default");
+    // Absent from the global document -> the runtime value IS the default.
+    expect(settings.autoResume).toMatchObject({
+      controlType: "boolean",
+      configured: false,
+      default: false,
+      tab: "general",
+    });
+    expect(settings.autoResume).not.toHaveProperty("effective");
+    // OMP publishes no enum options, so an enum degrades to free text.
+    expect(settings["power.sleepPrevention"]).toMatchObject({
+      controlType: "string",
+      configured: false,
+      // No curated home for this prefix: Advanced, grouped by the raw prefix,
+      // so an unbounded schema can never outgrow the renderer's section cap.
+      tab: "advanced",
+      group: "power",
+    });
+    expect(settings.modelRoles).toMatchObject({
+      controlType: "record",
+      configured: true,
+      effective: { smol: "anthropic/claude-haiku-4-5" },
+      tab: "model",
+    });
+    // Secret-like paths and values with secret-like nested keys never carry values.
+    expect(settings["auth.broker.token"]).toMatchObject({ sensitive: true, configured: false });
+    expect(settings["auth.broker.token"]).not.toHaveProperty("effective");
+    expect(settings["providers.headers"]).not.toHaveProperty("effective");
+    expect(settings["providers.headers"]).not.toHaveProperty("default");
+    // Only the machine-wide layer is writable through this authority.
+    for (const row of Object.values(settings)) expect(row.scopes).toEqual(["global"]);
+  });
+
+  test("writes official settings through the runtime and republishes a fresh revision", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const applied: OfficialSettingsEdit[][] = [];
+    const schema: Record<string, Record<string, unknown>> = {
+      autoResume: { controlType: "boolean", configured: false, sensitive: false, scopes: ["global"], default: false },
+      "auth.broker.token": { controlType: "string", configured: false, sensitive: true, scopes: ["global"] },
+    };
+    const authority = {
+      initialize: async () => {},
+      close: async () => {},
+      projectRootForProject: async () => "/tmp",
+      projectRootForSession: async () => "/tmp",
+      lockCheck: async () => {},
+      lockStatus: () => "missing",
+      list: async () => [],
+    };
+    await expect(
+      runHostDaemon(
+        {
+          ompExecutable: "/opt/omp",
+          authorityMode: "official",
+          ompSessionsRoot: "/tmp/t4-official-sessions",
+          profileId: "t4",
+          stateRoot: "/tmp/t4-official-state",
+        },
+        {
+          verifyOfficialRuntime: async () => ({ ompVersion: OFFICIAL_OMP_VERSION, ompBuild: OFFICIAL_OMP_BUILD }),
+          listOfficialModelCatalogItems: async () => [],
+          listOfficialSettingsMetadata: async () => structuredClone(schema),
+          applyOfficialSettingsEdits: async (_config, edits) => {
+            applied.push([...edits]);
+            schema.autoResume = {
+              controlType: "boolean",
+              configured: true,
+              sensitive: false,
+              scopes: ["global"],
+              effective: true,
+              effectiveSource: "global",
+            };
+          },
+          createOfficialAuthority: () => authority as never,
+          createTranscriptSearch: () => ({ close: async () => {} }) as never,
+          createLocal: (options: unknown) => {
+            captured = options as Record<string, unknown>;
+            throw new Error("captured official options");
+          },
+        },
+      ),
+    ).rejects.toThrow("captured official options");
+    const operations = captured?.operationsAuthority as {
+      settingsRead?: () => Promise<Record<string, unknown>>;
+      settingsWrite?: (args: unknown, context: unknown) => Promise<Record<string, unknown>>;
+    };
+    const before = await operations.settingsRead?.();
+    const revision = String(before?.revision);
+    const context = { expectedRevision: revision };
+
+    await expect(
+      operations.settingsWrite?.({ edits: [{ path: "autoResume", scope: "session", value: true }] }, context),
+    ).rejects.toThrow("whole machine");
+    await expect(
+      operations.settingsWrite?.({ edits: [{ path: "auth.broker.token", scope: "global", value: "nope" }] }, context),
+    ).rejects.toThrow("secret settings");
+    await expect(
+      operations.settingsWrite?.({ edits: [{ path: "nope.missing", scope: "global", value: 1 }] }, context),
+    ).rejects.toThrow("unknown setting path");
+    await expect(
+      operations.settingsWrite?.({ edits: [{ path: "autoResume", scope: "global", value: true }] }, {
+        expectedRevision: "official-settings-stale",
+      }),
+    ).rejects.toThrow("stale");
+    expect(applied).toEqual([]);
+
+    const written = await operations.settingsWrite?.(
+      { edits: [{ path: "autoResume", scope: "global", value: true }] },
+      context,
+    );
+    expect(applied).toEqual([[{ path: "autoResume", scope: "global", value: true }]]);
+    expect(String(written?.revision)).not.toBe(revision);
+    const after = await operations.settingsRead?.();
+    expect(after?.revision).toBe(written?.revision);
+    const settingsAfter = after?.settings as Record<string, Record<string, unknown>> | undefined;
+    expect(settingsAfter?.autoResume).toMatchObject({
+      configured: true,
+      effective: true,
+    });
   });
 });

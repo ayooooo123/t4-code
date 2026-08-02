@@ -19,7 +19,7 @@ import {
   type SessionAuthority,
   type SessionDiscovery,
 } from "@t4-code/host-service";
-import { COMMAND_DESCRIPTORS, type ProjectId, type SessionId } from "@t4-code/protocol";
+import { COMMAND_DESCRIPTORS, isSecretLikeKey, type ProjectId, type SessionId } from "@t4-code/protocol";
 
 export const T4_HOST_VERSION = "0.1.32";
 export const OFFICIAL_OMP_VERSION = "17.0.9";
@@ -33,6 +33,13 @@ const VERSION_OUTPUT_BYTES = 4 * 1024;
 const VERSION_TIMEOUT_MS = 5_000;
 const MODEL_CATALOG_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MODEL_CATALOG_TIMEOUT_MS = 10_000;
+const SETTINGS_CATALOG_OUTPUT_BYTES = 2 * 1024 * 1024;
+const SETTINGS_CATALOG_TIMEOUT_MS = 10_000;
+const SETTINGS_WRITE_EDIT_LIMIT = 64;
+const MAX_SETTING_PATH_BYTES = 512;
+/** `boundedSettings` caps the wire map at MAX_MAP_KEYS keys. */
+const SETTINGS_PUBLISH_LIMIT = 512;
+const SETTINGS_CACHE_TTL_MS = 5_000;
 const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
   "session.create",
   "session.rename",
@@ -42,6 +49,8 @@ const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
   "session.model.set",
   "session.thinking.set",
   "session.cancel",
+  "settings.read",
+  "settings.write",
   "session.close",
 ]);
 
@@ -146,30 +155,322 @@ function mergeOfficialModelCatalogItems(...groups: readonly (readonly Record<str
   return items;
 }
 
-async function officialModelCatalogItems(config: HostDaemonConfig): Promise<Record<string, unknown>[]> {
-  const child = Bun.spawn([config.ompExecutable, "models", "--json"], {
+async function runOfficialOmp(
+  config: HostDaemonConfig,
+  argv: readonly string[],
+  maxBytes: number,
+  timeoutMs: number,
+  label: string,
+): Promise<string> {
+  const child = Bun.spawn([config.ompExecutable, ...argv], {
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, OMP_PROFILE: config.profileId },
   });
-  const timer = setTimeout(() => child.kill(), MODEL_CATALOG_TIMEOUT_MS);
+  const timer = setTimeout(() => child.kill(), timeoutMs);
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
-      boundedProcessOutput(child.stdout, MODEL_CATALOG_OUTPUT_BYTES),
+      boundedProcessOutput(child.stdout, maxBytes),
       boundedProcessOutput(child.stderr, VERSION_OUTPUT_BYTES),
       child.exited,
     ]);
-    if (exitCode !== 0) throw new Error(`official OMP model catalog failed (${exitCode}): ${stderr.trim()}`);
-    return officialModelCatalogItemsFromJson(JSON.parse(stdout));
+    if (exitCode !== 0) throw new Error(`official OMP ${label} failed (${exitCode}): ${stderr.trim()}`);
+    return stdout;
   } finally {
     clearTimeout(timer);
     if (child.exitCode === null) child.kill();
   }
 }
 
-function officialCatalogItems(modelItems: readonly Record<string, unknown>[] = []): Record<string, unknown>[] {
-  return [...officialCommandCatalogItems(), ...modelItems];
+async function officialModelCatalogItems(config: HostDaemonConfig): Promise<Record<string, unknown>[]> {
+  const stdout = await runOfficialOmp(
+    config,
+    ["models", "--json"],
+    MODEL_CATALOG_OUTPUT_BYTES,
+    MODEL_CATALOG_TIMEOUT_MS,
+    "model catalog",
+  );
+  return officialModelCatalogItemsFromJson(JSON.parse(stdout));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A value is only publishable when no nested key looks like a secret: the
+ * wire decoder rejects the whole frame over one such key. */
+function containsSecretLikeObjectKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsSecretLikeObjectKey);
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([key, child]) => isSecretLikeKey(key) || containsSecretLikeObjectKey(child));
+}
+
+/** OMP publishes no enum options through `config list`, so an enum degrades to
+ * free text rather than rendering as a broken picker. The runtime validates
+ * the written value and rejects anything outside its own enum. */
+function settingControlType(type: unknown, value: unknown): string {
+  if (type === "boolean" || type === "number" || type === "string" || type === "array" || type === "record") return type;
+  if (type === "enum") return "string";
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "number") return "number";
+  if (Array.isArray(value)) return "array";
+  if (isRecord(value)) return "record";
+  return "string";
+}
+
+/** The renderer only knows these section ids and caps sections hard, so every
+ * path lands on a curated tab; the raw prefix survives as the group. */
+const SETTING_TAB_BY_PREFIX: Readonly<Record<string, string>> = {
+  advisor: "tasks",
+  agent: "tasks",
+  agents: "tasks",
+  async: "tasks",
+  auth: "providers",
+  bash: "shell",
+  browser: "tools",
+  command: "shell",
+  commands: "shell",
+  context: "context",
+  diff: "files",
+  edit: "files",
+  file: "files",
+  files: "files",
+  github: "tools",
+  history: "memory",
+  image: "tools",
+  inspect_image: "tools",
+  instructions: "context",
+  mcp: "tools",
+  memory: "memory",
+  model: "model",
+  models: "model",
+  notification: "interaction",
+  notifications: "interaction",
+  prelude: "context",
+  project: "files",
+  prompt: "interaction",
+  provider: "providers",
+  providers: "providers",
+  reasoning: "model",
+  rules: "context",
+  search: "tools",
+  shell: "shell",
+  skills: "context",
+  speech: "interaction",
+  speechgen: "interaction",
+  task: "tasks",
+  terminal: "shell",
+  theme: "appearance",
+  thinking: "model",
+  tier: "model",
+  tool: "tools",
+  tools: "tools",
+  tts: "interaction",
+  ttsr: "interaction",
+  ui: "appearance",
+  web: "tools",
+  workspace: "files",
+};
+
+const MODEL_SETTING_PATHS: ReadonlySet<string> = new Set([
+  "cycleOrder",
+  "defaultThinkingLevel",
+  "modelRoleStorage",
+  "modelRoles",
+  "modelTags",
+]);
+
+const ADVANCED_TAB = "advanced";
+
+function settingPlacement(path: string): { readonly tab: string; readonly group: string } {
+  const dot = path.indexOf(".");
+  if (dot <= 0) return { tab: MODEL_SETTING_PATHS.has(path) ? "model" : "general", group: "" };
+  const prefix = path.slice(0, dot);
+  return { tab: SETTING_TAB_BY_PREFIX[prefix] ?? ADVANCED_TAB, group: prefix };
+}
+
+/** Walk the global config document by dotted path. Presence in that document
+ * IS the global layer; everything else the runtime reports is a default. */
+function globalLayerValue(document: unknown, path: string): unknown {
+  let current: unknown = document;
+  for (const segment of path.split(".")) {
+    if (!isRecord(current)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
+
+function settingMetadataFromConfigEntry(path: string, entry: unknown, globalValue: unknown): Record<string, unknown> {
+  const record = isRecord(entry) ? entry : {};
+  const value = record.value;
+  const sensitive = isSecretLikeKey(path);
+  const configured = globalValue !== undefined;
+  const placement = settingPlacement(path);
+  const metadata: Record<string, unknown> = {
+    controlType: settingControlType(record.type, value),
+    ...(typeof record.description === "string" && record.description.length > 0
+      ? { description: record.description }
+      : {}),
+    configured,
+    sensitive,
+    scopes: ["global"],
+    tab: placement.tab,
+    ...(placement.group === "" ? {} : { group: placement.group }),
+  };
+  if (sensitive || value === undefined || containsSecretLikeObjectKey(value)) return metadata;
+  if (configured) {
+    metadata.effective = value;
+    metadata.effectiveSource = "global";
+  } else {
+    // Nothing overrides this path, so what the runtime reports IS the default.
+    metadata.default = value;
+  }
+  return metadata;
+}
+
+export function officialSettingsFromConfig(schema: unknown, globalDocument: unknown): Record<string, unknown> {
+  if (!isRecord(schema)) return {};
+  const settings: Record<string, unknown> = {};
+  let published = 0;
+  for (const [path, entry] of Object.entries(schema).sort(([left], [right]) => left.localeCompare(right))) {
+    if (path.length === 0 || path.length > MAX_SETTING_PATH_BYTES) continue;
+    // The wire map is bounded; one row past the cap would reject the whole
+    // frame, so drop the tail alphabetically and say so in the log.
+    if (published === SETTINGS_PUBLISH_LIMIT) {
+      console.warn(`t4-host: official OMP publishes more settings than the wire allows; dropping paths after ${path}`);
+      break;
+    }
+    settings[path] = settingMetadataFromConfigEntry(path, entry, globalLayerValue(globalDocument, path));
+    published += 1;
+  }
+  return settings;
+}
+
+/** The profile's global config document, or `{}` when the profile has none. */
+async function officialGlobalConfigDocument(config: HostDaemonConfig): Promise<unknown> {
+  const profileDir = (
+    await runOfficialOmp(config, ["config", "path"], VERSION_OUTPUT_BYTES, SETTINGS_CATALOG_TIMEOUT_MS, "config path")
+  ).trim();
+  if (profileDir.length === 0 || !isAbsolute(profileDir)) return {};
+  const file = Bun.file(join(profileDir, "config.yml"));
+  if (!(await file.exists())) return {};
+  const text = await file.text();
+  if (text.length > SETTINGS_CATALOG_OUTPUT_BYTES) throw new Error("official OMP config document is too large");
+  return Bun.YAML.parse(text);
+}
+
+async function officialSettingsMetadata(config: HostDaemonConfig): Promise<Record<string, unknown>> {
+  const [schema, globalDocument] = await Promise.all([
+    runOfficialOmp(
+      config,
+      ["config", "list", "--json"],
+      SETTINGS_CATALOG_OUTPUT_BYTES,
+      SETTINGS_CATALOG_TIMEOUT_MS,
+      "settings catalog",
+    ).then(stdout => JSON.parse(stdout) as unknown),
+    officialGlobalConfigDocument(config).catch(() => ({})),
+  ]);
+  return officialSettingsFromConfig(schema, globalDocument);
+}
+
+export interface OfficialSettingsEdit {
+  readonly path: string;
+  readonly scope?: string;
+  readonly value?: unknown;
+  readonly reset?: boolean;
+}
+
+function refuse(message: string, code: string): Error {
+  return Object.assign(new Error(message), { code });
+}
+
+/** `omp config set` takes scalars verbatim and structures as JSON. */
+function settingWriteArgument(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined) throw refuse("settings edit is missing a value", "UNSUPPORTED");
+  return JSON.stringify(value);
+}
+
+function officialSettingsEdits(args: unknown): readonly OfficialSettingsEdit[] {
+  const raw = isRecord(args) ? args.edits : undefined;
+  if (!Array.isArray(raw) || raw.length === 0) throw refuse("settings write carried no edits", "UNSUPPORTED");
+  if (raw.length > SETTINGS_WRITE_EDIT_LIMIT) throw refuse("too many settings edits", "UNSUPPORTED");
+  return raw.map(entry => {
+    if (!isRecord(entry) || typeof entry.path !== "string" || entry.path.length === 0)
+      throw refuse("settings edit is malformed", "UNSUPPORTED");
+    return {
+      path: entry.path,
+      ...(typeof entry.scope === "string" ? { scope: entry.scope } : {}),
+      ...(entry.reset === true ? { reset: true } : { value: entry.value }),
+    };
+  });
+}
+
+/** Refuse anything this authority cannot honestly write before any runtime
+ * process starts, so a rejected batch never lands half-applied. */
+function assertWritableSettingsEdits(
+  settings: Record<string, unknown>,
+  edits: readonly OfficialSettingsEdit[],
+): void {
+  for (const edit of edits) {
+    const metadata = settings[edit.path];
+    if (!isRecord(metadata)) throw refuse(`unknown setting path: ${edit.path}`, "NOT_FOUND");
+    if (edit.scope !== undefined && edit.scope !== "global")
+      throw refuse("this host only writes settings for the whole machine", "UNSUPPORTED");
+    if (metadata.sensitive === true)
+      throw refuse("secret settings are managed by the runtime, not this app", "FORBIDDEN");
+    if (edit.reset !== true) settingWriteArgument(edit.value);
+  }
+}
+
+async function applyOfficialSettingsEdits(
+  config: HostDaemonConfig,
+  edits: readonly OfficialSettingsEdit[],
+): Promise<void> {
+  for (const edit of edits) {
+    const argv = edit.reset === true
+      ? ["config", "reset", edit.path]
+      : ["config", "set", edit.path, settingWriteArgument(edit.value)];
+    await runOfficialOmp(config, argv, VERSION_OUTPUT_BYTES, SETTINGS_CATALOG_TIMEOUT_MS, "settings write");
+  }
+}
+
+function officialSettingCatalogItems(settings: Record<string, unknown>): Record<string, unknown>[] {
+  return Object.entries(settings).map(([path, metadata]) => ({
+    id: `setting:${path}`,
+    kind: "setting",
+    name: path,
+    supported: true,
+    metadata: { path, ...(isRecord(metadata) ? metadata : {}) },
+  }));
+}
+
+/** Presentation keys (`description`, `tab`, `group`) live on the catalog item;
+ * the settings frame carries values only. A frame that repeats them is
+ * unrecognized value metadata and the renderer refuses the whole row. */
+const SETTINGS_FRAME_ITEM_ONLY_KEYS: ReadonlySet<string> = new Set(["description", "group", "label", "path", "tab"]);
+
+export function officialSettingsFrameValues(settings: Record<string, unknown>): Record<string, unknown> {
+  const frame: Record<string, unknown> = {};
+  for (const [path, metadata] of Object.entries(settings)) {
+    if (!isRecord(metadata)) continue;
+    frame[path] = Object.fromEntries(
+      Object.entries(metadata).filter(([key]) => !SETTINGS_FRAME_ITEM_ONLY_KEYS.has(key)),
+    );
+  }
+  return frame;
+}
+
+function settingsRevision(settings: Record<string, unknown>): string {
+  return `official-settings-${createHash("sha256").update(JSON.stringify(settings)).digest("hex").slice(0, 16)}`;
+}
+
+function officialCatalogItems(
+  modelItems: readonly Record<string, unknown>[] = [],
+  settings: Record<string, unknown> = {},
+): Record<string, unknown>[] {
+  return [...officialCommandCatalogItems(), ...modelItems, ...officialSettingCatalogItems(settings)];
 }
 
 export interface HostDaemonConfig {
@@ -344,6 +645,11 @@ export interface HostDaemonDependencies {
   readonly createRemote?: typeof createRemoteAppserver;
   readonly verifyOfficialRuntime?: (executable: string) => Promise<Pick<AppserverOptions, "ompVersion" | "ompBuild">>;
   readonly listOfficialModelCatalogItems?: (config: HostDaemonConfig) => Promise<readonly Record<string, unknown>[]>;
+  readonly listOfficialSettingsMetadata?: (config: HostDaemonConfig) => Promise<Record<string, unknown>>;
+  readonly applyOfficialSettingsEdits?: (
+    config: HostDaemonConfig,
+    edits: readonly OfficialSettingsEdit[],
+  ) => Promise<void>;
   readonly onSignal?: (signal: "SIGINT" | "SIGTERM", listener: () => void) => void;
   readonly removeSignal?: (signal: "SIGINT" | "SIGTERM", listener: () => void) => void;
 }
@@ -435,13 +741,52 @@ export async function runHostDaemon(
     };
     const loadSessionModelCatalogItems = (): Promise<readonly Record<string, unknown>[]> =>
       officialSessionModelCatalogItems(official).catch(() => []);
+    // `omp config set` from a terminal changes the same file this authority
+    // reads, so the snapshot expires; the TTL still collapses the bootstrap
+    // burst (catalog.get + settings.read arrive together) into one probe.
+    let settingsMetadata: Promise<Record<string, unknown>> | undefined;
+    let settingsMetadataAt = 0;
+    const loadSettingsMetadata = (): Promise<Record<string, unknown>> => {
+      if (settingsMetadata === undefined || Date.now() - settingsMetadataAt > SETTINGS_CACHE_TTL_MS) {
+        settingsMetadataAt = Date.now();
+        settingsMetadata = (dependencies.listOfficialSettingsMetadata ?? officialSettingsMetadata)(config).catch(() => ({}));
+      }
+      return settingsMetadata;
+    };
     operationsAuthority = {
       catalogGet: async () => {
-        const modelItems = mergeOfficialModelCatalogItems(await loadModelCatalogItems(), await loadSessionModelCatalogItems());
+        const [modelItems, settings] = await Promise.all([
+          Promise.all([loadModelCatalogItems(), loadSessionModelCatalogItems()]).then(groups => mergeOfficialModelCatalogItems(...groups)),
+          loadSettingsMetadata(),
+        ]);
         return {
-          revision: `official-omp-${OFFICIAL_OMP_VERSION}`,
-          items: officialCatalogItems(modelItems),
+          revision: `official-omp-${OFFICIAL_OMP_VERSION}-${settingsRevision(settings)}`,
+          items: officialCatalogItems(modelItems, settings),
         };
+      },
+      settingsRead: async () => {
+        const settings = await loadSettingsMetadata();
+        return {
+          revision: settingsRevision(settings),
+          settings: officialSettingsFrameValues(settings),
+        };
+      },
+      settingsWrite: async (args, context) => {
+        const settings = await loadSettingsMetadata();
+        const revision = settingsRevision(settings);
+        const expected = context.expectedRevision ?? (isRecord(args) ? args.expectedRevision : undefined);
+        if (typeof expected === "string" && expected !== revision)
+          throw refuse("settings revision is stale", "STALE_REVISION");
+        const edits = officialSettingsEdits(args);
+        assertWritableSettingsEdits(settings, edits);
+        try {
+          await (dependencies.applyOfficialSettingsEdits ?? applyOfficialSettingsEdits)(config, edits);
+        } finally {
+          // Any partially applied batch must still republish; the next read
+          // re-derives the truth from the runtime rather than from this cache.
+          settingsMetadata = undefined;
+        }
+        return { revision: settingsRevision(await loadSettingsMetadata()) };
       },
     };
     projectRootForProject = projectId => official.projectRootForProject(projectId);
