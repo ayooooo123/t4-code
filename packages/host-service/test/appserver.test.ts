@@ -9,7 +9,12 @@ import { ensureSecureSocketDirectory } from "../src/ownership.ts";
 import { FileSessionDiscovery, realFs, stableProjectId } from "../src/discovery.ts";
 import { SessionProjection } from "../src/projection.ts";
 import { SessionOwnershipStore } from "../src/session-ownership-store.ts";
-import { appserverSupportedCapabilities, appserverSupportedFeatures, createAppserver } from "../src/server.ts";
+import {
+	appserverSupportedCapabilities,
+	appserverSupportedFeatures,
+	createAppserver,
+	safeSessionState,
+} from "../src/server.ts";
 import { SubagentProjection } from "../src/subagent-projection.ts";
 import type { ChildHandle, RpcChildFactory, SessionDiscovery, SessionRecord } from "../src/types.ts";
 import { RawUdsWebSocket } from "./raw-uds-client.ts";
@@ -357,6 +362,38 @@ describe("idempotency", () => {
 		store.complete(id, { value: 1 }, outcome);
 		expect(store.begin(id, { value: 1 })).toMatchObject({ kind: "replay" });
 		expect(store.begin(id, { value: 2 })).toMatchObject({ kind: "conflict" });
+	});
+});
+describe("official runtime state", () => {
+	const base = {
+		isStreaming: false,
+		isCompacting: false,
+		messageCount: 1,
+		queuedMessageCount: 0,
+		steeringMode: "one-at-a-time",
+		followUpMode: "all",
+		interruptMode: "wait",
+	};
+	test("reads fast mode from the official 17.2.x field names", () => {
+		// Stock OMP publishes no availability flag: `set_fast_mode` refuses a model
+		// that has no service tier, so the control is offered and the runtime
+		// decides. Availability is therefore true whenever fast state is reported.
+		expect(safeSessionState({ ...base, fastModeEnabled: true, fastModeActive: false })).toMatchObject({
+			fast: true,
+			fastAvailable: true,
+			fastActive: false,
+		});
+	});
+	test("keeps fork field names authoritative when both shapes arrive", () => {
+		expect(
+			safeSessionState({ ...base, fast: false, fastAvailable: false, fastActive: false, fastModeEnabled: true }),
+		).toMatchObject({ fast: false, fastAvailable: false, fastActive: false });
+	});
+	test("omits fast state entirely when the runtime reports none", () => {
+		const state = safeSessionState(base) as unknown as Record<string, unknown>;
+		expect(state).not.toHaveProperty("fast");
+		expect(state).not.toHaveProperty("fastAvailable");
+		expect(state).not.toHaveProperty("fastActive");
 	});
 });
 describe("appserver lifecycle", () => {
@@ -1039,7 +1076,7 @@ describe("appserver lifecycle", () => {
 			lockStatus: () => "missing",
 			lockCheck: async () => {},
 			claimLocklessSessions: true,
-			rpcDialect: "official-17.0.9",
+			rpcDialect: "official-17.2.4",
 		});
 		await appserver.start();
 		const client = await RawUdsWebSocket.connect(socketPath);

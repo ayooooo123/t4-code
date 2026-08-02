@@ -115,14 +115,18 @@ describe("official OMP capability adapter", () => {
     });
   });
 
-  test("rejects ambiguous and malformed capability updates", () => {
+  test("collapses ambiguous names and refuses an update with no decodable entry", () => {
     const adapter = new OfficialOmpCapabilityAdapter();
-    expect(() =>
-      adapter.update([
-        { name: "compact", source: "builtin" },
-        { name: "compact", source: "extension" },
-      ]),
-    ).toThrow("duplicate available command");
+    // Two sources claiming one name is not fatal: the first entry owns the name,
+    // so dispatch stays unambiguous without dropping the rest of the catalog.
+    const operations = adapter.update([
+      { name: "compact", source: "builtin" },
+      { name: "compact", source: "extension" },
+    ]);
+    expect(operations.filter((item) => item.operationId === "slash.compact")).toHaveLength(1);
+    expect(adapter.assertOperationSupported("slash.compact")).toMatchObject({
+      metadata: expect.objectContaining({ source: "builtin" }),
+    });
     expect(() =>
       adapter.update([{ name: "bad/name", source: "builtin" }]),
     ).toThrow("no valid entries");
@@ -135,17 +139,33 @@ describe("official OMP capability adapter", () => {
     expect(adapter.assertOperationSupported("slash.compact")).toMatchObject({ supported: true });
   });
 
-  test("ignores malformed live capability metadata without terminating prompt support", () => {
+  test("ignores an undecodable live update without terminating prompt support", () => {
     const adapter = new OfficialOmpCapabilityAdapter();
     adapter.update([{ name: "compact", description: "Compact context", source: "builtin" }]);
+    expect(
+      adapter.consume({
+        type: "available_commands_update",
+        commands: [{ name: "bad/name", description: "Unusable", source: "skill" }],
+      }),
+    ).toBe(true);
+    // The frame was accepted off the wire, the catalog it carried was not: the
+    // previously published capability still dispatches.
+    expect(adapter.assertPromptSupported("/compact now")).toMatchObject({
+      operationId: "slash.compact",
+      supported: true,
+    });
+  });
+
+  test("sanitizes control characters in a live update instead of dropping the command", () => {
+    const adapter = new OfficialOmpCapabilityAdapter();
     expect(
       adapter.consume({
         type: "available_commands_update",
         commands: [{ name: "skill:test", description: "Line one\0Line two", source: "skill" }],
       }),
     ).toBe(true);
-    expect(adapter.assertPromptSupported("/compact now")).toMatchObject({
-      operationId: "slash.compact",
+    expect(adapter.assertOperationSupported("slash.skill:test")).toMatchObject({
+      description: "Line oneLine two",
       supported: true,
     });
   });

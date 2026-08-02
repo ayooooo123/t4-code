@@ -12,8 +12,8 @@ const MAX_INBOUND_BYTES = 1024 * 1024;
 const MAX_FRAMES = 32;
 const SAFE_AGENT_ID_KEYS = ["agentId", "rootAgentId", "activeAgentId", "parentAgentId"];
 const CLUSTER_HOST = "t4-dev.tailb18de3.ts.net";
-const EXPECTED_OMP_VERSION = "17.0.9";
-const EXPECTED_OMP_BUILD = "639bac596d94b5993349f3f6696176cb2bf9b5d3";
+const EXPECTED_OMP_VERSION = "17.2.4";
+const EXPECTED_OMP_BUILD = "06343fef4200c4e32d18f08df5a6a8bd84dcc710";
 const REQUIRED_CAPABILITIES = Object.freeze([
   "sessions.read",
   "ci.trigger",

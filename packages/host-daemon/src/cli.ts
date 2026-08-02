@@ -22,8 +22,8 @@ import {
 import { COMMAND_DESCRIPTORS, isSecretLikeKey, type ProjectId, type SessionId } from "@t4-code/protocol";
 
 export const T4_HOST_VERSION = "0.1.32";
-export const OFFICIAL_OMP_VERSION = "17.0.9";
-export const OFFICIAL_OMP_BUILD = "639bac596d94b5993349f3f6696176cb2bf9b5d3";
+export const OFFICIAL_OMP_VERSION = "17.2.4";
+export const OFFICIAL_OMP_BUILD = "06343fef4200c4e32d18f08df5a6a8bd84dcc710";
 const PROFILE = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const ORIGIN_LIMIT = 32;
 // After the bridge dies we ask the appserver to stop, but a dead bridge can wedge that teardown; cap
@@ -49,6 +49,7 @@ const OFFICIAL_CATALOG_COMMANDS = Object.freeze([
   "session.model.set",
   "session.thinking.set",
   "session.cancel",
+  "session.fast.set",
   "settings.read",
   "settings.write",
   "session.close",
@@ -304,7 +305,12 @@ function globalLayerValue(document: unknown, path: string): unknown {
 function settingMetadataFromConfigEntry(path: string, entry: unknown, globalValue: unknown): Record<string, unknown> {
   const record = isRecord(entry) ? entry : {};
   const value = record.value;
-  const sensitive = isSecretLikeKey(path);
+  // OMP 17.2.x classifies credentials itself: a configured one arrives as
+  // `redacted` with no value, and anything it hands over in the clear is by its
+  // own verdict not a credential. The name heuristic therefore only decides the
+  // unset rows, where the runtime cannot tell us either way and no value is at
+  // risk — without it, `commit.mapReduceMaxFileTokens` would read as a secret.
+  const sensitive = record.redacted === true || (value === undefined && isSecretLikeKey(path));
   const configured = globalValue !== undefined;
   const placement = settingPlacement(path);
   const metadata: Record<string, unknown> = {
@@ -852,7 +858,7 @@ export async function runHostDaemon(
       ...(transcriptImageRoot ? { transcriptImageRoot } : {}),
       rpcChildInvocation: sessionRpcChildInvocation(config),
       rpcChildEnvironment: { OMP_PROFILE: config.profileId },
-      ...(config.authorityMode === "official" ? { rpcDialect: "official-17.0.9" as const } : {}),
+      ...(config.authorityMode === "official" ? { rpcDialect: "official-17.2.4" as const } : {}),
       ...(process.platform === "darwin"
         ? {
             projectRevealer: async (root: string): Promise<boolean> => {

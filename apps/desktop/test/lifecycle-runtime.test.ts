@@ -829,7 +829,7 @@ describe("desktop Electron lifecycle", () => {
       probes += 1;
       return false;
     }, {
-      discoverExecutable: async () => "/opt/t4/runtime/v17.0.9/omp",
+      discoverExecutable: async () => "/opt/t4/runtime/v17.2.4/omp",
       createServiceManager: (options) => {
         argv = options.argv;
         return service;
@@ -841,7 +841,7 @@ describe("desktop Electron lifecycle", () => {
     expect(argv).toEqual([
       "serve",
       "--omp",
-      "/opt/t4/runtime/v17.0.9/omp",
+      "/opt/t4/runtime/v17.2.4/omp",
       "--profile",
       "default",
       "--omp-authority",

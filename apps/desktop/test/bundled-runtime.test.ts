@@ -38,13 +38,13 @@ describe("bundled OMP runtime", () => {
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     await writeFile(join(runtimeRoot, "omp"), bytes);
     await writeFile(join(runtimeRoot, "manifest.json"), JSON.stringify({
-      version: 1, tag: "v17.0.9", platform: "darwin", arch: "arm64",
+      version: 1, tag: "v17.2.4", platform: "darwin", arch: "arm64",
       executable: "omp", size: bytes.length, sha256,
     }));
 
     const installed = await installBundledOmpRuntime({ resourcesPath, applicationSupportPath: supportPath });
 
-    expect(installed).toBe(join(supportPath, "runtime", "v17.0.9", "omp"));
+    expect(installed).toBe(join(supportPath, "runtime", "v17.2.4", "omp"));
     expect(await readFile(installed)).toEqual(bytes);
   });
 

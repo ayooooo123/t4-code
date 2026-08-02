@@ -2,36 +2,36 @@
   "appProtocol": "omp-app/1",
   "officialRuntime": {
     "package": "omp",
-    "version": "17.0.9",
+    "version": "17.2.4",
     "sourceRepository": "https://github.com/can1357/oh-my-pi",
-    "sourceCommit": "639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceTag": "v17.0.9",
+    "sourceCommit": "06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceTag": "v17.2.4",
     "artifacts": {
       "darwin-arm64": {
         "name": "omp-darwin-arm64",
-        "size": 121901952,
-        "sha256": "dd1430ba4809a55f4d6f2f646211cee51535f9619eb6670f1bfcf7484c23b931"
+        "size": 125352960,
+        "sha256": "f39d256c6b2ece7f2eb85c24fc47ffbe39a1796ea6eea2605ad564fce42c408e"
       },
       "darwin-x64": {
         "name": "omp-darwin-x64",
-        "size": 127378672,
-        "sha256": "b3fb6ea340d5eec33adcdae8e1e9923925599c1068c83a51fa5b3a02dd4f2c32"
+        "size": 131556208,
+        "sha256": "997bc0c98ac2bd3010bf86fde3b75347832dd5c110bc6c603ace67e70a249f95"
       },
       "linux-arm64": {
         "name": "omp-linux-arm64",
-        "size": 151496848,
-        "sha256": "c29907233107fc57ae18f81e91877431f69252ba071936b5c6672592d84cc984"
+        "size": 155429008,
+        "sha256": "ac473cbf61cc1a2607d2883930e641e15e8e79da2cdd42ffec8d701ad85a219c"
       },
       "linux-x64": {
         "name": "omp-linux-x64",
-        "size": 176400512,
-        "sha256": "485cc301d6fdff26bab5d3ab45ab137634a73b71b2ed7a91c6c8545842ff4c09"
+        "size": 183978112,
+        "sha256": "a6e7086f3b807f68a5b08b49597f4349e5ce37365639b7af5e9c8fe359989840"
       },
       "win32-x64": {
         "name": "omp-windows-x64.exe",
-        "size": 155415040,
-        "sha256": "feeb48925791b267dc35912e26e95af4fab66e213ad8dfcfc73ff82ab2c8e84d"
+        "size": 159698432,
+        "sha256": "1ae3b28c96a5653af1ef7dd444d570c755501c5526c34d2e81809511f5b6e045"
       }
     }
   },
@@ -54,71 +54,71 @@
   },
   "publishedRuntime": {
     "package": "omp",
-    "version": "17.0.9",
+    "version": "17.2.4",
     "sourceRepository": "https://github.com/can1357/oh-my-pi",
-    "sourceCommit": "639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceTag": "v17.0.9",
+    "sourceCommit": "06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceTag": "v17.2.4",
     "artifacts": {
       "darwin-arm64": {
         "name": "omp-darwin-arm64",
-        "size": 121901952,
-        "sha256": "dd1430ba4809a55f4d6f2f646211cee51535f9619eb6670f1bfcf7484c23b931"
+        "size": 125352960,
+        "sha256": "f39d256c6b2ece7f2eb85c24fc47ffbe39a1796ea6eea2605ad564fce42c408e"
       },
       "darwin-x64": {
         "name": "omp-darwin-x64",
-        "size": 127378672,
-        "sha256": "b3fb6ea340d5eec33adcdae8e1e9923925599c1068c83a51fa5b3a02dd4f2c32"
+        "size": 131556208,
+        "sha256": "997bc0c98ac2bd3010bf86fde3b75347832dd5c110bc6c603ace67e70a249f95"
       },
       "linux-arm64": {
         "name": "omp-linux-arm64",
-        "size": 151496848,
-        "sha256": "c29907233107fc57ae18f81e91877431f69252ba071936b5c6672592d84cc984"
+        "size": 155429008,
+        "sha256": "ac473cbf61cc1a2607d2883930e641e15e8e79da2cdd42ffec8d701ad85a219c"
       },
       "linux-x64": {
         "name": "omp-linux-x64",
-        "size": 176400512,
-        "sha256": "485cc301d6fdff26bab5d3ab45ab137634a73b71b2ed7a91c6c8545842ff4c09"
+        "size": 183978112,
+        "sha256": "a6e7086f3b807f68a5b08b49597f4349e5ce37365639b7af5e9c8fe359989840"
       },
       "win32-x64": {
         "name": "omp-windows-x64.exe",
-        "size": 155415040,
-        "sha256": "feeb48925791b267dc35912e26e95af4fab66e213ad8dfcfc73ff82ab2c8e84d"
+        "size": 159698432,
+        "sha256": "1ae3b28c96a5653af1ef7dd444d570c755501c5526c34d2e81809511f5b6e045"
       }
     }
   },
   "verifiedRuntime": {
     "package": "omp",
-    "version": "17.0.9",
+    "version": "17.2.4",
     "sourceRepository": "https://github.com/can1357/oh-my-pi",
-    "sourceCommit": "639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/639bac596d94b5993349f3f6696176cb2bf9b5d3",
-    "sourceTag": "v17.0.9",
+    "sourceCommit": "06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceUrl": "https://github.com/can1357/oh-my-pi/commit/06343fef4200c4e32d18f08df5a6a8bd84dcc710",
+    "sourceTag": "v17.2.4",
     "artifacts": {
       "darwin-arm64": {
         "name": "omp-darwin-arm64",
-        "size": 121901952,
-        "sha256": "dd1430ba4809a55f4d6f2f646211cee51535f9619eb6670f1bfcf7484c23b931"
+        "size": 125352960,
+        "sha256": "f39d256c6b2ece7f2eb85c24fc47ffbe39a1796ea6eea2605ad564fce42c408e"
       },
       "darwin-x64": {
         "name": "omp-darwin-x64",
-        "size": 127378672,
-        "sha256": "b3fb6ea340d5eec33adcdae8e1e9923925599c1068c83a51fa5b3a02dd4f2c32"
+        "size": 131556208,
+        "sha256": "997bc0c98ac2bd3010bf86fde3b75347832dd5c110bc6c603ace67e70a249f95"
       },
       "linux-arm64": {
         "name": "omp-linux-arm64",
-        "size": 151496848,
-        "sha256": "c29907233107fc57ae18f81e91877431f69252ba071936b5c6672592d84cc984"
+        "size": 155429008,
+        "sha256": "ac473cbf61cc1a2607d2883930e641e15e8e79da2cdd42ffec8d701ad85a219c"
       },
       "linux-x64": {
         "name": "omp-linux-x64",
-        "size": 176400512,
-        "sha256": "485cc301d6fdff26bab5d3ab45ab137634a73b71b2ed7a91c6c8545842ff4c09"
+        "size": 183978112,
+        "sha256": "a6e7086f3b807f68a5b08b49597f4349e5ce37365639b7af5e9c8fe359989840"
       },
       "win32-x64": {
         "name": "omp-windows-x64.exe",
-        "size": 155415040,
-        "sha256": "feeb48925791b267dc35912e26e95af4fab66e213ad8dfcfc73ff82ab2c8e84d"
+        "size": 159698432,
+        "sha256": "1ae3b28c96a5653af1ef7dd444d570c755501c5526c34d2e81809511f5b6e045"
       }
     }
   },

@@ -311,6 +311,27 @@ function controlModel(
 
 // ─── Row mapping ───────────────────────────────────────────────────────────
 
+/**
+ * True when a row is a switch or a number and every value it ships is one too,
+ * so no credential text can hide behind a credential-shaped id.
+ */
+function carriesOnlyScalarFlags(raw: Record<string, unknown>, declaredKind: string): boolean {
+  if (declaredKind !== "boolean" && declaredKind !== "number") return false;
+  const scalar = (value: unknown): boolean =>
+    value === undefined || typeof value === "boolean" || typeof value === "number";
+  if (!scalar(raw.default)) return false;
+  const layers = raw.layers;
+  if (layers === undefined) return true;
+  if (typeof layers !== "object" || layers === null || Array.isArray(layers)) return false;
+  return Object.values(layers as Record<string, unknown>).every((layer) => {
+    if (layer === undefined || layer === null) return true;
+    if (typeof layer !== "object" || Array.isArray(layer)) return false;
+    const holder = layer as Record<string, unknown>;
+    // A secret status block is text by nature; never wave one through here.
+    return holder.secret === undefined && scalar(holder.value);
+  });
+}
+
 function settingRow(
   input: unknown,
   path: string,
@@ -337,7 +358,11 @@ function settingRow(
     if (raw.default !== undefined) {
       fail("SECRET_VALUE", `${path}.default`, "sensitive settings must not ship values");
     }
-  } else if (SECRET_LIKE_ID.test(id)) {
+  } else if (SECRET_LIKE_ID.test(id) && !carriesOnlyScalarFlags(raw, declaredKind)) {
+    // A credential-shaped id must be a secret reference — unless the row is a
+    // switch or a number and every value it ships is one too. `secrets.enabled`
+    // and `commit.maxFileTokens` read as credentials to the pattern but cannot
+    // carry one, and refusing them would take the whole catalog down with them.
     fail("SECRET_VALUE", `${path}.id`, `"${id}" looks like a credential but is not a secret reference`);
   }
 

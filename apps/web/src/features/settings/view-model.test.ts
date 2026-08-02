@@ -181,6 +181,36 @@ describe("secret safety", () => {
       ),
     ).toThrowError(/SECRET_VALUE/);
   });
+
+  it("allows a credential-shaped id when the row is a switch that ships no text", () => {
+    const model = buildSettingsViewModel(
+      catalogWith({
+        id: "secrets.enabled",
+        section: "general",
+        label: "Scrub secrets",
+        help: "Replace credential-shaped tokens before they reach a model.",
+        control: { kind: "boolean" },
+        default: false,
+        layers: { global: { value: true } },
+      }),
+    );
+    expect(model.rowsById.get("secrets.enabled")).toMatchObject({ control: { kind: "boolean" } });
+  });
+
+  it("still rejects a credential-shaped switch that smuggles text through a layer", () => {
+    expect(() =>
+      buildSettingsViewModel(
+        catalogWith({
+          id: "secrets.enabled",
+          section: "general",
+          label: "Scrub secrets",
+          help: "Help.",
+          control: { kind: "boolean" },
+          layers: { global: { value: "sk-live-not-a-flag" } },
+        }),
+      ),
+    ).toThrowError(/SECRET_VALUE/);
+  });
 });
 
 describe("unsafe metadata rejection", () => {

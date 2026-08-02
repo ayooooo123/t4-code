@@ -441,7 +441,7 @@ function argumentError(command: CommandFrame): string | undefined {
 	if (keys.length !== 0) return "command does not accept args";
 	return undefined;
 }
-function safeSessionState(value: unknown): SessionStateResult {
+export function safeSessionState(value: unknown): SessionStateResult {
 	const raw =
 		value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 	if (!raw) throw new Error("rpc state is not an object");
@@ -491,9 +491,26 @@ function safeSessionState(value: unknown): SessionStateResult {
 		...(raw.thinkingLevels === undefined ? {} : { thinkingLevels: raw.thinkingLevels }),
 		...(raw.thinkingSupported === undefined ? {} : { thinkingSupported: raw.thinkingSupported }),
 		...(raw.thinkingOffFloored === undefined ? {} : { thinkingOffFloored: raw.thinkingOffFloored }),
-		...(typeof raw.fast === "boolean" ? { fast: raw.fast } : {}),
-		...(raw.fastAvailable === undefined ? {} : { fastAvailable: raw.fastAvailable }),
-		...(raw.fastActive === undefined ? {} : { fastActive: raw.fastActive }),
+		// Official OMP 17.2.x reports fast mode as `fastModeEnabled`/`fastModeActive`
+		// and publishes no per-model availability flag: `set_fast_mode` answers with
+		// an error when the current model family has no service tier. The control is
+		// therefore offered whenever the host reports fast state at all, and a model
+		// that cannot take it refuses the command instead of hiding the toggle.
+		...(typeof raw.fast === "boolean"
+			? { fast: raw.fast }
+			: typeof raw.fastModeEnabled === "boolean"
+				? { fast: raw.fastModeEnabled }
+				: {}),
+		...(raw.fastAvailable !== undefined
+			? { fastAvailable: raw.fastAvailable }
+			: typeof raw.fastModeEnabled === "boolean"
+				? { fastAvailable: true }
+				: {}),
+		...(raw.fastActive !== undefined
+			? { fastActive: raw.fastActive }
+			: typeof raw.fastModeActive === "boolean"
+				? { fastActive: raw.fastModeActive }
+				: {}),
 		...(typeof raw.sessionName === "string" ? { sessionName: raw.sessionName } : {}),
 		...(context
 			? { contextUsage: { used: context.used ?? context.tokens, limit: context.limit ?? context.contextWindow } }
@@ -1096,9 +1113,11 @@ export class LocalAppserver implements AppserverHandle {
 	}
 
 	#directRpcCommandSupported(command: string): boolean {
+		// Official OMP has never exposed retry/pause/resume over RPC. It gained
+		// `set_fast_mode` in 17.2.0, so fast mode is the one control that leaves
+		// the fork-only list for the official dialect.
 		return (
-			this.#rpcDialect === "fork" ||
-			!["session.retry", "session.pause", "session.resume", "session.fast.set"].includes(command)
+			this.#rpcDialect === "fork" || !["session.retry", "session.pause", "session.resume"].includes(command)
 		);
 	}
 
@@ -1119,11 +1138,13 @@ export class LocalAppserver implements AppserverHandle {
 									? "set_model"
 									: command.command === "session.thinking.set"
 										? "set_thinking_level"
-										: "set_fast";
+										: this.#rpcDialect === "official-17.2.4"
+											? "set_fast_mode"
+											: "set_fast";
 		if (command.command === "session.compact") return { type, customInstructions: command.args.instructions };
 		if (command.command === "session.rename") return { type, name: command.args.name };
 		if (command.command === "session.model.set") {
-			if (this.#rpcDialect === "official-17.0.9") {
+			if (this.#rpcDialect === "official-17.2.4") {
 				if (
 					command.args.persistence !== "session" ||
 					typeof command.args.selector !== "string" ||

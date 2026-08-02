@@ -351,7 +351,7 @@ describe("T4 host daemon CLI", () => {
     expect(captured).toMatchObject({
       ompVersion: OFFICIAL_OMP_VERSION,
       ompBuild: OFFICIAL_OMP_BUILD,
-      rpcDialect: "official-17.0.9",
+      rpcDialect: "official-17.2.4",
       claimLocklessSessions: true,
       sessionOwnershipPath: expect.stringContaining("/owned-sessions.json"),
     });
@@ -414,7 +414,8 @@ describe("T4 host daemon CLI", () => {
       }),
     );
     expect(commandNames).toContain("session.model.set");
-    expect(commandNames).not.toContain("session.fast.set");
+    // Official OMP gained `set_fast_mode` in 17.2.0; retry stays fork-only.
+    expect(commandNames).toContain("session.fast.set");
     expect(commandNames).not.toContain("session.retry");
     expect(commandNames).toContain("settings.read");
     const settings = await operations.settingsRead?.();
@@ -463,7 +464,11 @@ describe("T4 host daemon CLI", () => {
         "power.sleepPrevention": { value: "idle", type: "enum", description: "Prevent sleep" },
         modelRoles: { value: { smol: "anthropic/claude-haiku-4-5" }, type: "record", description: "" },
         "auth.broker.token": { type: "string", description: "" },
-        "providers.headers": { value: { authorization: "Bearer x" }, type: "record", description: "" },
+        // 17.2.x names the credential itself; this path defeats the name heuristic.
+        "providers.exa.key": { redacted: true, type: "string", description: "" },
+        "dev.autoqaPush.enabled": { value: "plain", type: "string", description: "" },
+        // A numeric limit whose name merely contains "tokens" is not a secret.
+        "commit.mapReduceMaxFileTokens": { value: 24000, type: "number", description: "" },
       },
       { theme: { dark: "titanium" }, modelRoles: { smol: "anthropic/claude-haiku-4-5" } },
     ) as Record<string, Record<string, unknown>>;
@@ -505,6 +510,11 @@ describe("T4 host daemon CLI", () => {
     expect(settings["auth.broker.token"]).not.toHaveProperty("effective");
     expect(settings["providers.headers"]).not.toHaveProperty("effective");
     expect(settings["providers.headers"]).not.toHaveProperty("default");
+    // The runtime's own `redacted` verdict wins where the name heuristic is blind.
+    expect(settings["providers.exa.key"]).toMatchObject({ sensitive: true });
+    expect(settings["providers.exa.key"]).not.toHaveProperty("default");
+    expect(settings["dev.autoqaPush.enabled"]).toMatchObject({ sensitive: false, default: "plain" });
+    expect(settings["commit.mapReduceMaxFileTokens"]).toMatchObject({ sensitive: false, default: 24000 });
     // Only the machine-wide layer is writable through this authority.
     for (const row of Object.values(settings)) expect(row.scopes).toEqual(["global"]);
   });

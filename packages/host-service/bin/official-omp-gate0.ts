@@ -480,7 +480,7 @@ async function runCancellationScenario(input: {
   readonly workspace: string;
   readonly profile: string;
   readonly model: DeterministicModel;
-}): Promise<{ accepted: boolean; agentSettled: boolean }> {
+}): Promise<{ accepted: boolean; agentSettled: boolean; settledBeforeAck: boolean }> {
   const rpc = launchRpc(input.runtimePath, join(input.root, "cancel.jsonl"), input.workspace, input.profile);
   let stopped = false;
   const gate = input.model.gateNextRequest();
@@ -499,12 +499,17 @@ async function runCancellationScenario(input: {
       "abort acceptance",
     );
     assertAccepted(abortFrames, "cancel-abort", "abort");
-    const agentSettled = abortFrames.some((frame) => frame.type === "agent_end");
-    if (!agentSettled) throw new Error("abort acknowledgment arrived before agent settlement");
+    // 17.2.0 acknowledges the abort before the agent settles (it no longer waits
+    // out an in-flight session_stop handler). Either order is acceptable; what
+    // the adapter needs is that the agent does settle, because the projection
+    // leaves the running state on `agent_end`, not on the ack.
+    const settledBeforeAck = abortFrames.some((frame) => frame.type === "agent_end");
     gate.release();
+    if (!settledBeforeAck)
+      await rpc.waitFor((frame) => frame.type === "agent_end", "agent settlement after abort");
     await stopRpc(rpc);
     stopped = true;
-    return { accepted: true, agentSettled };
+    return { accepted: true, agentSettled: true, settledBeforeAck };
   } finally {
     gate.release();
     if (!stopped) {

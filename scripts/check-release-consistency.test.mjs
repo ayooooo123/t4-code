@@ -94,9 +94,9 @@ test("rejects duplicate keys in JSON release contracts", () => {
 test("promotes the verified runtime into the product release", () => {
   const matrix = JSON.parse(files.get("compat/omp-app-matrix.json"));
   assert.equal(matrix.verifiedRuntime.sourceRepository, "https://github.com/can1357/oh-my-pi");
-  assert.equal(matrix.verifiedRuntime.sourceTag, "v17.0.9");
+  assert.equal(matrix.verifiedRuntime.sourceTag, "v17.2.4");
   assert.equal(matrix.publishedRuntime.sourceRepository, "https://github.com/can1357/oh-my-pi");
-  assert.equal(matrix.publishedRuntime.sourceTag, "v17.0.9");
+  assert.equal(matrix.publishedRuntime.sourceTag, "v17.2.4");
   assert.deepEqual(matrix.publishedRuntime, matrix.verifiedRuntime);
 });
 

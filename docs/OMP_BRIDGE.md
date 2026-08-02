@@ -52,10 +52,10 @@ The simplified rollout does not weaken the hard boundaries. We retain strict pro
 
 ## Released product state
 
-T4 v0.1.32 is paired with immutable official OMP tag `v17.0.9` at commit `639bac596d94b5993349f3f6696176cb2bf9b5d3`. Its published Apple Silicon binary is 121,901,952 bytes with SHA-256 `dd1430ba4809a55f4d6f2f646211cee51535f9619eb6670f1bfcf7484c23b931`.
+T4 v0.1.32 is paired with immutable official OMP tag `v17.2.4` at commit `06343fef4200c4e32d18f08df5a6a8bd84dcc710`. Its published Apple Silicon binary is 125,352,960 bytes with SHA-256 `f39d256c6b2ece7f2eb85c24fc47ffbe39a1796ea6eea2605ad564fce42c408e`.
 
 The standalone OMP release is pinned as upstream provenance; the protected T4 product build remains the distribution-signing boundary and signs both the bundled OMP executable and `t4-host` with T4's Developer ID identity before shipping the macOS app.
 
-That bridge release moves the running network host into the standalone T4 executable and removes OMP's public legacy launchers. The thin bridge and standalone host pass a compiled-binary end-to-end smoke test. The compatibility matrix records `v17.0.9` as both the verified and published pairing for the T4 product build.
+That bridge release moves the running network host into the standalone T4 executable and removes OMP's public legacy launchers. The thin bridge and standalone host pass a compiled-binary end-to-end smoke test. The compatibility matrix records `v17.2.4` as both the verified and published pairing for the T4 product build.
 
 The old `wolfiesch/oh-my-pi` integration fork is no longer the active released runtime. The earlier `lyc-aon/oh-my-pi` repository remains only as frozen provenance for the app-wire package and host-source migration recorded in `provenance/omp-host-migration.json`.

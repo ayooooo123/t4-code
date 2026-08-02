@@ -16,8 +16,8 @@ const MAX_COMMAND_INPUT_HINT_BYTES = 512;
 const MAX_COMMAND_SOURCE_BYTES = 64;
 
 export const OFFICIAL_OMP_TERMINAL_ONLY_EVIDENCE = Object.freeze({
-  packageVersion: "17.0.9",
-  sourceCommit: "639bac596d94b5993349f3f6696176cb2bf9b5d3",
+  packageVersion: "17.2.4",
+  sourceCommit: "06343fef4200c4e32d18f08df5a6a8bd84dcc710",
 });
 
 interface TerminalOnlyCommand {

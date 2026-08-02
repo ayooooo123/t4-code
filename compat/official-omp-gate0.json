@@ -2,11 +2,15 @@
   "schemaVersion": 1,
   "gate": "official-omp-gate0",
   "runtime": {
-    "version": "17.0.9",
-    "tag": "v17.0.9",
-    "commit": "639bac596d94b5993349f3f6696176cb2bf9b5d3"
+    "version": "17.2.4",
+    "tag": "v17.2.4",
+    "commit": "06343fef4200c4e32d18f08df5a6a8bd84dcc710"
   },
-  "requiredPlatforms": ["darwin-arm64", "linux-x64", "linux-arm64"],
+  "requiredPlatforms": [
+    "darwin-arm64",
+    "linux-x64",
+    "linux-arm64"
+  ],
   "requiredScenarios": [
     "lifecycle",
     "crash-resume",
@@ -39,8 +43,18 @@
     "durableCommandKey": false
   },
   "packagedHostProof": {
-    "requiredPlatforms": ["darwin-arm64", "linux-x64", "linux-arm64"],
-    "requiredScenarios": ["discovery", "attach", "prompt", "durable-jsonl", "t4-wire-projection"],
+    "requiredPlatforms": [
+      "darwin-arm64",
+      "linux-x64",
+      "linux-arm64"
+    ],
+    "requiredScenarios": [
+      "discovery",
+      "attach",
+      "prompt",
+      "durable-jsonl",
+      "t4-wire-projection"
+    ],
     "authorityMode": "official-exclusive-profile",
     "releasedDefault": "official-omp-authority"
   },

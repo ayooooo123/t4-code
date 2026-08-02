@@ -100,7 +100,7 @@ describe("service-manager definitions", () => {
       argv: [
         "serve",
         "--omp",
-        "/opt/t4/runtime/v17.0.9/omp",
+        "/opt/t4/runtime/v17.2.4/omp",
         "--profile",
         "default",
         "--omp-authority",

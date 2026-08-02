@@ -1206,8 +1206,10 @@ test("lazy discovery reads a bounded preview and hydrates only the selected tran
 		const loaded = await discovery.load(preview);
 		expect(loaded.entriesLoaded).not.toBe(false);
 		expect(loaded.entries.map(entry => entry.kind)).toEqual(["message"]);
+		// list() stays an inventory even after a hydrate: the cached full record is
+		// stripped on the way out so session.list can never grow a transcript.
 		const [cached] = await discovery.list();
-		expect(cached?.entries.map(entry => entry.kind)).toEqual(["message"]);
+		expect(cached).toMatchObject({ title: "Lazy title", entriesLoaded: false, entries: [] });
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
