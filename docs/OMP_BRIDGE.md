@@ -52,10 +52,10 @@ The simplified rollout does not weaken the hard boundaries. We retain strict pro
 
 ## Released product state
 
-T4 v0.1.30 is paired with immutable OMP tag `t4code-17.0.5-appserver-10` at commit `8476f4451ed95c5d5401785d279a93d3c659fac4`. Its published Apple Silicon binary is 120,893,008 bytes with SHA-256 `f7d4438e163aabc4ca624468bf5bd4a243b5e1ab5360e84cef52abe93683ea55`.
+T4 v0.1.30 is paired with immutable OMP tag `t4code-17.0.5-appserver-12` at commit `6c2ba3d210bde6656382b312ec99b2fad5dcde71`. Its published Apple Silicon binary is 120,893,008 bytes with SHA-256 `642dfb86f68afb6fcc44ad4e2b5ad2acbefc9e50b915e04dab69e1bd849461aa`.
 
 The standalone OMP release carries an ad-hoc integrity signature because the fork release workflow does not have a Developer ID identity. The protected T4 product build remains the distribution-signing boundary: it must sign both the bundled OMP executable and `t4-host` with T4's Developer ID identity before shipping the macOS app.
 
-That bridge release moves the running network host into the standalone T4 executable and removes OMP's public legacy launchers. The thin bridge and standalone host pass a compiled-binary end-to-end smoke test. The compatibility matrix records `appserver-10` as both the verified and published pairing for the T4 product build.
+That bridge release moves the running network host into the standalone T4 executable and removes OMP's public legacy launchers. The thin bridge and standalone host pass a compiled-binary end-to-end smoke test. The compatibility matrix records `appserver-12` as both the verified and published pairing for the T4 product build.
 
 This reduces the fork to the OMP-specific authority adapter and protocol glue, but does not remove the fork entirely. T4 still pins the exact Lycaon OMP source and binary because the bridge is not part of ordinary upstream OMP.

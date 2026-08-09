@@ -56,7 +56,7 @@ This matrix is intentionally stricter than “the protocol supports it.” A row
 | Source | Audited ref | Why it matters |
 |---|---|---|
 | Original OMP | [`can1357/oh-my-pi@89d6a8f6`](https://github.com/can1357/oh-my-pi/commit/89d6a8f6d14286f32f09ec9c8aa8af7b3451d2d6), version 17.0.6 | Current original product surface |
-| Lycaon OMP fork | [`lyc-aon/oh-my-pi@8476f445`](https://github.com/lyc-aon/oh-my-pi/commit/8476f4451ed95c5d5401785d279a93d3c659fac4), tag [`t4code-17.0.5-appserver-10`](https://github.com/lyc-aon/oh-my-pi/releases/tag/t4code-17.0.5-appserver-10) | Current released thin authority bridge; transitional compatibility input |
+| Lycaon OMP fork | [`ayooooo123/oh-my-pi@6c2ba3d2`](https://github.com/ayooooo123/oh-my-pi/commit/6c2ba3d210bde6656382b312ec99b2fad5dcde71), tag [`t4code-17.0.5-appserver-12`](https://github.com/ayooooo123/oh-my-pi/releases/tag/t4code-17.0.5-appserver-12) | Current released thin authority bridge; transitional compatibility input |
 | Shared upstream base | [`can1357/oh-my-pi@9fd6e971`](https://github.com/can1357/oh-my-pi/commit/9fd6e97113f5ed3a847e66d346970efdf8afcad9), version 17.0.5 | Last shared OMP point |
 | T4 `main` | [`210ddfcb`](https://github.com/LycaonLLC/t4-code/commit/210ddfcb11b84da89b2c4b079a9517901168fa37), version 0.1.30 in source | Official-OMP classification, capability-aware clients, Flutter controls, and cluster foundations are merged |
 | Flutter merge | [`LycaonLLC/t4-code#104`](https://github.com/LycaonLLC/t4-code/pull/104) | New shared desktop/mobile client now on `main` |

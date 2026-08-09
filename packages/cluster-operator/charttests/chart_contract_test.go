@@ -612,8 +612,8 @@ func TestImageContractsArePinnedAndAuthorityCompatible(t *testing.T) {
 		}
 	}
 	assertContains(t, session,
-		"8476f4451ed95c5d5401785d279a93d3c659fac4",
-		"t4code-17.0.5-appserver-10",
+		"6c2ba3d210bde6656382b312ec99b2fad5dcde71",
+		"t4code-17.0.5-appserver-12",
 		"t4-omp-authority/1",
 		"session-entrypoint.sh",
 		"chromium",
@@ -630,8 +630,8 @@ func TestImageContractsArePinnedAndAuthorityCompatible(t *testing.T) {
 		t.Fatal("session runtime permits overriding a labeled runtime pin")
 	}
 	assertContains(t, session,
-		"refs/tags/t4code-17.0.5-appserver-10",
-		"git checkout --detach \"8476f4451ed95c5d5401785d279a93d3c659fac4\"",
+		"refs/tags/t4code-17.0.5-appserver-12",
+		"git checkout --detach \"6c2ba3d210bde6656382b312ec99b2fad5dcde71\"",
 		"snapshot.debian.org/archive/debian/20250721T000000Z",
 	)
 	assertContains(t, server, "snapshot.debian.org/archive/debian/20250721T000000Z")

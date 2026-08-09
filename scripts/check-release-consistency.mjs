@@ -39,7 +39,8 @@ export const RELEASE_CONTRACT_PATHS = [
 ];
 
 const REPOSITORY_URL = "https://github.com/LycaonLLC/t4-code";
-const OMP_RUNTIME_REPOSITORY = "https://github.com/lyc-aon/oh-my-pi";
+const OMP_RUNTIME_REPOSITORY = "https://github.com/ayooooo123/oh-my-pi";
+const OMP_APPWIRE_REPOSITORY = "https://github.com/lyc-aon/oh-my-pi";
 const OMP_UPSTREAM_REPOSITORY = "https://github.com/can1357/oh-my-pi";
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/u;
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
@@ -510,8 +511,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   if (typeof appWireVersion !== "string" || !VERSION_PATTERN.test(appWireVersion)) {
     errors.push(`${matrixPath} app-wire version must be a stable x.y.z version`);
   }
-  if (appWire?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
-    errors.push(`${matrixPath} app-wire repository must be ${OMP_RUNTIME_REPOSITORY}`);
+  if (appWire?.sourceRepository !== OMP_APPWIRE_REPOSITORY) {
+    errors.push(`${matrixPath} app-wire repository must be ${OMP_APPWIRE_REPOSITORY}`);
   }
   if (!SHA_PATTERN.test(appWireSourceCommit)) {
     errors.push(`${matrixPath} app-wire commit must be a lowercase 40-character Git SHA`);
@@ -528,8 +529,8 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   ) {
     errors.push(`${matrixPath} published app-wire version must be a stable x.y.z version`);
   }
-  if (publishedAppWire?.sourceRepository !== OMP_RUNTIME_REPOSITORY) {
-    errors.push(`${matrixPath} published app-wire repository must be ${OMP_RUNTIME_REPOSITORY}`);
+  if (publishedAppWire?.sourceRepository !== OMP_APPWIRE_REPOSITORY) {
+    errors.push(`${matrixPath} published app-wire repository must be ${OMP_APPWIRE_REPOSITORY}`);
   }
   if (!SHA_PATTERN.test(publishedAppWireSourceCommit)) {
     errors.push(`${matrixPath} published app-wire commit must be a lowercase 40-character Git SHA`);
@@ -730,7 +731,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   requireText(
     site,
-    "export const OMP_RUNTIME_URL = `https://github.com/lyc-aon/oh-my-pi/tree/${OMP_RUNTIME_TAG}`;",
+    "export const OMP_RUNTIME_URL = `https://github.com/ayooooo123/oh-my-pi/tree/${OMP_RUNTIME_TAG}`;",
     "apps/site/src/release.ts",
     errors,
   );
@@ -783,7 +784,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   );
   requireText(
     readme,
-    `T4 Code vendors \`@oh-my-pi/app-wire\` ${publishedAppWireVersion} from integration commit [\`${publishedAppWireSourceCommit.slice(0, 8)}\`](${OMP_RUNTIME_REPOSITORY}/commit/${publishedAppWireSourceCommit}), source tree \`${publishedAppWireSourceTree}\`.`,
+    `T4 Code vendors \`@oh-my-pi/app-wire\` ${publishedAppWireVersion} from integration commit [\`${publishedAppWireSourceCommit.slice(0, 8)}\`](${OMP_APPWIRE_REPOSITORY}/commit/${publishedAppWireSourceCommit}), source tree \`${publishedAppWireSourceTree}\`.`,
     "README.md",
     errors,
   );
@@ -812,7 +813,7 @@ export function collectReleaseConsistencyErrors(files, releaseTag) {
   const releaseNotes = files.get("docs/CURRENT_RELEASE_NOTES.md") ?? "";
   for (const expected of [
     `app-wire ${publishedAppWireVersion}`,
-    `[${publishedAppWireSourceCommit.slice(0, 8)}](${OMP_RUNTIME_REPOSITORY}/commit/${publishedAppWireSourceCommit})`,
+    `[${publishedAppWireSourceCommit.slice(0, 8)}](${OMP_APPWIRE_REPOSITORY}/commit/${publishedAppWireSourceCommit})`,
     `OMP ${ompRuntimeVersion}`,
     `[${String(ompRuntimeCommit).slice(0, 8)}](${ompRuntimeCommitUrl})`,
     `[${ompRuntimeSourceTag}](${ompRuntimeSourceUrl})`,
