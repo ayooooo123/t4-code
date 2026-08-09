@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hostId, projectId, sessionId, type ServerFrame } from "@t4-code/host-wire";
+import { hostId, projectId, sessionId, entryId, type ServerFrame } from "@t4-code/host-wire";
 import { createAppserver } from "../src/server.ts";
 import type { ChildHandle, RpcChildFactory, SessionLockStatus, SessionRecord } from "../src/types.ts";
 import { RawUdsWebSocket } from "./raw-uds-client.ts";
@@ -213,13 +213,31 @@ test("attached catalog refresh and terminal-only rejection stay on the runtime b
     updatedAt: "2026-07-20T00:00:00.000Z",
     status: "idle",
     entries: [],
+    entriesLoaded: false,
   };
   const factory = new CapabilityRpcFactory();
   const appserver = createAppserver({
     hostId: host,
     socketPath,
     ompVersion: "17.0.6",
-    discovery: { list: async () => [session] },
+    discovery: {
+      list: async () => [session],
+      load: async (record) => ({
+        ...record,
+        entriesLoaded: true,
+        entries: [
+          {
+            id: entryId("entry-a"),
+            parentId: null,
+            hostId: host,
+            sessionId: record.sessionId,
+            kind: "message",
+            timestamp: "2026-07-20T00:00:00.000Z",
+            data: { role: "user", text: "hello" }
+          }
+        ]
+      })
+    },
     childFactory: factory,
     rpcDialect: "official-17.0.6",
     lockCheck: () => {},
@@ -288,7 +306,19 @@ test("attached catalog refresh and terminal-only rejection stay on the runtime b
     expect(await responseFor(client, "state")).toMatchObject({ ok: true });
     expect(factory.children).toHaveLength(1);
     sendCommand("attach", "session.attach", {});
-    expect(await responseFor(client, "attach")).toMatchObject({ ok: true });
+    const firstFrame = await client.nextServer();
+    const secondFrame = await client.nextServer();
+    const attachFrames = [firstFrame, secondFrame];
+    const attachResponse = attachFrames.find((f) => f.type === "response" && f.requestId === "attach");
+    expect(attachResponse).toMatchObject({ ok: true });
+
+    const snapshotFrame = attachFrames.find((f) => f.type === "snapshot") as Extract<
+      ServerFrame,
+      { type: "snapshot" }
+    >;
+    expect(snapshotFrame).toBeDefined();
+    expect(snapshotFrame.entries).toHaveLength(1);
+    expect(snapshotFrame.entries[0]).toMatchObject({ id: "entry-a", kind: "message" });
 
     sendCommand("catalog", "catalog.get", {}, { session: false });
     const catalogResponse = await responseFor(client, "catalog");
@@ -351,6 +381,18 @@ test("attached catalog refresh and terminal-only rejection stay on the runtime b
     expect(factory.children[0]?.writes.find((command) => command.type === "set_model")).not.toHaveProperty(
       "selector",
     );
+
+    sendCommand(
+      "model-role",
+      "session.model.set",
+      { role: "slow", persistence: "session" },
+      { expectedRevision: currentRevision },
+    );
+    expect(await responseFor(client, "model-role")).toMatchObject({ ok: true, result: { accepted: true } });
+    expect(factory.children[0]?.writes.find((command) => command.type === "set_model" && command.role === "slow")).toMatchObject({
+      type: "set_model",
+      role: "slow",
+    });
   } finally {
     client.destroy();
     await client.closed();

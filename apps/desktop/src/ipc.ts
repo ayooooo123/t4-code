@@ -247,7 +247,7 @@ export class DesktopIpcRegistry {
     this.ipc.handle("omp:speech:stop", async (event, payload: unknown): Promise<SpeechResult> => {
       this.assertSender(event);
       decodeRequest("omp:speech:stop", payload);
-      return this.runtime.speech?.stopSpeaking() ?? { accepted: false, error: "Speech is unavailable" };
+      return this.runtime.speech?.stopSpeaking() ?? { accepted: true };
     });
     this.ipc.handle("omp:command", async (event, payload: unknown): Promise<CommandResult> => {
       this.assertSender(event);

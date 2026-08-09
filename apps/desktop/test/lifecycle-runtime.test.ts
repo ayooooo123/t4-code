@@ -824,6 +824,58 @@ describe("desktop Electron lifecycle", () => {
     expect(calls).toEqual(["inspect", "start", "inspect"]);
     await fixture.lifecycle.stop();
   });
+  it("automatically repairs a named local profile service with autoStart enabled when its target falls back to connecting", async () => {
+    const calls: string[] = [];
+    let state: "running" | "stopped" = "running";
+    const repaired = Promise.withResolvers<void>();
+    const service: ServiceManager = {
+      inspect: async () => {
+        calls.push("inspect");
+        if (state === "running" && calls.includes("start")) {
+          repaired.resolve();
+        }
+        return { definition: "current", service: state, diagnostics: "" };
+      },
+      install: async () => {
+        calls.push("install");
+      },
+      start: async () => {
+        calls.push("start");
+        state = "running";
+      },
+      stop: async () => {},
+      restart: async () => {},
+      uninstall: async () => {},
+    };
+    const fixture = setup(undefined, async () => true, {
+      discoverExecutable: async () => "/opt/omp/bin/omp",
+      discoverHostExecutable: async () => "/opt/t4/bin/t4-host",
+      createServiceManager: (options) => {
+        if (options.profileId === "custom-profile") {
+          return service;
+        }
+        return {
+          inspect: async () => ({ definition: "current", service: "running", diagnostics: "" }),
+          install: async () => {},
+          start: async () => {},
+          stop: async () => {},
+          restart: async () => {},
+          uninstall: async () => {},
+        };
+      },
+    });
+    await fixture.localProfileRegistry.add({ profileId: "custom-profile", label: "Custom Profile", autoStart: true });
+    await fixture.lifecycle.start();
+    calls.length = 0;
+
+    state = "stopped";
+    expect(fixture.managerOptions).toBeDefined();
+    fixture.managerOptions!.events.onState({ targetId: "local:custom-profile", state: "connecting" });
+    await repaired.promise;
+
+    expect(calls).toEqual(["inspect", "start", "inspect"]);
+    await fixture.lifecycle.stop();
+  });
   it("shares in-flight profile discovery but revalidates the executable on later recovery", async () => {
     const service: ServiceManager = {
       inspect: async () => ({ definition: "current", service: "running", diagnostics: "" }),

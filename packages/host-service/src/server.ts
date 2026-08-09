@@ -1026,19 +1026,25 @@ export class LocalAppserver implements AppserverHandle {
 		if (command.command === "session.rename") return { type, name: command.args.name };
 		if (command.command === "session.model.set") {
 			if (this.#rpcDialect === "official-17.0.6") {
-				if (
-					command.args.persistence !== "session" ||
-					typeof command.args.selector !== "string" ||
-					command.args.role !== undefined
-				)
-					return undefined;
-				const separator = command.args.selector.indexOf("/");
-				if (separator <= 0 || separator === command.args.selector.length - 1) return undefined;
-				return {
-					type,
-					provider: command.args.selector.slice(0, separator),
-					modelId: command.args.selector.slice(separator + 1),
-				};
+				if (command.args.persistence !== "session") return undefined;
+				if (command.args.selector !== undefined) {
+					if (typeof command.args.selector !== "string" || command.args.role !== undefined) return undefined;
+					const separator = command.args.selector.indexOf("/");
+					if (separator <= 0 || separator === command.args.selector.length - 1) return undefined;
+					return {
+						type,
+						provider: command.args.selector.slice(0, separator),
+						modelId: command.args.selector.slice(separator + 1),
+					};
+				}
+				if (command.args.role !== undefined) {
+					if (typeof command.args.role !== "string") return undefined;
+					return {
+						type,
+						role: command.args.role,
+					};
+				}
+				return undefined;
 			}
 			return {
 				type,

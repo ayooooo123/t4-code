@@ -47,8 +47,6 @@ import {
   type WorkspaceRootChooseResult,
   type WorkspaceRootSelectRequest,
   type WorkspaceRootsResult,
-  type SpeechRequest,
-  type SpeechResult,
   type ProjectionCacheLoadResult,
   type ProjectionCacheSaveRequest,
   type ProjectionCacheSaveResult,
@@ -64,8 +62,6 @@ export interface OmpShellBridge {
   readonly bootstrap: () => Promise<BootstrapResult>;
   readonly confirm: (request: ConfirmRequest) => Promise<ConfirmResult>;
   readonly terminalInput: (request: TerminalInputRequest) => Promise<TerminalResult>;
-  readonly speakText: (request: SpeechRequest) => Promise<SpeechResult>;
-  readonly stopSpeaking: () => Promise<SpeechResult>;
   readonly terminalResize: (request: TerminalResizeRequest) => Promise<TerminalResult>;
   readonly terminalClose: (request: TerminalCloseRequest) => Promise<TerminalResult>;
   readonly connect: (request: TargetRequest) => Promise<ConnectResult>;
@@ -186,8 +182,6 @@ const bridge: OmpShellBridge = {
   kind: "desktop",
   platform: process.platform === "darwin" ? "darwin" : "linux",
   ...(desktopClusterOperatorEnabled() ? { clusterOperatorEnabled: true as const } : {}),
-  speakText: (request) => invoke("omp:speech:speak", request),
-  stopSpeaking: () => invoke("omp:speech:stop", {}),
   bootstrap: () => invoke("omp:bootstrap", {}),
   connect: (request) => invoke("omp:connect", request),
   confirm: (request) => invoke("omp:confirm", request),

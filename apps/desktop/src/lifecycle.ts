@@ -38,7 +38,6 @@ import {
   NodeServiceFileSystem,
 } from "./service.ts";
 import { WorkspaceRootsService } from "./workspace-roots.ts";
-import { createDesktopSpeechService, type DesktopSpeechService } from "./speech.ts";
 import { createElectronUpdateController } from "./electron-update-controller.ts";
 import { installApplicationMenu, type ApplicationMenuOptions } from "./menu.ts";
 import { DesktopUpdateController } from "./update-controller.ts";
@@ -92,9 +91,6 @@ export interface DesktopLifecycleOptions {
   readonly createTargetManager?: (options: TargetManagerOptions) => LocalTargetManager;
   readonly createPeerShare?: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
   readonly createWorkspaceRoots?: () => WorkspaceRootsService;
-  readonly createSpeechService?: (options: {
-    readonly discoverExecutable: () => Promise<string | undefined>;
-  }) => DesktopSpeechService;
   readonly createUpdateController?: () => DesktopUpdateController;
   readonly installMenu?: (options: ApplicationMenuOptions) => void;
 }
@@ -125,9 +121,6 @@ export class DesktopLifecycle {
   private readonly serviceFactory: (
     options: Parameters<typeof createAppserverServiceManager>[0],
   ) => ServiceManager;
-  private readonly speechServiceFactory: (options: {
-    readonly discoverExecutable: () => Promise<string | undefined>;
-  }) => DesktopSpeechService;
   private readonly appserverProbe: (executable: string) => Promise<boolean>;
   private readonly targetManagerFactory: (options: TargetManagerOptions) => LocalTargetManager;
   private readonly peerShareFactory: (workspaceRoots: WorkspaceRootsService) => Pick<PeerShareHost, "start" | "regenerate" | "status" | "stop">;
@@ -141,7 +134,6 @@ export class DesktopLifecycle {
   private ipc: DesktopIpcRegistry | undefined;
   private manager: LocalTargetManager | undefined;
   private localProfileRegistry: LocalProfileRegistry | undefined;
-  private speechService: DesktopSpeechService | undefined;
   private profileRuntime: LocalProfileRuntime | undefined;
   private projectionCache: ProjectionCacheRuntime | undefined;
   private serviceManager: ServiceManager | undefined;
@@ -150,7 +142,7 @@ export class DesktopLifecycle {
   private serviceExecutablePromise: Promise<string | undefined> | undefined;
   private hostExecutablePromise: Promise<string | undefined> | undefined;
   private serviceRecoveryPromise: Promise<ServiceManager | undefined> | undefined;
-  private automaticServiceRepairPromise: Promise<void> | undefined;
+  private readonly automaticServiceRepairPromises = new Map<string, Promise<void>>();
   private readonly serviceRecoveryPromises = new Map<string, Promise<ServiceManager | undefined>>();
   private readonly serviceAvailabilityIssues = new Map<string, ServiceAvailabilityIssue>();
   private updateController: DesktopUpdateController | undefined;
@@ -225,8 +217,6 @@ export class DesktopLifecycle {
       options.createTargetManager ?? ((managerOptions) => new LocalTargetManager(managerOptions));
     this.peerShareFactory = options.createPeerShare ?? ((workspaceRoots) => new PeerShareHost({ pairingStore: new ElectronPeerPairingStore(), workspaceRoots }));
     this.workspaceRootsFactory = options.createWorkspaceRoots ?? (() => new WorkspaceRootsService({ store: new ElectronWorkspaceRootsStore() }));
-    this.speechServiceFactory =
-      options.createSpeechService ?? ((speechOptions) => createDesktopSpeechService(speechOptions));
     this.updateControllerFactory = options.createUpdateController ?? createElectronUpdateController;
     this.menuInstaller = options.installMenu ?? installApplicationMenu;
   }
@@ -315,9 +305,6 @@ export class DesktopLifecycle {
       releaseServiceManager: (profileId) => this.releaseServiceManager(profileId),
       getServiceAvailabilityIssue: (profileId) => this.getServiceAvailabilityIssue(profileId),
     });
-    this.speechService = this.speechServiceFactory({
-      discoverExecutable: () => this.discoverServiceExecutable(),
-    });
     this.bindWindow(
       this.windowFactory(
         this.clusterOperatorEnabled ? { clusterOperatorEnabled: true } : undefined,
@@ -360,8 +347,6 @@ export class DesktopLifecycle {
     this.browserRuntime = undefined;
     ipc?.deactivateBrowserTarget(browser);
     await this.disposeBrowserRuntime(browser);
-    await this.speechService?.dispose();
-    this.speechService = undefined;
     this.mainWindow = undefined;
     this.updateController?.dispose();
     this.updateController = undefined;
@@ -370,7 +355,7 @@ export class DesktopLifecycle {
     const manager = this.manager;
     this.manager = undefined;
     const recovery = this.serviceRecoveryPromise;
-    const automaticRepair = this.automaticServiceRepairPromise;
+    const automaticRepairs = [...this.automaticServiceRepairPromises.values()];
     const recoveries = [...this.serviceRecoveryPromises.values()];
     await Promise.all([
       manager?.close() ?? Promise.resolve(),
@@ -379,10 +364,12 @@ export class DesktopLifecycle {
         () => undefined,
         () => undefined,
       ) ?? Promise.resolve(),
-      automaticRepair?.then(
-        () => undefined,
-        () => undefined,
-      ) ?? Promise.resolve(),
+      ...automaticRepairs.map((value) =>
+        value.then(
+          () => undefined,
+          () => undefined,
+        ),
+      ),
       ...recoveries.map((value) =>
         value.then(
           () => undefined,
@@ -460,31 +447,33 @@ export class DesktopLifecycle {
   }
 
   private scheduleAutomaticServiceRepair(event: ConnectionStateEvent): void {
-    if (
-      this.stopping ||
-      event.targetId !== "local" ||
-      event.state !== "connecting" ||
-      this.automaticServiceRepairPromise !== undefined
-    ) return;
-    const repair = this.repairAutomaticDefaultService();
-    this.automaticServiceRepairPromise = repair;
+    if (this.stopping || event.state !== "connecting") return;
+    const isLocalDefault = event.targetId === "local";
+    const isLocalProfile = event.targetId.startsWith("local:");
+    if (!isLocalDefault && !isLocalProfile) return;
+
+    const profileId = isLocalDefault ? "default" : event.targetId.slice("local:".length);
+    if (this.automaticServiceRepairPromises.has(profileId)) return;
+
+    const repair = this.repairAutomaticService(profileId);
+    this.automaticServiceRepairPromises.set(profileId, repair);
     void repair.then(
       () => {
-        if (this.automaticServiceRepairPromise === repair)
-          this.automaticServiceRepairPromise = undefined;
+        if (this.automaticServiceRepairPromises.get(profileId) === repair)
+          this.automaticServiceRepairPromises.delete(profileId);
       },
       (error: unknown) => {
-        if (this.automaticServiceRepairPromise === repair)
-          this.automaticServiceRepairPromise = undefined;
-        if (!this.stopping) this.ipc?.emitRuntimeError(runtimeError(error, "local"));
+        if (this.automaticServiceRepairPromises.get(profileId) === repair)
+          this.automaticServiceRepairPromises.delete(profileId);
+        if (!this.stopping) this.ipc?.emitRuntimeError(runtimeError(error, event.targetId));
       },
     );
   }
 
-  private async repairAutomaticDefaultService(): Promise<void> {
-    const profile = await this.localProfileRegistry?.get("default");
+  private async repairAutomaticService(profileId: string): Promise<void> {
+    const profile = await this.localProfileRegistry?.get(profileId);
     if (profile?.autoStart !== true || this.stopping) return;
-    const manager = await this.acquireServiceManager();
+    const manager = await this.acquireServiceManager(profileId);
     if (manager === undefined || this.stopping) return;
     await repairAppserverService(manager);
   }
@@ -711,7 +700,6 @@ export class DesktopLifecycle {
       getServiceManager: () => this.serviceManager,
       acquireServiceManager: () => this.acquireServiceManager(),
       getServiceAvailabilityIssue: () => this.serviceAvailabilityIssue,
-      ...(this.speechService === undefined ? {} : { speech: this.speechService }),
       ...(this.profileRuntime === undefined ? {} : { profileRuntime: this.profileRuntime }),
       ...(this.projectionCache === undefined ? {} : { projectionCache: this.projectionCache }),
       drainPairLinks: () => this.pendingPairs.drain(),
